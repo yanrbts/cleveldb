@@ -40,6 +40,46 @@ static int vfast_clean_server(void) {
     return 0;
 }
 
+/**
+ * @brief Pre-allocate and submit initial read requests to warm up the I/O ring.
+ * This ensures the kernel has available buffers to fill when packets arrive.
+ */
+static void vfast_io_warmup(vfast_ctx_t *ctx) {
+    /* * We pre-submit 256 pairs of read requests. 
+     * In high-performance networking, this "fills the pipe" so the CPU 
+     * doesn't sit idle waiting for the first batch of interrupts.
+     */
+    for (int i = 0; i < 256; i++) {
+        /* Pop buffers from our fixed-buffer pool */
+        int idx_t = vfast_buf_pop(ctx);
+        int idx_s = vfast_buf_pop(ctx);
+
+        /* Submit TUN read request */
+        if (idx_t != -1) {
+            vpn_io_data_t *d = zmalloc(sizeof(vpn_io_data_t));
+            if (d) {
+                memset(d, 0, sizeof(vpn_io_data_t));
+                d->type = IO_TYPE_TUN_READ;
+                vpn_iouring_submit_read(&ctx->io_ring, ctx->tun.fd, idx_t, d);
+            }
+        }
+
+        /* Submit UDP Socket read request (using recvmsg for IP learning) */
+        if (idx_s != -1) {
+            vpn_io_data_t *d = zmalloc(sizeof(vpn_io_data_t));
+            if (d) {
+                memset(d, 0, sizeof(vpn_io_data_t));
+                d->type = IO_TYPE_SOCK_READ;
+                vpn_iouring_submit_recvmsg(&ctx->io_ring, ctx->udp->fd, idx_s, d);
+            }
+        }
+    }
+
+    /* Force a syscall to tell the kernel: "Start watching these 512 requests now" */
+    vpn_iouring_flush(&ctx->io_ring);
+    log_info("I/O Pipeline Warmed: 512 read requests submitted.");
+}
+
 static int vfast_init_server(void) {
     /* 1. Global Context Basic Initialization */
     memset(&vfastctx, 0, sizeof(vfast_ctx_t));
@@ -84,6 +124,8 @@ static int vfast_init_server(void) {
         vfast_buf_push(&vfastctx, i);
     }
 
+    vfast_io_warmup(&vfastctx);
+
     return 0;
 
 cleanup:
@@ -102,28 +144,6 @@ int main(int argc, char *argv[]) {
 
     log_info("VFAST Server: TUN_FD=%d, SOCK_FD=%d, DEV=%s", 
              vfastctx.tun.fd, vfastctx.udp->fd, vfastctx.tun.name);
-
-    /* 7. Pre-submit Initial Read Tasks (Asynchronous Pipeline Warm-up) */
-    /* We split the pool to balance TUN and Socket read requests */
-    for (int i = 0; i < 256; i++) {
-        int idx_t = vfast_buf_pop(&vfastctx);
-        int idx_s = vfast_buf_pop(&vfastctx);
-
-        if (idx_t != -1) {
-            vpn_io_data_t *d = zmalloc(sizeof(vpn_io_data_t));
-            memset(d, 0, sizeof(vpn_io_data_t));
-            d->type = IO_TYPE_TUN_READ;
-            vpn_iouring_submit_read(&vfastctx.io_ring, vfastctx.tun.fd, idx_t, d);
-        }
-        if (idx_s != -1) {
-            vpn_io_data_t *d = zmalloc(sizeof(vpn_io_data_t));
-            memset(d, 0, sizeof(vpn_io_data_t));
-            d->type = IO_TYPE_SOCK_READ;
-            /* Use recvmsg to capture the client's public IP/Port */
-            vpn_iouring_submit_recvmsg(&vfastctx.io_ring, vfastctx.udp->fd, idx_s, d);
-        }
-    }
-    vpn_iouring_flush(&vfastctx.io_ring);
 
     /* 8. Main Event Relay Loop */
     log_info("Entering main relay loop with Session Auto-Learning...");
