@@ -54,7 +54,7 @@ typedef enum {
 typedef struct {
     int fd;
     io_type_t type;
-    uint32_t session_id; /* Used to find the client in your hash table */
+    uint32_t sid;        /* Used to find the client in your hash table */
     int buf_idx;         /* 新增：记录 Fixed Buffer 的索引，必须！ */
     size_t buf_len;
 

@@ -18,3 +18,11 @@ A lightweight, industrial-grade VPN core library built with C and `io_uring` for
 ### 1. Install Dependencies
 ```bash
 sudo apt update && sudo apt install -y liburing-dev build-essential
+```
+
+### 2 MSS
+```bash
+# -t mangle 专门用于修改包头
+# --clamp-mss-to-pmtu 自动根据当前路径 MTU 计算最佳 MSS
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+```

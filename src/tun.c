@@ -257,3 +257,42 @@ void vpn_tun_destroy(vpn_tun_ctx_t *ctx) {
     
     log_info("TUN context destroyed and interface closed.");
 }
+
+/**
+ * @brief Sets the MTU for a specific network interface.
+ * @param dev_name Name of the device (e.g., "tun0").
+ * @param mtu Desired MTU value.
+ * @return 0 on success, -errno on failure.
+ */
+int vpn_tun_set_mtu(const char *dev_name, int mtu) {
+    /* Parameter Validation: RFC 791 requires minimum IPv4 MTU of 68 */
+    if (!dev_name || mtu < 68) {
+        return -EINVAL;
+    }
+
+    /* Create a temporary control socket */
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        return -errno;
+    }
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+
+    /* Safe string copy to prevent buffer overflow in interface name */
+    strncpy(ifr.ifr_name, dev_name, IFNAMSIZ - 1);
+    ifr.ifr_name[IFNAMSIZ - 1] = '\0';
+    
+    ifr.ifr_mtu = mtu;
+
+    /* Execute the IOCTL to modify MTU */
+    int result = 0;
+    if (ioctl(sockfd, SIOCSIFMTU, &ifr) < 0) {
+        result = -errno;
+    }
+
+    /* Clean up socket descriptor */
+    close(sockfd);
+
+    return result;
+}

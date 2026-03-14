@@ -19,5 +19,12 @@ int vpn_tun_init(vpn_tun_ctx_t *ctx, const char *dev_name, int multi_queue);
 void vpn_tun_destroy(vpn_tun_ctx_t *ctx);
 int vpn_tun_set_status(const char *dev_name, int mtu, int up);
 int vpn_tun_set_ip(const char *dev_name, const char *ip_addr, const char *netmask);
+/**
+ * @brief Sets the MTU for a network interface.
+ * @param dev_name Name of the interface (e.g., "tun0").
+ * @param mtu Desired MTU value.
+ * @return 0 on success, or -errno on failure.
+ */
+int vpn_tun_set_mtu(const char *dev_name, int mtu);
 
 #endif
