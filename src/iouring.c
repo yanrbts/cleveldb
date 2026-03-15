@@ -35,9 +35,17 @@ int vpn_iouring_init(vpn_iouring_ctx_t *ctx, uint32_t entries) {
 
     /* IORING_SETUP_COOP_TASKRUN: Optimizes CPU transitions (needs 5.19+)
      * IORING_SETUP_CQSIZE: Avoids CQ overflows if application is slow
+     * IORING_SETUP_SQPOLL: Enables a dedicated kernel thread to poll the SQ ring.
+     * This eliminates the need for the application to perform the io_uring_enter() 
+     * system call to submit tasks, significantly reducing context switches.
      */
-    params.flags |= IORING_SETUP_CQSIZE;
+    params.flags |= IORING_SETUP_CQSIZE | IORING_SETUP_SQPOLL;
     params.cq_entries = entries * 2;
+
+    /* sq_thread_idle: Defines the time (in ms) the kernel thread stays active 
+     * without new tasks before going to sleep. 2000ms is a balanced value.
+     */
+    params.sq_thread_idle = 2000;
 
     // Initialize ring
     if (io_uring_queue_init_params(entries, &ctx->ring, &params) < 0) return -1;
