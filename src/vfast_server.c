@@ -67,13 +67,13 @@ static void submit_tun_write(int idx, uint8_t *ptr, int len, vpn_io_data_t *d) {
 
 static void handle_tun_rx(int res, int idx, vpn_io_data_t *data) {
     atomic_fetch_add(&vfastctx.stats.rx_packets, 1);
-    const int off = VPN_TNL_HLEN + sizeof(struct iphdr);
+    const int off = VPN_TNL_HLEN;
     uint8_t *base = (uint8_t *)vfastctx.io_ring.iovecs[idx].iov_base;
     struct iphdr *iph = (struct iphdr *)(base + off);
     struct sockaddr_in remote;
 
     if (vpn_session_lookup(iph->daddr, &remote)) {
-        int tlen = vpn_pack(base, res, IO_BUF_SIZE, VPN_MSG_DATA, data->sid, iph->saddr, iph->daddr);
+        int tlen = vpn_pack(base, res, IO_BUF_SIZE, VPN_MSG_DATA, data->sid);
         if (tlen > 0) {
             data->type = IO_TYPE_SOCK_WRITE;
             memcpy(&data->udp_meta.client_addr, &remote, sizeof(remote));

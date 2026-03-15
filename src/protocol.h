@@ -82,13 +82,9 @@ typedef struct {
  * @param max_buf_size Total capacity of buf to prevent overflow
  * @param type The VFAST message type (DATA, HELLO, KEEPALIVE, etc.)
  * @param sid Session ID for the tunnel
- * @param src_ip Source Virtual IP (Network Order)
- * @param dst_ip Destination Virtual IP (Network Order)
  * @return Total packet length on success, -1 on buffer overflow
  */
-int vpn_pack(uint8_t *buf, int payload_len, 
-             int max_buf_size, vpn_msg_t type, uint32_t sid,
-             uint32_t src_ip, uint32_t dst_ip);
+int vpn_pack(uint8_t *buf, int payload_len, int max_buf_size, vpn_msg_t type, uint32_t sid);
 
 /**
  * @brief Decapsulates and validates incoming VFAST tunnel packets

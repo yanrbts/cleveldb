@@ -65,8 +65,7 @@ static void _init_ip_header(struct iphdr *ip, int total_payload_len, uint32_t sr
  * offset (VPN_TNL_HLEN + sizeof(struct iphdr)) within the buffer.
  * @return Total packet length on success, -1 on failure.
  */
-int vpn_pack(uint8_t *buf, int payload_len, int max_buf_size, vpn_msg_t type,
-             uint32_t sid, uint32_t src_ip, uint32_t dst_ip) {
+int vpn_pack(uint8_t *buf, int payload_len, int max_buf_size, vpn_msg_t type, uint32_t sid) {
     
     const int ip_hlen = sizeof(struct iphdr);
     const int required_head = VPN_TNL_HLEN + ip_hlen;
@@ -91,8 +90,8 @@ int vpn_pack(uint8_t *buf, int payload_len, int max_buf_size, vpn_msg_t type,
     tnl->session_id = htonl(sid);
 
     /* 3. Setup Internal IP Header immediately following the tunnel header */
-    struct iphdr *ip = (struct iphdr *)(buf + VPN_TNL_HLEN);
-    _init_ip_header(ip, payload_len, src_ip, dst_ip);
+    // struct iphdr *ip = (struct iphdr *)(buf + VPN_TNL_HLEN);
+    // _init_ip_header(ip, payload_len, src_ip, dst_ip);
 
     /* The entire packet now resides contiguously from 'buf' to 'buf + total_len' */
     return total_len;
