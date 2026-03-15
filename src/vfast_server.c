@@ -90,13 +90,23 @@ static void handle_udp_rx(int res, int idx, vpn_io_data_t *data) {
     int plen;
     uint32_t sid;
     
+    /* 1. Decapsulate: Strip VFAST header and get pointer to inner IP packet */
     uint8_t *ip_pkt = vpn_unpack(base, res, &plen, &sid);
-    if (ip_pkt) {
+    
+    if (likely(ip_pkt != NULL)) {
         struct iphdr *iph = (struct iphdr *)ip_pkt;
+        
+        /* 2. Update Session: Map Virtual IP to Public UDP Endpoint */
         vpn_session_update(iph->saddr, &data->udp_meta.client_addr);
         data->sid = sid;
+
+        /* 3. Forward: Write the inner IP packet to TUN device */
         submit_tun_write(idx, ip_pkt, plen, data);
     } else {
+        /* 4. Error Recovery: Drop malformed packet and resume listening */
+        log_warn("Dropped invalid VFAST packet from client");
+        
+        data->type = IO_TYPE_SOCK_READ; // Explicitly ensure state
         vpn_iouring_submit_recvmsg(&vfastctx.io_ring, vfastctx.udp->fd, idx, data);
     }
 }
