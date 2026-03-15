@@ -2,6 +2,38 @@
  * Copyright (c) 2026-2026, cleveldb.
  * Author: [yanruibing]
  * All rights reserved.
+ * 
+ * 
+ * [ PUBLIC INTERNET ]                   [ VIRTUAL NETWORK ]
+        (Remote Clients)                      (Google / Kernel)
+               |                                     ^
+               |                                     |
+    +----------V----------+               +----------|----------+
+    |  IO_TYPE_SOCK_READ  |               |  IO_TYPE_TUN_WRITE  |
+    | (Listen for Uplink) |               | (Inject to System)  |
+    +----------+----------+               +----------^----------+
+               |                                     |
+        [Decap & Learn]                       [Packet Ready]
+               |                                     |
+    +----------V----------+               +----------|----------+
+    |    handle_udp_rx    |-------------->|  submit_tun_write   |
+    +---------------------+  (Pipeline B) +---------------------+
+                                 Ingress
+    -------------------------------------------------------------
+                                 Egress
+    +---------------------+  (Pipeline A) +---------------------+
+    |  vpn_iouring_submit |<--------------|    handle_tun_rx    |
+    |    (sock_write)     |               |  (Encap & Lookup)   |
+    +----------+----------+               +----------^----------+
+               |                                     |
+        [Send to Client]                      [Capture Response]
+               |                                     |
+    +----------V----------+               +----------|----------+
+    |  IO_TYPE_SOCK_WRITE |               |  IO_TYPE_TUN_READ   |
+    | (UDP Outbound Done) |               | (Listen for Downlink)|
+    +----------|----------+               +----------^----------+
+               |                                     |
+               +-------------------------------------+
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -224,19 +256,20 @@ int main(int argc, char *argv[]) {
         } else {
             /* Finite State Machine (FSM) */
             switch (data->type) {
+                /* --- 闭环 A: 处理 Google 回包 (TUN -> SOCK) --- */
                 case IO_TYPE_TUN_READ:  
                     handle_tun_rx(res, idx, data); 
                     break;
-
-                case IO_TYPE_SOCK_READ: 
-                    handle_udp_rx(res, idx, data); 
-                    break;
-
+                // Google 的包发给客户端成功了，继续监听 TUN 等下一个 Google 包
                 case IO_TYPE_SOCK_WRITE: 
                     /* UDP Sent -> Wait for next TUN packet */
                     submit_tun_read(idx, data); 
                     break;
-
+                /* --- 闭环 B: 处理客户端请求 (SOCK -> TUN) --- */
+                case IO_TYPE_SOCK_READ: 
+                    handle_udp_rx(res, idx, data); 
+                    break;
+                // 客户端的包塞进系统成功了，继续监听 UDP 等下一个客户端包
                 case IO_TYPE_TUN_WRITE: 
                     /* TUN Injected -> Wait for next UDP packet */
                     data->type = IO_TYPE_SOCK_READ;
