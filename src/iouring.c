@@ -154,6 +154,45 @@ int vpn_iouring_submit_recvmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, vpn_
     return 0;
 }
 
+/**
+ * vpn_iouring_submit_sendmsg - Prepare and submit an asynchronous sendmsg.
+ * This is required for unconnected UDP sockets so we can specify
+ * the destination address per-packet.
+ */
+int vpn_iouring_submit_sendmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t len, vpn_io_data_t *io_data) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
+    if (!sqe) {
+        io_uring_submit(&ctx->ring);
+        sqe = io_uring_get_sqe(&ctx->ring);
+        if (!sqe) return -EBUSY;
+    }
+
+    io_data->fd = fd;
+    io_data->buf_idx = buf_idx;
+    io_data->buf_len = len;
+
+    /* Setup iovec pointing to the fixed registered buffer base */
+    io_data->udp_meta.iov.iov_base = ctx->iovecs[buf_idx].iov_base;
+    io_data->udp_meta.iov.iov_len = len;
+
+    /* Prepare msghdr to carry destination address */
+    memset(&io_data->udp_meta.msg, 0, sizeof(struct msghdr));
+    io_data->udp_meta.msg.msg_name = &io_data->udp_meta.client_addr;
+    io_data->udp_meta.msg.msg_namelen = sizeof(struct sockaddr_in);
+    io_data->udp_meta.msg.msg_iov = &io_data->udp_meta.iov;
+    io_data->udp_meta.msg.msg_iovlen = 1;
+
+    /* Use sendmsg so we can provide per-packet destination */
+    io_uring_prep_sendmsg(sqe, fd, &io_data->udp_meta.msg, 0);
+    io_uring_sqe_set_data(sqe, io_data);
+
+    if (++ctx->pending_sqes >= IO_MAX_BATCH_SIZE) {
+        io_uring_submit(&ctx->ring);
+        ctx->pending_sqes = 0;
+    }
+    return 0;
+}
+
 void vpn_iouring_destroy(vpn_iouring_ctx_t *ctx) {
     if (ctx) {
         /* Unregister buffers before closing the ring */

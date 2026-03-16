@@ -117,9 +117,12 @@ static void handle_tun_rx(int res, int idx, vpn_io_data_t *data) {
         return;
     }
 
+    /* Send encapsulated packet to client's UDP endpoint. Use sendmsg so
+     * we can specify destination per-packet (the server socket is not
+     * connected to a single client). */
     data->type = IO_TYPE_SOCK_WRITE;
     memcpy(&data->udp_meta.client_addr, &remote, sizeof(remote));
-    vpn_iouring_submit_write(&vfastctx.io_ring, vfastctx.udp->fd, idx, tlen, data);
+    vpn_iouring_submit_sendmsg(&vfastctx.io_ring, vfastctx.udp->fd, idx, tlen, data);
 }
 
 static void handle_udp_rx(int res, int idx, vpn_io_data_t *data) {

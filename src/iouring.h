@@ -72,14 +72,12 @@ typedef struct {
     int pending_sqes;                       // Counter for batching
 } vpn_iouring_ctx_t;
 
-/* Function Prototypes */
 int vpn_iouring_init(vpn_iouring_ctx_t *ctx, uint32_t entries);
 void vpn_iouring_destroy(vpn_iouring_ctx_t *ctx);
-/* Helper to submit a read request */
 int vpn_iouring_submit_read(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, vpn_io_data_t *io_data);
-/* Helper to submit a write request */
 int vpn_iouring_submit_write(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t len, vpn_io_data_t *io_data);
 int vpn_iouring_submit_recvmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, vpn_io_data_t *io_data);
+int vpn_iouring_submit_sendmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t len, vpn_io_data_t *io_data);
 void vpn_iouring_flush(vpn_iouring_ctx_t *ctx);
 
 #endif /* __IOURING_H__ */
