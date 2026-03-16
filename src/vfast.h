@@ -13,17 +13,21 @@
 #include "iouring.h"
 #include "tun.h"
 #include "udp.h"
+#include "ippool.h"
 
 /* --- Global Context Structure --- */
 typedef struct {
     /* 1. Network & Hardware Interfaces */
     vpn_iouring_ctx_t io_ring;   /* High-performance IO engine */
     vpn_tun_ctx_t     tun;       /* Virtual network interface */
+    vpn_ip_pool_t     ip_pool;   /* IP address management */
     udp_conn_t        *udp;      /* UDP transport handle */
 
     /* 2. Buffer Management (Lock-free pool using stack) */
     int               free_buffers[IO_BUF_POOL_SIZE];
     int               free_top;
+
+    vpn_io_data_t     *io_data_pool;
     
     /* 3. Global Status & Config */
     atomic_bool       running;   /* Control flag for main loop */
@@ -36,6 +40,12 @@ typedef struct {
         atomic_uint_fast64_t rx_packets;
         atomic_uint_fast64_t tx_bytes;
         atomic_uint_fast64_t rx_bytes;
+
+        /* Error & Drop counters */
+        atomic_uint_fast64_t drop_session_miss;   /* Session lookup failed */
+        atomic_uint_fast64_t drop_unpack_error;   /* VFAST protocol unpack failed */
+        atomic_uint_fast64_t drop_pack_error;     /* VFAST protocol pack failed */
+        atomic_uint_fast64_t drop_io_errors;      /* io_uring completion errors (res <= 0) */
     } stats;
 
 } __attribute__((aligned(64))) vfast_ctx_t;
@@ -55,4 +65,5 @@ static inline int vfast_buf_pop(vfast_ctx_t *ctx) {
     return -1;
 }
 
+void vfast_report_performance(void);
 #endif

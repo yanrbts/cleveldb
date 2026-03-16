@@ -59,6 +59,7 @@
 /* Global Context Instance */
 vfast_ctx_t vfastctx;
 
+
 /* Simple signal handling for graceful shutdown */
 static void signal_handler(int sig) {
     (void)sig;
@@ -67,22 +68,9 @@ static void signal_handler(int sig) {
 
 /* --- Internal Helpers (Short Names) --- */
 static void submit_tun_read(int idx, vpn_io_data_t *d) {
-    const int off = VPN_TNL_HLEN + sizeof(struct iphdr);
     d->type = IO_TYPE_TUN_READ;
     d->buf_idx = idx;
-
-    void *org_ptr = vfastctx.io_ring.iovecs[idx].iov_base;
-    size_t org_len = vfastctx.io_ring.iovecs[idx].iov_len;
-
-    /* Apply zero-copy offset */
-    vfastctx.io_ring.iovecs[idx].iov_base = (uint8_t *)org_ptr + off;
-    vfastctx.io_ring.iovecs[idx].iov_len = org_len - off;
-
     vpn_iouring_submit_read(&vfastctx.io_ring, vfastctx.tun.fd, idx, d);
-
-    /* Restore iovec */
-    vfastctx.io_ring.iovecs[idx].iov_base = org_ptr;
-    vfastctx.io_ring.iovecs[idx].iov_len = org_len;
 }
 
 static void submit_tun_write(int idx, uint8_t *ptr, int len, vpn_io_data_t *d) {
@@ -99,25 +87,45 @@ static void submit_tun_write(int idx, uint8_t *ptr, int len, vpn_io_data_t *d) {
 
 static void handle_tun_rx(int res, int idx, vpn_io_data_t *data) {
     atomic_fetch_add(&vfastctx.stats.rx_packets, 1);
-    const int off = VPN_TNL_HLEN;
+    atomic_fetch_add(&vfastctx.stats.rx_bytes, (uint64_t)res);
+
     uint8_t *base = (uint8_t *)vfastctx.io_ring.iovecs[idx].iov_base;
-    struct iphdr *iph = (struct iphdr *)(base + off);
+    struct iphdr *iph = (struct iphdr *)(base + VPN_TNL_HLEN);
     struct sockaddr_in remote;
 
-    if (vpn_session_lookup(iph->daddr, &remote)) {
-        int tlen = vpn_pack(base, res, IO_BUF_SIZE, VPN_MSG_DATA, data->sid);
-        if (tlen > 0) {
-            data->type = IO_TYPE_SOCK_WRITE;
-            memcpy(&data->udp_meta.client_addr, &remote, sizeof(remote));
-            vpn_iouring_submit_write(&vfastctx.io_ring, vfastctx.udp->fd, idx, tlen, data);
-            return;
-        }
+    if (unlikely(!vpn_session_lookup(iph->daddr, &remote))) {
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &iph->daddr, ip_str, sizeof(ip_str));
+        log_warn("SESSION MISS: Kernel wants to send to %s, but I don't know this client!", ip_str);
+
+        atomic_fetch_add(&vfastctx.stats.drop_session_miss, 1);
+        submit_tun_read(idx, data);
+        return;
     }
-    submit_tun_read(idx, data);
+
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &iph->daddr, ip_str, sizeof(ip_str));
+    char client_ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &remote.sin_addr, client_ip_str, sizeof(client_ip_str));
+
+    log_info("Found session for %s <--> %s:%d", ip_str, client_ip_str, ntohs(remote.sin_port));
+
+    int tlen = vpn_pack(base, res, IO_BUF_SIZE, VPN_MSG_DATA, data->sid);
+    if (unlikely(tlen <= 0)) {
+        atomic_fetch_add(&vfastctx.stats.drop_pack_error, 1);
+        submit_tun_read(idx, data);
+        return;
+    }
+
+    data->type = IO_TYPE_SOCK_WRITE;
+    memcpy(&data->udp_meta.client_addr, &remote, sizeof(remote));
+    vpn_iouring_submit_write(&vfastctx.io_ring, vfastctx.udp->fd, idx, tlen, data);
 }
 
 static void handle_udp_rx(int res, int idx, vpn_io_data_t *data) {
     atomic_fetch_add(&vfastctx.stats.tx_packets, 1);
+    atomic_fetch_add(&vfastctx.stats.tx_bytes, (uint64_t)res);
+
     uint8_t *base = (uint8_t *)vfastctx.io_ring.iovecs[idx].iov_base;
     int plen;
     uint32_t sid;
@@ -128,7 +136,12 @@ static void handle_udp_rx(int res, int idx, vpn_io_data_t *data) {
     if (likely(ip_pkt != NULL)) {
         struct iphdr *iph = (struct iphdr *)ip_pkt;
         
+        // log_warn("Received VFAST packet: SID=%x, Inner IP src=%x dst=%x, payload_len=%d", sid, iph->saddr, iph->daddr, plen);
         /* 2. Update Session: Map Virtual IP to Public UDP Endpoint */
+        // char client_ip_str[INET_ADDRSTRLEN];
+        // inet_ntop(AF_INET, &data->udp_meta.client_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
+        // log_warn("Updating session: Virtual IP %x <-> Client %s:%d", iph->saddr, client_ip_str, ntohs(data->udp_meta.client_addr.sin_port));
+
         vpn_session_update(iph->saddr, &data->udp_meta.client_addr);
         data->sid = sid;
 
@@ -137,14 +150,25 @@ static void handle_udp_rx(int res, int idx, vpn_io_data_t *data) {
     } else {
         /* 4. Error Recovery: Drop malformed packet and resume listening */
         log_warn("Dropped invalid VFAST packet from client");
-        
+        atomic_fetch_add(&vfastctx.stats.drop_unpack_error, 1);
+
         data->type = IO_TYPE_SOCK_READ; // Explicitly ensure state
         vpn_iouring_submit_recvmsg(&vfastctx.io_ring, vfastctx.udp->fd, idx, data);
     }
 }
 
+static inline void submit_udp_read(int idx, vpn_io_data_t *data) {
+    data->type = IO_TYPE_SOCK_READ;
+    data->buf_idx = idx;
+    /* In high-concurrency, ensure we don't need to re-allocate 'data'. 
+     * You are already recycling the 'data' pointer, which is excellent. 
+     */
+    vpn_iouring_submit_recvmsg(&vfastctx.io_ring, vfastctx.udp->fd, idx, data);
+}
+
 static int vfast_clean_server(void) {
     vpn_session_destroy();
+    vpn_ip_pool_destroy(&vfastctx.ip_pool);
     if (vfastctx.udp) udp_close(vfastctx.udp);
     vpn_tun_destroy(&vfastctx.tun);
     vpn_iouring_destroy(&vfastctx.io_ring);
@@ -152,35 +176,50 @@ static int vfast_clean_server(void) {
 }
 
 /**
- * @brief Pre-allocate and submit initial read requests to warm up the I/O ring.
+ * @brief Warm up the I/O ring by pre-submitting initial read requests.
+ * This function populates the io_uring submission queue with balanced 
+ * requests for both TUN and UDP interfaces. It utilizes the pre-allocated 
+ * static object pool (io_data_pool) to avoid heap allocation overhead 
+ * during high-performance packet processing.
+ *
+ * @param ctx Pointer to the global VFAST context instance.
  */
 static void vfast_io_warmup(vfast_ctx_t *ctx) {
-    for (int i = 0; i < 256; i++) {
+    /* Balance initial requests between Ingress (TUN) and Egress (UDP) pipelines */
+    for (int i = 0; i < IO_BUF_POOL_SIZE / 2; i++) {
+        
+        /* 1. Initialize Downlink Pipeline (Google -> Server -> Client) 
+         * Pop a free buffer index to listen for incoming packets from the TUN device. */
         int idx_t = vfast_buf_pop(ctx);
-        int idx_s = vfast_buf_pop(ctx);
-
-        /* Submit TUN read request with zero-copy offset */
         if (idx_t != -1) {
-            vpn_io_data_t *d = zmalloc(sizeof(vpn_io_data_t));
-            if (d) {
-                memset(d, 0, sizeof(vpn_io_data_t));
-                submit_tun_read(idx_t, d);
-            }
+            /* Map the buffer index to its corresponding static data structure */
+            vpn_io_data_t *d = &ctx->io_data_pool[idx_t];
+            memset(d, 0, sizeof(vpn_io_data_t));
+            d->buf_idx = idx_t;
+            
+            /* Start listening for raw IP packets routed into the virtual interface */
+            submit_tun_read(idx_t, d);
         }
 
-        /* Submit UDP Socket read request */
+        /* 2. Initialize Uplink Pipeline (Client -> Server -> Google) 
+         * Pop a free buffer index to listen for encapsulated UDP packets from clients. */
+        int idx_s = vfast_buf_pop(ctx);
         if (idx_s != -1) {
-            vpn_io_data_t *d = zmalloc(sizeof(vpn_io_data_t));
-            if (d) {
-                memset(d, 0, sizeof(vpn_io_data_t));
-                d->buf_idx = idx_s;
-                d->type = IO_TYPE_SOCK_READ;
-                vpn_iouring_submit_recvmsg(&ctx->io_ring, ctx->udp->fd, idx_s, d);
-            }
+            /* Map the buffer index to its corresponding static data structure */
+            vpn_io_data_t *d = &ctx->io_data_pool[idx_s];
+            memset(d, 0, sizeof(vpn_io_data_t));
+            d->buf_idx = idx_s;
+            
+            /* Start listening for VFAST encapsulated traffic on the public UDP port */
+            submit_udp_read(idx_s, d);
         }
     }
+
+    /* Perform a single batch flush to sync all SQEs to the kernel's submission queue.
+     * This maximizes efficiency, especially when IORING_SETUP_SQPOLL is enabled. */
     vpn_iouring_flush(&ctx->io_ring);
-    log_info("I/O Pipeline Warmed: 512 read requests submitted with offsets.");
+    
+    log_info("I/O Pipeline Warmed: %d buffers initialized from the static pool.", IO_BUF_POOL_SIZE);
 }
 
 static int vfast_init_server(void) {
@@ -190,6 +229,13 @@ static int vfast_init_server(void) {
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+
+    /* Initialize IPAM (The IP Pool) - MUST be before sessions */
+    /* Starting from 10.0.0.0 with 65536 addresses (/16) */
+    if (vpn_ip_pool_init(&vfastctx.ip_pool, "10.0.0.0", 65536) != 0) {
+        log_error("Failed to initialize IP Pool");
+        return -1;
+    }
 
     if (vpn_session_init() < 0) {
         log_error("Failed to initialize session manager");
@@ -221,6 +267,9 @@ static int vfast_init_server(void) {
         vfast_buf_push(&vfastctx, i);
     }
 
+    vfastctx.io_data_pool = zmalloc(sizeof(vpn_io_data_t) * IO_BUF_POOL_SIZE);
+    if (!vfastctx.io_data_pool) goto cleanup;
+
     vfast_io_warmup(&vfastctx);
     return 0;
 
@@ -232,53 +281,65 @@ cleanup:
 /* * Core Event Loop - Optimized for Clarity
  */
 int main(int argc, char *argv[]) {
-    UNUSED(argc);
-    UNUSED(argv);
+    UNUSED(argc); UNUSED(argv);
+
     if (vfast_init_server() < 0) return 1;
 
+    struct io_uring_cqe *cqes[16]; // Batch processing array
+    static uint64_t last_check_pkt = 0;
+
     while (atomic_load(&vfastctx.running)) {
-        struct io_uring_cqe *cqe;
-        if (io_uring_wait_cqe(&vfastctx.io_ring.ring, &cqe) < 0) break;
-
-        vpn_io_data_t *data = (vpn_io_data_t *)io_uring_cqe_get_data(cqe);
-        int res = cqe->res, idx = data->buf_idx;
-
-        if (unlikely(res <= 0)) {
-            /* Error Handling: Resubmit initial state or recycle buffer */
-            if (data->type == IO_TYPE_TUN_READ) 
-                submit_tun_read(idx, data);
-            else if (data->type == IO_TYPE_SOCK_READ) 
-                vpn_iouring_submit_recvmsg(&vfastctx.io_ring, vfastctx.udp->fd, idx, data);
-            else { 
-                vfast_buf_push(&vfastctx, idx); 
-                zfree(data); 
+        /* Batch-peek completions to minimize synchronization overhead */
+        int count = io_uring_peek_batch_cqe(&vfastctx.io_ring.ring, cqes, 16);
+        
+        /* If no completions, wait for at least one */
+        if (count == 0) {
+            struct io_uring_cqe *cqe;
+            int ret = io_uring_wait_cqe(&vfastctx.io_ring.ring, &cqe);
+            if (ret < 0) {
+                if (ret == -EINTR) break; /* Normal exit on signal */
+                log_error("Fatal io_uring error: %d", ret);
+                break;
             }
-        } else {
-            /* Finite State Machine (FSM) */
-            switch (data->type) {
-                /* --- 闭环 A: 处理 Google 回包 (TUN -> SOCK) --- */
-                case IO_TYPE_TUN_READ:  
-                    handle_tun_rx(res, idx, data); 
-                    break;
-                // Google 的包发给客户端成功了，继续监听 TUN 等下一个 Google 包
-                case IO_TYPE_SOCK_WRITE: 
-                    /* UDP Sent -> Wait for next TUN packet */
-                    submit_tun_read(idx, data); 
-                    break;
-                /* --- 闭环 B: 处理客户端请求 (SOCK -> TUN) --- */
-                case IO_TYPE_SOCK_READ: 
-                    handle_udp_rx(res, idx, data); 
-                    break;
-                // 客户端的包塞进系统成功了，继续监听 UDP 等下一个客户端包
-                case IO_TYPE_TUN_WRITE: 
-                    /* TUN Injected -> Wait for next UDP packet */
-                    data->type = IO_TYPE_SOCK_READ;
-                    vpn_iouring_submit_recvmsg(&vfastctx.io_ring, vfastctx.udp->fd, idx, data);
-                    break;
-            }
+            cqes[0] = cqe;
+            count = 1;
         }
 
-        io_uring_cqe_seen(&vfastctx.io_ring.ring, cqe);
+        for (int i = 0; i < count; i++) {
+            struct io_uring_cqe *cqe = cqes[i];
+            vpn_io_data_t *data = (vpn_io_data_t *)io_uring_cqe_get_data(cqe);
+            int res = cqe->res, idx = data->buf_idx;
+
+            if (unlikely(res <= 0)) {
+                atomic_fetch_add(&vfastctx.stats.drop_io_errors, 1);
+                /* Error: Resubmit based on current state to keep the loop alive */
+                if (data->type == IO_TYPE_TUN_READ || data->type == IO_TYPE_SOCK_WRITE)
+                    submit_tun_read(idx, data);
+                else
+                    submit_udp_read(idx, data);
+            } else {
+                /* Finite State Machine: High-speed packet routing */
+                switch (data->type) {
+                    case IO_TYPE_TUN_READ: handle_tun_rx(res, idx, data); break;
+                    case IO_TYPE_SOCK_WRITE: submit_tun_read(idx, data);  break;
+                    case IO_TYPE_SOCK_READ:  handle_udp_rx(res, idx, data); break;
+                    case IO_TYPE_TUN_WRITE: submit_udp_read(idx, data);  break;
+                }
+            }
+            io_uring_cqe_seen(&vfastctx.io_ring.ring, cqe);
+
+            last_check_pkt++;
+        }
+
+        if (unlikely(last_check_pkt >= 50000)) {
+            last_check_pkt = 0;
+            vpn_session_clean_timeout(&vfastctx.ip_pool, 60);
+            log_info("Periodic cleanup: scan timeout sessions.");
+        }
+
+        // vfast_report_performance();
+        
+        /* Submit all queued SQEs in one single batch to improve SQPOLL efficiency */
         vpn_iouring_flush(&vfastctx.io_ring);
     }
 

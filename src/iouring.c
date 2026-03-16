@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <sys/resource.h>
 #include "log.h"
+#include "protocol.h"
 #include "iouring.h"
 
 /**
@@ -77,30 +78,16 @@ int vpn_iouring_init(vpn_iouring_ctx_t *ctx, uint32_t entries) {
  */
 int vpn_iouring_submit_read(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, vpn_io_data_t *io_data) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
-    
-    /* Handle SQ overflow by forcing a submission to free up slots */
-    if (!sqe) {
-        io_uring_submit(&ctx->ring);
-        sqe = io_uring_get_sqe(&ctx->ring);
-        if (!sqe) return -EBUSY;
-    }
+    if (!sqe) return -EBUSY;
 
-    io_data->fd = fd;
-    io_data->buf_idx = buf_idx;
+    // 在这里计算偏移后的地址，只给本次 SQE 使用
+    void *target_ptr = (uint8_t *)ctx->iovecs[buf_idx].iov_base + VPN_TNL_HLEN;
+    size_t target_len = ctx->iovecs[buf_idx].iov_len - VPN_TNL_HLEN;
 
-    /* Prepare a fixed-buffer read to avoid page table overhead */
-    io_uring_prep_read_fixed(sqe, fd, ctx->iovecs[buf_idx].iov_base, 
-                             ctx->iovecs[buf_idx].iov_len, 0, buf_idx);
+    // 使用 prep_read_fixed，传入计算好的偏移地址
+    io_uring_prep_read_fixed(sqe, fd, target_ptr, target_len, 0, buf_idx);
     
     io_uring_sqe_set_data(sqe, io_data);
-    
-    /* Batching: Only enter kernel when threshold is met to reduce syscall overhead */
-    if (++ctx->pending_sqes >= IO_MAX_BATCH_SIZE) {
-        int ret = io_uring_submit(&ctx->ring);
-        ctx->pending_sqes = 0;
-        if (ret < 0) return ret;
-    }
-
     return 0;
 }
 

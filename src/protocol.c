@@ -34,26 +34,6 @@ static inline uint16_t _calculate_checksum(uint16_t *buf, int len) {
 }
 
 /**
- * @brief Initialize a standard IPv4 header
- * @note This is a internal static helper to ensure consistent IP state
- */
-static void _init_ip_header(struct iphdr *ip, int total_payload_len, uint32_t src_ip, uint32_t dst_ip) {
-    ip->version  = 4;
-    ip->ihl      = 5; // Standard 20 bytes
-    ip->tos      = 0;
-    ip->tot_len  = htons(sizeof(struct iphdr) + total_payload_len);
-    ip->id       = 0; 
-    ip->frag_off = htons(IP_DF); // Don't Fragment
-    ip->ttl      = 64;
-    ip->protocol = IPPROTO_UDP;
-    ip->saddr    = src_ip;
-    ip->daddr    = dst_ip;
-    ip->check    = 0;
-    /* Industrial grade checksum calculation */
-    ip->check    = _calculate_checksum((uint16_t *)ip, sizeof(struct iphdr));
-}
-
-/**
  * @brief Industrial-grade zero-copy encapsulation.
  * @param buf          The base address of the memory block (buffer start).
  * @param payload_len  The length of the actual payload currently in the buffer.
@@ -67,9 +47,9 @@ static void _init_ip_header(struct iphdr *ip, int total_payload_len, uint32_t sr
  */
 int vpn_pack(uint8_t *buf, int payload_len, int max_buf_size, vpn_msg_t type, uint32_t sid) {
     
-    const int ip_hlen = sizeof(struct iphdr);
-    const int required_head = VPN_TNL_HLEN + ip_hlen;
-    const int total_len = required_head + payload_len;
+    // const int ip_hlen = sizeof(struct iphdr);
+    // const int required_head = VPN_TNL_HLEN + ip_hlen;
+    const int total_len = VPN_TNL_HLEN + payload_len;
 
     /* 1. Defensive Check: Ensure the total packet fits in the provided buffer */
     if (buf == NULL || total_len > max_buf_size) {
@@ -135,7 +115,8 @@ uint8_t* vpn_unpack(uint8_t *buf, int received_len, int *out_ip_len, uint32_t *o
 
     /* 5. Extract Metadata */
     *out_sid = ntohl(tnl->session_id);
-    *out_ip_len = received_len - VPN_TNL_HLEN;
+    // *out_ip_len = received_len - VPN_TNL_HLEN;
+    *out_ip_len = inner_ip_tot_len;
 
     /* Return pointer to start of Internal IP Header for TUN write */
     return (buf + VPN_TNL_HLEN);

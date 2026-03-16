@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include "uthash.h"
+#include "ippool.h"
 
 typedef struct {
     uint32_t virtual_ip;            /* Key: Network Byte Order */
@@ -27,9 +28,9 @@ typedef struct {
 
 int vpn_session_init(void);
 void vpn_session_destroy(void);
-void vpn_session_update(uint32_t vip, const struct sockaddr_in *addr);
-bool vpn_session_lookup(uint32_t vip, struct sockaddr_in *out_addr);
-void vpn_session_delete(uint32_t vip);
-void vpn_session_gc(int timeout_sec);
+void vpn_session_update(uint32_t v_ip, const struct sockaddr_in *addr);
+bool vpn_session_lookup(uint32_t v_ip, struct sockaddr_in *out_addr);
+void vpn_session_delete(uint32_t v_ip);
+void vpn_session_clean_timeout(vpn_ip_pool_t *ipp, int timeout_sec);
 
 #endif /* __SESSION_H__ */

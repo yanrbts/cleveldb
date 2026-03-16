@@ -13,7 +13,8 @@
 #include "iouring.h"
 
 #define PORT 9999
-
+typedef struct vfast_ctx_s{} vfast_ctx_t;
+vfast_ctx_t vfastctx;
 /* Buffer index management */
 static int free_stack[IO_BUF_POOL_SIZE];
 static int top = -1;

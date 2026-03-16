@@ -5,9 +5,12 @@
  */
 #include <stdlib.h>
 #include <string.h>
+#include "vfast.h"
 #include "session.h"
 #include "log.h"
+#include "utils.h"
 #include "zmalloc.h"
+
 
 #define VPN_SESSION_SHARD_COUNT 16
 
@@ -84,7 +87,7 @@ void vpn_session_delete(uint32_t v_ip) {
     pthread_rwlock_unlock(&g_shards[idx].lock);
 }
 
-void vpn_session_gc(int timeout_sec) {
+void vpn_session_clean_timeout(vpn_ip_pool_t *ipp, int timeout_sec) {
     time_t now = time(NULL);
     for (int i = 0; i < VPN_SESSION_SHARD_COUNT; i++) {
         vpn_session_t *s, *tmp;
@@ -94,6 +97,15 @@ void vpn_session_gc(int timeout_sec) {
 
         HASH_ITER(hh, g_shards[i].table, s, tmp) {
             if (difftime(now, s->last_seen) > timeout_sec) {
+                /* Release IP lease before freeing the session memory */
+                if (likely(s->virtual_ip != 0)) {
+                    vpn_ip_pool_free(ipp, s->virtual_ip);
+                    
+                    /* For industrial logging, avoid inet_ntoa (not thread-safe in some libs) */
+                    char ip_str[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &s->virtual_ip, ip_str, sizeof(ip_str));
+                    log_info("SESSION: IP lease %s expired and reclaimed", ip_str);
+                }
                 HASH_DEL(g_shards[i].table, s);
                 zfree(s);
             }
