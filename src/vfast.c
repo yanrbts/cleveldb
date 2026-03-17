@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026-2026, cleveldb.
+ * Author: [yanruibing]
+ * All rights reserved.
+ */
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
@@ -99,6 +104,27 @@ void vfast_udp_rx(int res, int idx, vpn_io_data_t *data) {
     uint8_t *base = (uint8_t *)vfastctx.io_ring.iovecs[idx].iov_base;
     int plen;
     uint32_t sid;
+
+    struct msghdr *msg = &data->udp_meta.msg;
+    /* [Packet Integrity Validation]
+    * Check for truncation flags set by the kernel during the async recvmsg operation.
+    * MSG_TRUNC:  Indicates the incoming UDP datagram was larger than the 
+    * provided 2048-byte fixed buffer. The trailing data was discarded.
+    * MSG_CTRUNC: Indicates that ancillary control data (e.g., IP options or 
+    * TTL metadata) was truncated due to insufficient buffer space.
+    * If either flag is set, the packet is corrupted or malformed. We must 
+    * drop it immediately to prevent the unpacker from processing incomplete data,
+    * which could lead to protocol desynchronization or memory errors.
+    */
+    if (unlikely(msg->msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
+        log_warn("Received truncated UDP packet from client, dropping.");
+        goto err;
+    }
+
+    if (unlikely(res < (int)VPN_TNL_HLEN)) {
+        log_warn("Received fragmented or tiny packet from client: %d bytes", res);
+        goto err;
+    }
     
     /* 1. Decapsulate: Strip VFAST header and get pointer to inner IP packet */
     uint8_t *ip_pkt = vpn_unpack(base, res, &plen, &sid);
@@ -112,13 +138,15 @@ void vfast_udp_rx(int res, int idx, vpn_io_data_t *data) {
 
         /* 3. Forward: Write the inner IP packet to TUN device */
         vfast_tun_write(idx, data);
+        return;
     } else {
-        /* 4. Error Recovery: Drop malformed packet and resume listening */
-        log_warn("Dropped invalid VFAST packet from client");
-        atomic_fetch_add(&vfastctx.stats.drop_unpack_error, 1);
-
-        vfast_udp_read(idx, data);
+        log_warn("Failed to unpack VFAST packet from client, dropping.");
+        goto err;
     }
+
+err:
+    atomic_fetch_add(&vfastctx.stats.drop_unpack_error, 1);
+    vfast_udp_read(idx, data);
 }
 
 void vfast_tun_rx(int res, int idx, vpn_io_data_t *data) {
@@ -138,12 +166,6 @@ void vfast_tun_rx(int res, int idx, vpn_io_data_t *data) {
         vfast_tun_read(idx, data);
         return;
     }
-
-    // char ip_str[INET_ADDRSTRLEN];
-    // inet_ntop(AF_INET, &iph->daddr, ip_str, sizeof(ip_str));
-    // char client_ip_str[INET_ADDRSTRLEN];
-    // inet_ntop(AF_INET, &remote.sin_addr, client_ip_str, sizeof(client_ip_str));
-    // log_info("Found session for %s <--> %s:%d", ip_str, client_ip_str, ntohs(remote.sin_port));
 
     int tlen = vpn_pack(base, res, IO_BUF_SIZE, VPN_MSG_DATA, data->sid);
     if (unlikely(tlen <= 0)) {

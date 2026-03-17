@@ -135,11 +135,16 @@ int vpn_submit_udp_recvmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, vpn_io_d
  */
 int vpn_submit_udp_sendmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t len, vpn_io_data_t *io_data) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
-    
+
     if (!sqe) {
         io_uring_submit(&ctx->ring);
         sqe = io_uring_get_sqe(&ctx->ring);
         if (!sqe) return -EBUSY;
+    }
+
+    if (unlikely(len > IO_BUF_SIZE || len == 0)) {
+        log_error("Invalid send length: %zu", len);
+        return -EMSGSIZE;
     }
 
     io_data->fd = fd;
