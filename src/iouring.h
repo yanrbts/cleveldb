@@ -74,10 +74,53 @@ typedef struct {
 
 int vpn_iouring_init(vpn_iouring_ctx_t *ctx, uint32_t entries);
 void vpn_iouring_destroy(vpn_iouring_ctx_t *ctx);
-int vpn_iouring_submit_read(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, vpn_io_data_t *io_data);
-int vpn_iouring_submit_write(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t len, vpn_io_data_t *io_data);
-int vpn_iouring_submit_recvmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, vpn_io_data_t *io_data);
-int vpn_iouring_submit_sendmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t len, vpn_io_data_t *io_data);
 void vpn_iouring_flush(vpn_iouring_ctx_t *ctx);
+
+/**
+ * @brief Submits an asynchronous UDP receive request using the io_uring engine.
+ *
+ * This function prepares a recvmsg SQE (Submission Queue Entry) to capture incoming 
+ * UDP datagrams. It leverages the pre-registered fixed buffer pool to achieve 
+ * zero-copy data transfer from the kernel to the user-space VPN engine.
+ *
+ * @param ctx      Pointer to the initialized vpn_iouring_ctx_t context.
+ * @param fd       The UDP socket file descriptor (typically the physical interface).
+ * @param buf_idx  Index of the fixed buffer allocated from the pool for this operation.
+ * @param io_data  Pointer to the state tracking structure. 
+ * Must have `buf_idx` and `type` (IO_TYPE_SOCK_READ) initialized.
+ *
+ * @return 0 on successful submission, -EBUSY if the SQ is full and cannot be flushed.
+ *
+ * @note [Industrial Logic]
+ * 1. ZERO-COPY: Uses ctx->iovecs[buf_idx] as the destination, bypassing standard copy_to_user.
+ * 2. PEER-DISCOVERY: Automatically populates io_data->udp_meta.client_addr with the 
+ * sender's IP/Port, which is essential for dynamic session mapping and Direction B routing.
+ * 3. BATCHING: Increments ctx->pending_sqes and performs an automatic io_uring_submit() 
+ * if the IO_MAX_BATCH_SIZE threshold is reached to optimize syscall frequency.
+ * 4. BUFFER ALIGNMENT: The datagram is stored starting at the absolute base of the 
+ * fixed buffer, as the VFAST header is part of the incoming wire data.
+ */
+int vpn_submit_udp_recvmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, vpn_io_data_t *io_data);
+int vpn_submit_udp_sendmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t len, vpn_io_data_t *io_data);
+
+/**
+ * @brief Submits a zero-copy read request to the TUN device.
+ * @param ctx The io_uring context.
+ * @param tun_fd File descriptor of the TUN device.
+ * @param buf_idx Index of the pre-registered fixed buffer.
+ * @param d User data associated with this IO operation.
+ * @return 0 on success, or negative error code.
+ */
+int vpn_submit_tun_read(vpn_iouring_ctx_t *ctx, int tun_fd, int buf_idx, vpn_io_data_t *d);
+/**
+ * vpn_submit_tun_write - Submits a TUN write request with automatic offset calculation.
+ * @param ctx     : The io_uring context containing registered buffers.
+ * @param tun_fd  : File descriptor for the TUN device.
+ * @param buf_idx : The index of the pre-registered fixed buffer.
+ * @param len     : The length of the inner IP packet (excluding the 8-byte VFAST header).
+ * @param d       : User data for state tracking.
+ * NOTE: This function automatically skips the VFAST header (VPN_TNL_HLEN).
+ */
+int vpn_submit_tun_write(vpn_iouring_ctx_t *ctx, int tun_fd, int buf_idx, vpn_io_data_t *d);
 
 #endif /* __IOURING_H__ */

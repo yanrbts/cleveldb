@@ -22,7 +22,7 @@
 #include "iouring.h"
 
 /* ---------------- 全局上下文 ---------------- */
-vfast_ctx_t vfastctx;
+// vfast_ctx_t vfastctx;
 
 #define get_buf_ptr(idx) ((uint8_t *)vfastctx.io_ring.iovecs[idx].iov_base)
 
