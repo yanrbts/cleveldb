@@ -18,34 +18,67 @@
 /* Global Context Instance */
 vfast_ctx_t vfastctx;
 
+/**
+ * @brief Periodically reports system throughput and error metrics.
+ * * Logic:
+ * 1. Calculates delta bytes and delta packets since the last report.
+ * 2. Computes PPS (Packets Per Second) and Bandwidth.
+ * 3. Automatically scales units (bps, Kbps, Mbps) to ensure visibility 
+ * even during low-traffic periods (e.g., ICMP keep-alives).
+ */
 void vfast_report_performance(void) {
     static uint64_t last_bytes = 0;
-    static struct timespec last_time = {0}; // 初始化
+    static uint64_t last_pkts = 0;
+    static struct timespec last_time = {0}; 
     struct timespec now;
+    
     clock_gettime(CLOCK_MONOTONIC, &now);
 
-    /* 如果是第一次运行，先记录时间并退出 */
-    if (last_time.tv_sec == 0) {
+    /* Initialize baseline on first execution */
+    if (unlikely(last_time.tv_sec == 0)) {
         last_time = now;
         last_bytes = atomic_load(&vfastctx.stats.rx_bytes);
+        last_pkts = atomic_load(&vfastctx.stats.rx_packets);
         return;
     }
 
-    uint64_t current_bytes = atomic_load(&vfastctx.stats.rx_bytes);
+    /* Calculate elapsed time in seconds */
     double seconds = (now.tv_sec - last_time.tv_sec) + 
                      (now.tv_nsec - last_time.tv_nsec) / 1e9;
 
-    /* 只有超过 1 秒才打印 */
+    /* Report threshold: 1.0 second interval */
     if (seconds >= 1.0) {
-        double mbps = ((double)(current_bytes - last_bytes) * 8.0) / (1024 * 1024 * seconds);
+        uint64_t curr_bytes = atomic_load(&vfastctx.stats.rx_bytes);
+        uint64_t curr_pkts = atomic_load(&vfastctx.stats.rx_packets);
         
-        log_info("[PERF] Bandwidth: %.2f Mbps | RX: %lu pkts | SessionMiss: %lu | UnpackErr: %lu", 
-                 mbps, 
-                 atomic_load(&vfastctx.stats.rx_packets),
-                 atomic_load(&vfastctx.stats.drop_session_miss),
-                 atomic_load(&vfastctx.stats.drop_unpack_error)); // 加上你关心的丢包统计
+        double delta_bytes = (double)(curr_bytes - last_bytes);
+        double delta_pkts = (double)(curr_pkts - last_pkts);
         
-        last_bytes = current_bytes;
+        /* Calculate bits-per-second and packets-per-second */
+        double bps = (delta_bytes * 8.0) / seconds;
+        double pps = delta_pkts / seconds;
+
+        /* Adaptive Unit Selection for Bandwidth Display */
+        if (bps < 1024.0) {
+            log_info("[PERF] BW: %.2f bps | PPS: %.0f | RX: %lu | Miss: %lu | Err: %lu", 
+                     bps, pps, curr_pkts,
+                     atomic_load(&vfastctx.stats.drop_session_miss),
+                     atomic_load(&vfastctx.stats.drop_unpack_error));
+        } else if (bps < (1024.0 * 1024.0)) {
+            log_info("[PERF] BW: %.2f Kbps | PPS: %.0f | RX: %lu | Miss: %lu | Err: %lu", 
+                     bps / 1024.0, pps, curr_pkts,
+                     atomic_load(&vfastctx.stats.drop_session_miss),
+                     atomic_load(&vfastctx.stats.drop_unpack_error));
+        } else {
+            log_info("[PERF] BW: %.2f Mbps | PPS: %.0f | RX: %lu | Miss: %lu | Err: %lu", 
+                     bps / (1024.0 * 1024.0), pps, curr_pkts,
+                     atomic_load(&vfastctx.stats.drop_session_miss),
+                     atomic_load(&vfastctx.stats.drop_unpack_error));
+        }
+
+        /* Update state for next cycle */
+        last_bytes = curr_bytes;
+        last_pkts = curr_pkts;
         last_time = now;
     }
 }
@@ -60,6 +93,11 @@ void vfast_report_performance(void) {
  * @param ctx Pointer to the global VFAST context instance.
  */
 void vfast_io_warmup(vfast_ctx_t *ctx) {
+
+    for (int i = 0; i < IO_BUF_POOL_SIZE; i++) {
+        vfast_buf_push(&vfastctx, i);
+    }
+
     /* Balance initial requests between Ingress (TUN) and Egress (UDP) pipelines */
     for (int i = 0; i < IO_BUF_POOL_SIZE / 2; i++) {
         
@@ -179,4 +217,73 @@ void vfast_tun_rx(int res, int idx, vpn_io_data_t *data) {
      * connected to a single client). */
     memcpy(&data->udp_meta.client_addr, &remote, sizeof(remote));
     vfast_udp_write(idx, tlen, data);
+}
+
+/**
+ * vfast_tun_client_rx - High-performance client-side transmission path.
+ * * This function handles the "Uplink" process:
+ * 1. Consumes a raw IPv4/IPv6 packet read from the TUN interface.
+ * 2. Encapsulates the packet with a VFAST header in-place (Zero-copy).
+ * 3. Submits an asynchronous fixed-buffer write to the UDP transport.
+ *
+ * @param res  The number of bytes actually read from the TUN device.
+ * @param idx  The index of the pre-registered buffer in the iovecs pool.
+ * @param data Pointer to the buffer's metadata for state tracking.
+ */
+void vfast_tun_client_rx(int res, int idx, vpn_io_data_t *data) {
+    /* 1. Telemetry and Statistics Update
+     * Using atomic operations to ensure thread-safety for monitoring tools. */
+    atomic_fetch_add(&vfastctx.stats.rx_packets, 1);
+    atomic_fetch_add(&vfastctx.stats.rx_bytes, (uint64_t)res);
+
+    /* 2. Zero-Copy Encapsulation
+     * Access the pre-registered fixed buffer. The protocol expects an 8-byte 
+     * headroom at the beginning of the buffer to host the VFAST header. */
+    uint8_t *base_ptr = (uint8_t *)vfastctx.io_ring.iovecs[idx].iov_base;
+
+    /* vpn_pack logic:
+     * - Writes the header starting at base_ptr[0].
+     * - Expects the raw IP packet to already be at base_ptr[8].
+     * - Returns: Total length (Header + Payload) or <= 0 on failure. */
+    int total_len = vpn_pack(base_ptr, res, IO_BUF_SIZE, VPN_MSG_DATA, data->sid);
+
+    if (unlikely(total_len <= 0)) {
+        atomic_fetch_add(&vfastctx.stats.drop_pack_error, 1);
+        /* Recycle buffer back to TUN listening state immediately on error. */
+        data->type = IO_TYPE_TUN_READ;
+        vfast_tun_read(idx, data);
+        return;
+    }
+
+    /* 3. Asynchronous Submission to io_uring
+     * Prepare the state machine for the next stage (Transmission Completion). */
+    data->type = IO_TYPE_SOCK_WRITE;
+    data->buf_idx = idx;
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&vfastctx.io_ring.ring);
+    if (unlikely(!sqe)) {
+        /* If SQE ring is full, we must drop and recycle to prevent buffer leakage. */
+        log_error("SQE pool exhausted during client RX submission");
+        atomic_fetch_add(&vfastctx.stats.drop_io_errors, 1);
+        
+        data->type = IO_TYPE_TUN_READ;
+        vfast_tun_read(idx, data);
+        return;
+    }
+
+    /* 4. Prepare Fixed Buffer Write
+     * io_uring_prep_write_fixed provides the highest throughput by avoiding 
+     * repetitive page mapping and kernel-to-user memory pinning. */
+    io_uring_prep_write_fixed(sqe, 
+                              vfastctx.udp->fd, 
+                              base_ptr, 
+                              (unsigned)total_len, 
+                              0,    /* offset: not used for sockets */
+                              idx); /* fixed_buf_index */
+    
+    /* Re-attach metadata to the SQE for context recovery in the completion loop. */
+    io_uring_sqe_set_data(sqe, data);
+
+    /* No explicit io_uring_submit() here; it will be flushed by the event loop's 
+     * batch submission for better syscall amortization. */
 }

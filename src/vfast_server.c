@@ -68,6 +68,7 @@ static int vfast_clean_server(void) {
     if (vfastctx.udp) udp_close(vfastctx.udp);
     vpn_tun_destroy(&vfastctx.tun);
     vpn_iouring_destroy(&vfastctx.io_ring);
+    if (vfastctx.io_data_pool) zfree(vfastctx.io_data_pool);
     return 0;
 }
 
@@ -111,10 +112,6 @@ static int vfast_init_server(void) {
         goto cleanup;
     }
     vpn_set_nonblocking(vfastctx.udp->fd);
-
-    for (int i = 0; i < IO_BUF_POOL_SIZE; i++) {
-        vfast_buf_push(&vfastctx, i);
-    }
 
     vfastctx.io_data_pool = zmalloc(sizeof(vpn_io_data_t) * IO_BUF_POOL_SIZE);
     if (!vfastctx.io_data_pool) goto cleanup;
