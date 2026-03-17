@@ -79,13 +79,11 @@ static void handle_io_event(struct io_uring_cqe *cqe, uint32_t *sid_ctx) {
 
         case IO_TYPE_SOCK_WRITE:
             /* Transmission success: return buffer to TUN ingress */
-            data->type = IO_TYPE_TUN_READ;
             vfast_tun_read(idx, data);
             break;
 
         case IO_TYPE_TUN_WRITE:
             /* Interface write success: return buffer to UDP egress */
-            data->type = IO_TYPE_SOCK_READ;
             vfast_udp_read(idx, data);
             break;
 

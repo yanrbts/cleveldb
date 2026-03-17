@@ -57,18 +57,73 @@
 #include "protocol.h"
 
 /* Simple signal handling for graceful shutdown */
-static void signal_handler(int sig) {
+static void vfast_signal_handler(int sig) {
     (void)sig;
     atomic_store(&vfastctx.running, false);
 }
 
+/**
+ * vfast_setup_signals - Industrial-grade signal registration.
+ * Registers SIGINT and SIGTERM to trigger a graceful exit.
+ * * NOTE: We explicitly omit SA_RESTART. This ensures that blocking 
+ * system calls like io_uring_wait_cqe are interrupted (returning -EINTR),
+ * allowing the event loop to terminate immediately on the first Ctrl+C.
+ */
+int vfast_setup_signals(void) {
+    struct sigaction sa;
+
+    /* Initialize sigaction structure */
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = vfast_signal_handler;
+    sigemptyset(&sa.sa_mask);
+
+    /* * sa_flags = 0 is critical here. 
+     * By default, many systems use SA_RESTART, which would cause 
+     * io_uring_wait_cqe to resume internally after a signal, 
+     * ignoring our 'running' state change.
+     */
+    sa.sa_flags = 0;
+
+    if (sigaction(SIGINT, &sa, NULL) < 0) {
+        log_error("Failed to configure SIGINT handler: %s", strerror(errno));
+        return -1;
+    }
+
+    if (sigaction(SIGTERM, &sa, NULL) < 0) {
+        log_error("Failed to configure SIGTERM handler: %s", strerror(errno));
+        return -1;
+    }
+
+    log_info("Signal handlers configured (SIGINT, SIGTERM).");
+    return 0;
+}
+
 static int vfast_clean_server(void) {
+    log_info("Initiating graceful shutdown...");
+
+    // alarm(2);
+    /* 1. Stop the Transport (UDP) */
+    if (vfastctx.udp) {
+        udp_close(vfastctx.udp);
+        vfastctx.udp = NULL;
+    }
+
+    /* 3. Close the TUN device */
+    vpn_tun_destroy(&vfastctx.tun);
+
+     /* 4. Business logic teardown */
     vpn_session_destroy();
     vpn_ip_pool_destroy(&vfastctx.ip_pool);
-    if (vfastctx.udp) udp_close(vfastctx.udp);
-    vpn_tun_destroy(&vfastctx.tun);
+
+    /* 2. Destroy the Ring FIRST (The most sensitive resource) */
+    /* This will force cancellation of all inflight SQEs */
     vpn_iouring_destroy(&vfastctx.io_ring);
-    if (vfastctx.io_data_pool) zfree(vfastctx.io_data_pool);
+
+    if (vfastctx.io_data_pool) {
+        zfree(vfastctx.io_data_pool);
+    }
+
+    log_info("VFAST server halted safely.");
     return 0;
 }
 
@@ -77,8 +132,8 @@ static int vfast_init_server(void) {
     vfastctx.free_top = -1;
     atomic_store(&vfastctx.running, true);
 
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    /* 1. Setup specialized signal handling */
+    if (vfast_setup_signals() < 0) return -1;
 
     /* Initialize IPAM (The IP Pool) - MUST be before sessions */
     /* Starting from 10.0.0.0 with 65536 addresses (/16) */
@@ -181,10 +236,9 @@ int main(int argc, char *argv[]) {
             last_check_pkt = 0;
             vpn_session_clean_timeout(&vfastctx.ip_pool, 60);
             log_info("Periodic cleanup: scan timeout sessions.");
-        }
 
-        vfast_report_performance();
-        
+            vfast_report_performance();
+        }
         /* Submit all queued SQEs in one single batch to improve SQPOLL efficiency */
         vpn_iouring_flush(&vfastctx.io_ring);
     }

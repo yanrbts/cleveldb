@@ -174,18 +174,46 @@ int vpn_submit_udp_sendmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t l
     return 0;
 }
 
+/**
+ * vpn_iouring_destroy - Cleanly decommission the io_uring instance and resources.
+ * @ctx: Pointer to the vpn_iouring_ctx_t structure.
+ *
+ * This function follows the "Exit-First" paradigm for io_uring teardown.
+ */
 void vpn_iouring_destroy(vpn_iouring_ctx_t *ctx) {
-    if (ctx) {
-        /* Unregister buffers before closing the ring */
-        io_uring_unregister_buffers(&ctx->ring);
-        io_uring_queue_exit(&ctx->ring);
-        
-        /* Free the aligned memory base */
-        if (ctx->buffer_base) {
-            free(ctx->buffer_base);
-            ctx->buffer_base = NULL;
-        }
+    /* Guard against NULL context or already closed rings */
+    if (!ctx || ctx->ring.ring_fd <= 0) {
+        return;
     }
+
+    /* CRITICAL IMPROVEMENT: Skip manual unregistration of buffers and files.
+     *
+     * Calling io_uring_unregister_buffers/files manually while I/O requests 
+     * are still in-flight (e.g., blocked on a TUN device or Socket) can cause 
+     * the thread to hang in an uninterruptible sleep (D-state) as the kernel 
+     * waits indefinitely for the refcount to drop to zero.
+     *
+     * By calling io_uring_queue_exit() directly:
+     * 1. It automatically triggers the teardown of the SQPOLL kernel thread (if active).
+     * 2. It handles the unregistration of all pinned memory and fixed files 
+     * internally as part of the ring's quiescence process.
+     * 3. It safely reclaims the SQ/CQ ring memory.
+     */
+    io_uring_queue_exit(&ctx->ring);
+    
+    /* Mark the ring FD as invalid to prevent double-free or accidental reuse */
+    ctx->ring.ring_fd = -1;
+
+    /* Now that the kernel has completely released the 'pinned' memory pages 
+     * associated with the ring, it is safe to free the aligned buffer base 
+     * without risking a kernel-level memory access violation.
+     */
+    if (ctx->buffer_base) {
+        free(ctx->buffer_base);
+        ctx->buffer_base = NULL;
+    }
+
+    log_info("io_uring resources released by kernel.");
 }
 
 void vpn_iouring_flush(vpn_iouring_ctx_t *ctx) {
