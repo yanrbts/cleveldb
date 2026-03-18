@@ -15,21 +15,26 @@
 #include "ippool.h"
 
 typedef struct {
+    uint32_t session_id;            /* Unique ID: For UDP -> TUN lookup/validation */
     uint32_t virtual_ip;            /* Key: Network Byte Order */
     struct sockaddr_in remote_addr; /* Value: Client Physical Addr */
     time_t last_seen;
-    UT_hash_handle hh;              /* uthash handle */
+    UT_hash_handle hh_ip;           /* handle for virtual_ip-based lookup */
+    UT_hash_handle hh_sid;          /* Handle for SessionID-based lookup */
 } __attribute__((aligned(64))) vpn_session_t;
 
 typedef struct {
-    vpn_session_t *table;           
+    vpn_session_t *ip_table;        /* Hash head for hh (virtual_ip) */
+    vpn_session_t *sid_table;       /* Hash head for hh_sid */           
     pthread_rwlock_t lock;          
 } vpn_session_shard_t;
 
+uint32_t vpn_generate_sid(uint32_t v_ip);
 int vpn_session_init(void);
 void vpn_session_destroy(void);
-void vpn_session_update(uint32_t v_ip, const struct sockaddr_in *addr);
-bool vpn_session_lookup(uint32_t v_ip, struct sockaddr_in *out_addr);
+void vpn_session_update(uint32_t v_ip, uint32_t s_id, const struct sockaddr_in *addr);
+bool vpn_session_lookup_by_ip(uint32_t v_ip, struct sockaddr_in *out_addr);
+bool vpn_session_lookup_by_sid(uint32_t s_id, uint32_t *out_v_ip, struct sockaddr_in *out_addr);
 void vpn_session_delete(uint32_t v_ip);
 void vpn_session_clean_timeout(vpn_ip_pool_t *ipp, int timeout_sec);
 

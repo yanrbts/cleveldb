@@ -5,6 +5,7 @@
  */
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include "vfast.h"
 #include "session.h"
 #include "log.h"
@@ -20,9 +21,65 @@ static inline uint32_t vpn_get_shard_idx(uint32_t ip) {
     return (ip ^ (ip >> 16)) & (VPN_SESSION_SHARD_COUNT - 1);
 }
 
+/**
+ * vfast_generate_sid - Generates a shard-aligned and secure SessionID.
+ * @v_ip: The assigned virtual IP (Network Byte Order).
+ *
+ * DESIGN PHILOSOPHY:
+ * In a high-performance multi-threaded VPN, we shard the session table to 
+ * reduce lock contention. By ensuring that the SessionID (used for UDP ingress) 
+ * and the Virtual IP (used for TUN egress) map to the same shard index, we 
+ * allow both lookup paths to access the same pthread_rwlock and cache line.
+ *
+ * MATHEMATICAL DERIVATION:
+ * The shard index is calculated as: idx = (val ^ (val >> 16)) & MASK.
+ * To generate a SessionID (sid) that matches a target_idx:
+ * 1. We keep the high 16 bits of a random number (high_bits).
+ * 2. We solve for the low bits: idx = (high_bits >> 16) ^ low_bits.
+ * 3. Therefore: low_bits = idx ^ (high_bits >> 16).
+ *
+ * Return: A 32-bit cryptographically random SessionID aligned to the IP's shard.
+ */
+uint32_t vpn_generate_sid(uint32_t v_ip) {
+    /* Calculate the target shard index based on the Virtual IP */
+    uint32_t target_idx = vpn_get_shard_idx(v_ip);
+    uint32_t raw_rand;
+
+    /* Use a cryptographically secure random source (non-blocking) */
+    if (getrandom(&raw_rand, sizeof(raw_rand), GRND_NONBLOCK) != sizeof(raw_rand)) {
+        /* Fallback to standard library rand() if entropy pool is unavailable */
+        raw_rand = (uint32_t)rand();
+    }
+
+    /**
+     * SHARD ALIGNMENT LOGIC:
+     * We preserve the entropy in the upper 24 bits and only manipulate the 
+     * specific bits required to satisfy the (sid ^ (sid >> 16)) & MASK 
+     * sharding constraint.
+     */
+    uint32_t high_bits = raw_rand & 0xFFFF0000;
+    
+    /* Calculate the specific low bits needed to match the IP's shard index */
+    uint32_t needed_bits = (target_idx ^ (high_bits >> 16)) & (VPN_SESSION_SHARD_COUNT - 1);
+    
+    /**
+     * Construct the final SessionID:
+     * - [31:16]: Pure random bits.
+     * - [15:4]:  Additional random padding (assuming 16 shards).
+     * - [3:0]:   The shard-alignment bits.
+     */
+    uint32_t sid = high_bits | (raw_rand & 0x0000FFF0) | needed_bits;
+
+    /* Verification (Internal integrity check) */
+    /* assert(vpn_get_shard_idx(sid) == target_idx); */
+
+    return sid;
+}
+
 int vpn_session_init(void) {
     for (int i = 0; i < VPN_SESSION_SHARD_COUNT; i++) {
-        g_shards[i].table = NULL;
+        g_shards[i].ip_table = NULL;
+        g_shards[i].sid_table = NULL;
         if (pthread_rwlock_init(&g_shards[i].lock, NULL) != 0) {
             log_error("VPN_SESSION: Failed to init rwlock %d", i);
             return -1;
@@ -32,7 +89,7 @@ int vpn_session_init(void) {
     return 0;
 }
 
-void vpn_session_update(uint32_t v_ip, const struct sockaddr_in *addr) {
+void vpn_session_update(uint32_t v_ip, uint32_t s_id, const struct sockaddr_in *addr) {
     if (!addr) return;
 
     uint32_t idx = vpn_get_shard_idx(v_ip);
@@ -40,12 +97,20 @@ void vpn_session_update(uint32_t v_ip, const struct sockaddr_in *addr) {
 
     pthread_rwlock_wrlock(&g_shards[idx].lock);
     
-    HASH_FIND_INT(g_shards[idx].table, &v_ip, s);
+    HASH_FIND(hh_ip, g_shards[idx].ip_table, &v_ip, sizeof(uint32_t), s);
     if (!s) {
         s = (vpn_session_t *)zmalloc(sizeof(vpn_session_t));
         if (s) {
             s->virtual_ip = v_ip;
-            HASH_ADD_INT(g_shards[idx].table, virtual_ip, s);
+            s->session_id = s_id;
+            HASH_ADD(hh_ip, g_shards[idx].ip_table, virtual_ip, sizeof(uint32_t), s);
+            HASH_ADD(hh_sid, g_shards[idx].sid_table, session_id, sizeof(uint32_t), s);
+        }
+    } else {
+        if (s->session_id != s_id) {
+            HASH_DELETE(hh_sid, g_shards[idx].sid_table, s);
+            s->session_id = s_id;
+            HASH_ADD(hh_sid, g_shards[idx].sid_table, session_id, sizeof(uint32_t), s);
         }
     }
 
@@ -57,14 +122,14 @@ void vpn_session_update(uint32_t v_ip, const struct sockaddr_in *addr) {
     pthread_rwlock_unlock(&g_shards[idx].lock);
 }
 
-bool vpn_session_lookup(uint32_t v_ip, struct sockaddr_in *out_addr) {
+bool vpn_session_lookup_by_ip(uint32_t v_ip, struct sockaddr_in *out_addr) {
     uint32_t idx = vpn_get_shard_idx(v_ip);
     vpn_session_t *s = NULL;
     bool found = false;
 
     pthread_rwlock_rdlock(&g_shards[idx].lock);
     
-    HASH_FIND_INT(g_shards[idx].table, &v_ip, s);
+    HASH_FIND(hh_ip, g_shards[idx].ip_table, &v_ip, sizeof(uint32_t), s);
     if (s) {
         if (out_addr) memcpy(out_addr, &s->remote_addr, sizeof(struct sockaddr_in));
         found = true;
@@ -74,42 +139,105 @@ bool vpn_session_lookup(uint32_t v_ip, struct sockaddr_in *out_addr) {
     return found;
 }
 
+bool vpn_session_lookup_by_sid(uint32_t s_id, uint32_t *out_v_ip, struct sockaddr_in *out_addr) {
+    uint32_t idx = vpn_get_shard_idx(s_id); 
+    vpn_session_t *s = NULL;
+    bool found = false;
+
+    pthread_rwlock_rdlock(&g_shards[idx].lock);
+    HASH_FIND(hh_sid, g_shards[idx].sid_table, &s_id, sizeof(uint32_t), s);
+    if (s) {
+        if (out_v_ip) *out_v_ip = s->virtual_ip;
+        if (out_addr) memcpy(out_addr, &s->remote_addr, sizeof(struct sockaddr_in));
+        found = true;
+    }
+    pthread_rwlock_unlock(&g_shards[idx].lock);
+    return found;
+}
+
+/**
+ * vpn_session_delete - Remove a session from both IP and SID hash tables.
+ * @v_ip: The virtual IP address (Network Byte Order) used as the primary key.
+ *
+ * This function performs a dual-index removal. Since both indexes (hh_ip and hh_sid)
+ * point to the same memory object, we must detach the object from both tables 
+ * before calling zfree() to prevent dangling pointers and memory corruption.
+ */
 void vpn_session_delete(uint32_t v_ip) {
+    /* Determine which shard contains this IP */
     uint32_t idx = vpn_get_shard_idx(v_ip);
     vpn_session_t *s = NULL;
 
+    /* Acquire write lock for the specific shard to ensure atomicity */
     pthread_rwlock_wrlock(&g_shards[idx].lock);
-    HASH_FIND_INT(g_shards[idx].table, &v_ip, s);
+
+    /* 1. Locate the session object using the IP-based index */
+    HASH_FIND(hh_ip, g_shards[idx].ip_table, &v_ip, sizeof(uint32_t), s);
+
     if (s) {
-        HASH_DEL(g_shards[idx].table, s);
+        /**
+         * CRITICAL: Multi-Index Deletion
+         * Even though we found the object via IP, it is still linked in the 
+         * SID table. We must remove it from BOTH to maintain heap integrity.
+         */
+        
+        /* Remove from the IP-indexed hash table */
+        HASH_DELETE(hh_ip, g_shards[idx].ip_table, s);
+        
+        /* Remove from the SessionID-indexed hash table using the SID handle */
+        HASH_DELETE(hh_sid, g_shards[idx].sid_table, s);
+
+        /* Log the deletion for audit/debug purposes */
+        log_debug("Session destroyed for IP: %u.%u.%u.%u | SID: 0x%08x", 
+                  (v_ip & 0xFF), (v_ip >> 8) & 0xFF, 
+                  (v_ip >> 16) & 0xFF, (v_ip >> 24) & 0xFF,
+                  s->session_id);
+
+        /* 2. Safe to release memory only after all references are removed */
         zfree(s);
     }
+
     pthread_rwlock_unlock(&g_shards[idx].lock);
 }
 
+/**
+ * vpn_session_clean_timeout - Periodic scavenger to reclaim stale sessions.
+ * @ipp: Pointer to the IP pool to return reclaimed IPs.
+ * @timeout_sec: Inactivity threshold in seconds.
+ *
+ * This function iterates through all shards. It is designed to be called 
+ * by a background maintenance thread or a periodic timer in the main loop.
+ */
 void vpn_session_clean_timeout(vpn_ip_pool_t *ipp, int timeout_sec) {
     time_t now = time(NULL);
+
+    /* Iterate through all shards to distribute the locking overhead */
     for (int i = 0; i < VPN_SESSION_SHARD_COUNT; i++) {
+        pthread_rwlock_wrlock(&g_shards[i].lock);
+        
         vpn_session_t *s, *tmp;
         
-        /* 尝试获取写锁，如果不成功则跳过该分片下次再处理，避免长时间阻塞转发线程 */
-        if (pthread_rwlock_trywrlock(&g_shards[i].lock) != 0) continue;
-
-        HASH_ITER(hh, g_shards[i].table, s, tmp) {
-            if (difftime(now, s->last_seen) > timeout_sec) {
-                /* Release IP lease before freeing the session memory */
-                if (likely(s->virtual_ip != 0)) {
+        /**
+         * Use HASH_ITER to safely delete elements while traversing.
+         * We use hh_ip as the primary traversal handle.
+         */
+        HASH_ITER(hh_ip, g_shards[i].ip_table, s, tmp) {
+            if (now - s->last_seen > timeout_sec) {
+                
+                /* Return the virtual IP to the pool for reuse by other clients */
+                if (ipp) {
                     vpn_ip_pool_free(ipp, s->virtual_ip);
-                    
-                    /* For industrial logging, avoid inet_ntoa (not thread-safe in some libs) */
-                    char ip_str[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &s->virtual_ip, ip_str, sizeof(ip_str));
-                    log_info("SESSION: IP lease %s expired and reclaimed", ip_str);
                 }
-                HASH_DEL(g_shards[i].table, s);
+
+                /* Detach from both hash indexes simultaneously */
+                HASH_DELETE(hh_ip, g_shards[i].ip_table, s);
+                HASH_DELETE(hh_sid, g_shards[i].sid_table, s);
+                
+                /* Release the session memory */
                 zfree(s);
             }
         }
+        
         pthread_rwlock_unlock(&g_shards[i].lock);
     }
 }
@@ -118,8 +246,9 @@ void vpn_session_destroy(void) {
     for (int i = 0; i < VPN_SESSION_SHARD_COUNT; i++) {
         vpn_session_t *s, *tmp;
         pthread_rwlock_wrlock(&g_shards[i].lock);
-        HASH_ITER(hh, g_shards[i].table, s, tmp) {
-            HASH_DEL(g_shards[i].table, s);
+        HASH_ITER(hh_ip, g_shards[i].ip_table, s, tmp) {
+            HASH_DELETE(hh_ip, g_shards[i].ip_table, s);
+            HASH_DELETE(hh_sid, g_shards[i].sid_table, s);
             zfree(s);
         }
         pthread_rwlock_unlock(&g_shards[i].lock);

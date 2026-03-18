@@ -13,10 +13,107 @@
 #include "utils.h"
 #include "session.h"
 #include "protocol.h"
+#include "auth.h"
+#include "ippool.h"
 #include "vfast.h"
 
 /* Global Context Instance */
 vfast_ctx_t vfastctx;
+
+/**
+ * vfast_auth_request - Processes HELLO packet and submits a response.
+ */
+static void vfast_auth_request(int res, int idx, vpn_io_data_t *data) {
+    UNUSED(res);
+
+    uint8_t *base = (uint8_t *)vfastctx.io_ring.iovecs[idx].iov_base;
+    
+    /* 1. Extract Payload (Header is 8 bytes, payload follows) */
+    const uint8_t *payload_ptr = base + sizeof(vpn_tunnel_hdr_t);
+    
+    uint32_t new_sid = 0;
+    vpn_auth_t resp_payload;
+
+    /* 2. Invoke our industrial-grade Auth Logic from auth.c */
+    /* Note: Using a global token here; in production, fetch from config/DB */
+    const uint8_t *expected_token = (const uint8_t *)"VFAST_SECRET_KEY";
+    
+    if (vfast_auth_verify((vpn_auth_t *)payload_ptr, expected_token) != 0) {
+        log_warn("Unauthorized HELLO attempt from %s", inet_ntoa(data->udp_meta.client_addr.sin_addr));
+        goto recycle;
+    }
+
+    /* 3. Resource Allocation (Decoupled in your Control Plane) */
+    uint32_t assigned_vip = vpn_ip_pool_alloc(&vfastctx.ip_pool);
+    if (assigned_vip == 0) {
+        log_error("IP Pool empty, dropping HELLO from %s", inet_ntoa(data->udp_meta.client_addr.sin_addr));
+        goto recycle;
+    }
+
+    /* 4. Generate SID and Persist Session */
+    new_sid = vpn_generate_sid(assigned_vip);
+    vpn_session_update(assigned_vip, new_sid, &data->udp_meta.client_addr);
+
+    /* 5. Construct Response Packet in the SAME buffer (Zero-copy reuse) */
+    vpn_tunnel_hdr_t *resp_hdr = (vpn_tunnel_hdr_t *)base;
+    resp_hdr->version = VFAST_VERSION;
+    resp_hdr->msg_type = VPN_MSG_HELLO; /* Response uses same type or a dedicated ACK type */
+    resp_hdr->session_id = new_sid;
+
+    /* Pack the auth response payload */
+    vfast_auth_pack(&resp_payload, assigned_vip, expected_token, 0);
+    memcpy(base + sizeof(vpn_tunnel_hdr_t), &resp_payload, sizeof(vpn_auth_t));
+
+    /* 6. Submit Async Write back to the Client */
+    int resp_len = sizeof(vpn_tunnel_hdr_t) + sizeof(vpn_auth_t);
+    vfast_udp_write(idx, resp_len, data);
+    
+    log_info("Handshake Complete: VIP=%u.%u.%u.%u SID=0x%08x -> %s",
+             (assigned_vip & 0xFF), (assigned_vip >> 8) & 0xFF,
+             (assigned_vip >> 16) & 0xFF, (assigned_vip >> 24) & 0xFF, 
+             new_sid, inet_ntoa(data->udp_meta.client_addr.sin_addr));
+    return;
+
+recycle:
+    vfast_udp_read(idx, data);
+}
+
+/**
+ * vfast_udp_forward - Core data plane forwarding logic.
+ * Process a valid VFAST DATA packet and forward it to the TUN device.
+ */
+static void vfast_udp_forward(int res, int idx, vpn_io_data_t *data, uint8_t *base) {
+    int plen;
+    uint32_t sid;
+    struct msghdr *msg = &data->udp_meta.msg;
+
+    /* 1. Packet Integrity Validation */
+    if (unlikely(msg->msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
+        log_warn("Received truncated UDP packet from client, dropping.");
+        goto err;
+    }
+
+    /* 2. Decapsulate: Strip VFAST header and get pointer to inner IP packet */
+    uint8_t *ip_pkt = vpn_unpack(base, res, &plen, &sid);
+    
+    if (likely(ip_pkt != NULL)) {
+        struct iphdr *iph = (struct iphdr *)ip_pkt;
+        
+        /* 3. Update Session: Map Virtual IP to Public UDP Endpoint */
+        vpn_session_update(iph->saddr, sid, &data->udp_meta.client_addr);
+        data->sid = sid;
+
+        /* 4. Forward: Write the inner IP packet to TUN device */
+        vfast_tun_write(idx, data);
+        return;
+    } 
+
+    log_warn("Failed to unpack VFAST packet from client, dropping.");
+
+err:
+    atomic_fetch_add(&vfastctx.stats.drop_unpack_error, 1);
+    vfast_udp_read(idx, data);
+}
 
 /**
  * @brief Periodically reports system throughput and error metrics.
@@ -140,51 +237,32 @@ void vfast_udp_rx(int res, int idx, vpn_io_data_t *data) {
     atomic_fetch_add(&vfastctx.stats.tx_bytes, (uint64_t)res);
 
     uint8_t *base = (uint8_t *)vfastctx.io_ring.iovecs[idx].iov_base;
-    int plen;
-    uint32_t sid;
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)base;
 
-    struct msghdr *msg = &data->udp_meta.msg;
-    /* [Packet Integrity Validation]
-    * Check for truncation flags set by the kernel during the async recvmsg operation.
-    * MSG_TRUNC:  Indicates the incoming UDP datagram was larger than the 
-    * provided 2048-byte fixed buffer. The trailing data was discarded.
-    * MSG_CTRUNC: Indicates that ancillary control data (e.g., IP options or 
-    * TTL metadata) was truncated due to insufficient buffer space.
-    * If either flag is set, the packet is corrupted or malformed. We must 
-    * drop it immediately to prevent the unpacker from processing incomplete data,
-    * which could lead to protocol desynchronization or memory errors.
-    */
-    if (unlikely(msg->msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
-        log_warn("Received truncated UDP packet from client, dropping.");
-        goto err;
-    }
-
+    /* Basic sanity check: must at least contain the 8-byte header */
     if (unlikely(res < (int)VPN_TNL_HLEN)) {
-        log_warn("Received fragmented or tiny packet from client: %d bytes", res);
-        goto err;
-    }
-    
-    /* 1. Decapsulate: Strip VFAST header and get pointer to inner IP packet */
-    uint8_t *ip_pkt = vpn_unpack(base, res, &plen, &sid);
-    
-    if (likely(ip_pkt != NULL)) {
-        struct iphdr *iph = (struct iphdr *)ip_pkt;
-        
-        /* 2. Update Session: Map Virtual IP to Public UDP Endpoint */
-        vpn_session_update(iph->saddr, &data->udp_meta.client_addr);
-        data->sid = sid;
-
-        /* 3. Forward: Write the inner IP packet to TUN device */
-        vfast_tun_write(idx, data);
+        atomic_fetch_add(&vfastctx.stats.drop_unpack_error, 1);
+        vfast_udp_read(idx, data);
         return;
-    } else {
-        log_warn("Failed to unpack VFAST packet from client, dropping.");
-        goto err;
     }
 
-err:
-    atomic_fetch_add(&vfastctx.stats.drop_unpack_error, 1);
-    vfast_udp_read(idx, data);
+    switch (hdr->msg_type) {
+    case VPN_MSG_DATA:
+        vfast_udp_forward(res, idx, data, base);
+        break;
+    case VPN_MSG_HELLO:
+        vfast_auth_request(res, idx, data);
+        break;
+    case VPN_MSG_KEEPALIVE:
+        vfast_keep(res, idx, data);
+        break;
+    case VPN_MSG_DISCONNECT:
+    default:
+        log_warn("Unknown msg_type 0x%02x from %s", 
+                    hdr->msg_type, inet_ntoa(data->udp_meta.client_addr.sin_addr));
+        vfast_udp_read(idx, data);
+        break;
+    }
 }
 
 void vfast_tun_rx(int res, int idx, vpn_io_data_t *data) {
@@ -195,7 +273,7 @@ void vfast_tun_rx(int res, int idx, vpn_io_data_t *data) {
     struct iphdr *iph = (struct iphdr *)(base + VPN_TNL_HLEN);
     struct sockaddr_in remote;
 
-    if (unlikely(!vpn_session_lookup(iph->daddr, &remote))) {
+    if (unlikely(!vpn_session_lookup_by_ip(iph->daddr, &remote))) {
         char ip_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &iph->daddr, ip_str, sizeof(ip_str));
         log_warn("SESSION MISS: Kernel wants to send to %s, but I don't know this client!", ip_str);
@@ -286,4 +364,51 @@ void vfast_tun_client_rx(int res, int idx, vpn_io_data_t *data) {
 
     /* No explicit io_uring_submit() here; it will be flushed by the event loop's 
      * batch submission for better syscall amortization. */
+}
+
+/**
+ * vfast_keep - Process heartbeat and send acknowledgment back to client.
+ */
+void vfast_keep(int res, int idx, vpn_io_data_t *data) {
+    uint8_t *base = (uint8_t *)vfastctx.io_ring.iovecs[idx].iov_base;
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)base;
+    struct sockaddr_in *client_addr = &data->udp_meta.client_addr;
+
+    uint32_t v_ip;
+    struct sockaddr_in old_addr;
+
+    /* 1. Session Validation & Update */
+    if (likely(vpn_session_lookup_by_sid(hdr->session_id, &v_ip, &old_addr))) {
+        
+        /* Refresh last_seen and handle potential NAT roaming */
+        vpn_session_update(v_ip, hdr->session_id, client_addr);
+
+        /* Log roaming if the public endpoint changed */
+        if (unlikely(memcmp(&old_addr, client_addr, sizeof(struct sockaddr_in)) != 0)) {
+            char ip_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &client_addr->sin_addr, ip_str, sizeof(ip_str));
+            log_info("ROAM: SID[0x%08x] now at %s:%d", hdr->session_id, ip_str, ntohs(client_addr->sin_port));
+        }
+
+        /**
+         * 2. Construct Response (Echo back)
+         * We reuse the same buffer and same header. 
+         * The client will see the same Session ID and MSG_TYPE.
+         */
+        vpn_auth_t *payload = (vpn_auth_t *)(base + sizeof(vpn_tunnel_hdr_t));
+        
+        /* Optional: Update the server-side timestamp in the payload */
+        payload->ts = (uint64_t)time(NULL);
+        payload->vip = v_ip; // Confirm their assigned VIP
+
+        /* 3. Send Acknowledgment via io_uring */
+        /* res is the length of the received keepalive packet */
+        vfast_udp_write(idx, res, data);
+
+    } else {
+        /* Session doesn't exist (possibly expired) */
+        log_warn("KEEPALIVE REJECTED: Unknown SID 0x%08x", hdr->session_id);
+        /* OPTIONAL: Send a special 'Reset' packet or just drop and let client re-auth */
+        vfast_udp_read(idx, data);
+    }
 }

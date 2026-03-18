@@ -100,8 +100,6 @@ int vfast_setup_signals(void) {
 
 static int vfast_clean_server(void) {
     log_info("Initiating graceful shutdown...");
-
-    // alarm(2);
     /* 1. Stop the Transport (UDP) */
     if (vfastctx.udp) {
         udp_close(vfastctx.udp);

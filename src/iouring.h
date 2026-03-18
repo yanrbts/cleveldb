@@ -47,7 +47,7 @@ typedef enum {
     IO_TYPE_TUN_READ,       // (读完网卡)  ──转换──>  IO_TYPE_SOCK_WRITE (准备发给 UDP)
     IO_TYPE_TUN_WRITE,      // (读完网络)  ──转换──>  IO_TYPE_TUN_WRITE (准备发给网卡)
     IO_TYPE_SOCK_READ,      // (发完了)   ──重置──>  IO_TYPE_TUN_READ (回到网卡继续等下一个包)
-    IO_TYPE_SOCK_WRITE      // (写进去了)  ──重置──>  IO_TYPE_SOCK_READ (回到网络继续等下一个包)
+    IO_TYPE_SOCK_WRITE,      // (写进去了)  ──重置──>  IO_TYPE_SOCK_READ (回到网络继续等下一个包)
 } io_type_t;
 
 /* Structure passed into SQE user_data to track async operations */
@@ -101,6 +101,24 @@ void vpn_iouring_flush(vpn_iouring_ctx_t *ctx);
  * fixed buffer, as the VFAST header is part of the incoming wire data.
  */
 int vpn_submit_udp_recvmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, vpn_io_data_t *io_data);
+
+/**
+ * @brief Submits a zero-copy sendmsg request for UDP transmission.
+ * This function prepares a sendmsg SQE to transmit encapsulated packets to the client.
+ * It uses the fixed buffer pool for zero-copy transmission and allows per-packet
+ * destination specification via msghdr.
+ * @param ctx      Pointer to the initialized vpn_iouring_ctx_t context.
+ * @param fd       The UDP socket file descriptor (physical interface).
+ * @param buf_idx  Index of the fixed buffer containing the data to send.
+ * @param len      The length of the data to send (must be <= IO_BUF_SIZE).
+ * @param io_data  Pointer to the state tracking structure. Must have `buf_idx` and `type` (IO_TYPE_SOCK_WRITE) initialized, 
+ * and `udp_meta.client_addr` populated with the destination address.
+ * @return 0 on success, -EBUSY if the SQ is full and cannot be flushed, or -EMSGSIZE if the length exceeds the buffer size.
+ * @note [Industrial Logic]
+ * 1. ZERO-COPY: Directly uses the fixed buffer registered in ctx->iovecs[buf_idx] for transmission, eliminating extra copy overhead.
+ * 2. PER-PACKET DESTINATION: Configures the msghdr structure to specify the client's address for each packet, which is crucial 
+ * for a UDP-based VPN where the server socket is not connected to a single client.
+ */
 int vpn_submit_udp_sendmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t len, vpn_io_data_t *io_data);
 
 /**

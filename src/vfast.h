@@ -15,6 +15,8 @@
 #include "udp.h"
 #include "ippool.h"
 
+#define VFAST_VERSION 1
+
 /* --- Global Context Structure --- */
 typedef struct {
     /* 1. Network & Hardware Interfaces */
@@ -85,4 +87,5 @@ void vfast_io_warmup(vfast_ctx_t *ctx);
 void vfast_udp_rx(int res, int idx, vpn_io_data_t *data);
 void vfast_tun_rx(int res, int idx, vpn_io_data_t *data);
 void vfast_tun_client_rx(int res, int idx, vpn_io_data_t *data);
+void vfast_keep(int res, int idx, vpn_io_data_t *data);
 #endif
