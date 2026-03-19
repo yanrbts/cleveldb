@@ -18,6 +18,7 @@
 #include "log.h"
 #include "utils.h"
 #include "vfast.h"
+#include "fsm.h"
 #include "zmalloc.h"
 #include "protocol.h"
 #include "iouring.h"
@@ -49,14 +50,14 @@ static inline void vfast_recycle_buffer(int idx, vpn_io_data_t *data) {
  * handle_io_event - FSM Dispatcher for I/O Completion.
  * Refactored to eliminate 'goto' statements for better structured flow.
  */
-static void handle_io_event(struct io_uring_cqe *cqe, uint32_t *sid_ctx) {
+static void handle_io_event(struct io_uring_cqe *cqe) {
     vpn_io_data_t *data = (vpn_io_data_t *)io_uring_cqe_get_data(cqe);
     
     if (unlikely(!data)) return;
 
     int res = cqe->res;
     int idx = data->buf_idx;
-    data->sid = *sid_ctx;
+    data->sid = client_fsm.sid;
 
     /* Handle I/O errors (e.g., interface down, buffer overflow) */
     if (unlikely(res <= 0)) {
@@ -70,11 +71,15 @@ static void handle_io_event(struct io_uring_cqe *cqe, uint32_t *sid_ctx) {
     /* Primary State Transition Logic */
     switch (data->type) {
         case IO_TYPE_TUN_READ:
-            vfast_tun_client_rx(res, idx, data);
+           if (vfast_fsm_is_connected()) {
+                vfast_tun_client_rx(res, idx, data);
+            } else {
+                vfast_tun_read(idx, data);
+            }
             break;
 
         case IO_TYPE_SOCK_READ:
-            vfast_udp_rx(res, idx, data);
+            vfast_udp_client_rx(res, idx, data);
             break;
 
         case IO_TYPE_SOCK_WRITE:
@@ -119,7 +124,7 @@ static void vfast_cleanup() {
  * vfast_init_server - Pipeline and Environment Setup.
  * Initializes memory, kernel interfaces, and warms up the I/O ring.
  */
-static int vfast_init_server(const char *remote_ip) {
+static int vfast_init_client(const char *remote_ip) {
     memset(&vfastctx, 0, sizeof(vfast_ctx_t));
     vfastctx.free_top = -1;
     atomic_store(&vfastctx.running, true);
@@ -140,7 +145,7 @@ static int vfast_init_server(const char *remote_ip) {
     if (vpn_iouring_init(&vfastctx.io_ring, IO_RING_DEPTH) < 0) return -1;
 
     if (vpn_tun_init(&vfastctx.tun, "tun0", 1) < 0) return -1;
-    vpn_tun_set_ip(vfastctx.tun.name, "10.0.0.2", "255.255.255.0");
+    // vpn_tun_set_ip(vfastctx.tun.name, "10.0.0.2", "255.255.255.0");
     vpn_tun_set_status(vfastctx.tun.name, VPN_MTU_DEFAULT, 1);
     
     vfastctx.udp = udp_init_listener(0, 20);
@@ -162,15 +167,15 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Usage: %s <server_ip>\n", argv[0]);
         return EXIT_FAILURE;
     }
-
-    uint32_t current_sid = 0x12345678;
     
     /* System Bootstrap */
-    if (vfast_init_server(argv[1]) < 0) {
+    if (vfast_init_client(argv[1]) < 0) {
         log_error("System initialization failed. Aborting.");
         vfast_cleanup();
         return EXIT_FAILURE;
     }
+
+    vfast_fsm_init(vfastctx.udp, argv[1], 9999);
 
     struct io_uring_cqe *cqes[16];
     
@@ -189,7 +194,7 @@ int main(int argc, char *argv[]) {
         /* Batch processing for high-load efficiency */
         int count = io_uring_peek_batch_cqe(&vfastctx.io_ring.ring, cqes, 16);
         for (int i = 0; i < count; i++) {
-            handle_io_event(cqes[i], &current_sid);
+            handle_io_event(cqes[i]);
             io_uring_cqe_seen(&vfastctx.io_ring.ring, cqes[i]);
         }
         

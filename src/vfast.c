@@ -15,6 +15,7 @@
 #include "protocol.h"
 #include "auth.h"
 #include "ippool.h"
+#include "fsm.h"
 #include "vfast.h"
 
 /* Global Context Instance */
@@ -36,7 +37,7 @@ static void vfast_auth_request(int res, int idx, vpn_io_data_t *data) {
 
     /* 2. Invoke our industrial-grade Auth Logic from auth.c */
     /* Note: Using a global token here; in production, fetch from config/DB */
-    const uint8_t *expected_token = (const uint8_t *)"VFAST_SECRET_KEY";
+    const uint8_t *expected_token = (const uint8_t *)"VFAST_SECRET";
     
     if (vfast_auth_verify((vpn_auth_t *)payload_ptr, expected_token) != 0) {
         log_warn("Unauthorized HELLO attempt from %s", inet_ntoa(data->udp_meta.client_addr.sin_addr));
@@ -58,7 +59,7 @@ static void vfast_auth_request(int res, int idx, vpn_io_data_t *data) {
     vpn_tunnel_hdr_t *resp_hdr = (vpn_tunnel_hdr_t *)base;
     resp_hdr->version = VFAST_VERSION;
     resp_hdr->msg_type = VPN_MSG_HELLO; /* Response uses same type or a dedicated ACK type */
-    resp_hdr->session_id = new_sid;
+    resp_hdr->session_id = htonl(new_sid);
 
     /* Pack the auth response payload */
     vfast_auth_pack(&resp_payload, assigned_vip, expected_token, 0);
@@ -297,6 +298,43 @@ void vfast_tun_rx(int res, int idx, vpn_io_data_t *data) {
     vfast_udp_write(idx, tlen, data);
 }
 
+void vfast_udp_client_rx(int res, int idx, vpn_io_data_t *data) {
+    UNUSED(res);
+
+    uint8_t *base = (uint8_t *)vfastctx.io_ring.iovecs[idx].iov_base;
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)base;
+
+    vfast_fsm_update_rx();
+
+    switch (hdr->msg_type) {
+        case VPN_MSG_HELLO: {
+            vpn_auth_t *auth = (vpn_auth_t *)(base + VPN_TNL_HLEN);
+            client_fsm.sid = ntohl(hdr->session_id);
+            client_fsm.vip = auth->vip;
+
+            /* 2. Dynamic IP Configuration */
+            char ip_str[16];
+            struct in_addr in = { .s_addr = auth->vip };
+            inet_ntop(AF_INET, &in, ip_str, sizeof(ip_str));
+            vpn_tun_set_ip(vfastctx.tun.name, ip_str, "255.255.255.0");
+
+            atomic_store(&client_fsm.state, ST_CONNECTED);
+            log_info("FSM: Authentication Successful. Virtual IP: %s SID: 0x%08x", ip_str, client_fsm.sid);
+            break;
+        }
+        case VPN_MSG_DATA:
+            if (vfast_fsm_is_connected()) {
+                vfast_tun_write(idx, data);
+                return;
+            }
+            break;
+        case VPN_MSG_KEEPALIVE:
+        default:
+            break;
+    }
+    vfast_udp_read(idx, data);
+}
+
 /**
  * vfast_tun_client_rx - High-performance client-side transmission path.
  * * This function handles the "Uplink" process:
@@ -328,7 +366,15 @@ void vfast_tun_client_rx(int res, int idx, vpn_io_data_t *data) {
     if (unlikely(total_len <= 0)) {
         atomic_fetch_add(&vfastctx.stats.drop_pack_error, 1);
         /* Recycle buffer back to TUN listening state immediately on error. */
-        data->type = IO_TYPE_TUN_READ;
+        vfast_tun_read(idx, data);
+        return;
+    }
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&vfastctx.io_ring.ring);
+    if (unlikely(!sqe)) {
+        /* If SQE ring is full, we must drop and recycle to prevent buffer leakage. */
+        log_error("SQE pool exhausted during client RX submission");
+        atomic_fetch_add(&vfastctx.stats.drop_io_errors, 1);
         vfast_tun_read(idx, data);
         return;
     }
@@ -337,17 +383,6 @@ void vfast_tun_client_rx(int res, int idx, vpn_io_data_t *data) {
      * Prepare the state machine for the next stage (Transmission Completion). */
     data->type = IO_TYPE_SOCK_WRITE;
     data->buf_idx = idx;
-
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&vfastctx.io_ring.ring);
-    if (unlikely(!sqe)) {
-        /* If SQE ring is full, we must drop and recycle to prevent buffer leakage. */
-        log_error("SQE pool exhausted during client RX submission");
-        atomic_fetch_add(&vfastctx.stats.drop_io_errors, 1);
-        
-        data->type = IO_TYPE_TUN_READ;
-        vfast_tun_read(idx, data);
-        return;
-    }
 
     /* 4. Prepare Fixed Buffer Write
      * io_uring_prep_write_fixed provides the highest throughput by avoiding 
@@ -376,18 +411,19 @@ void vfast_keep(int res, int idx, vpn_io_data_t *data) {
 
     uint32_t v_ip;
     struct sockaddr_in old_addr;
+    uint32_t hsid = ntohl(hdr->session_id);
 
     /* 1. Session Validation & Update */
-    if (likely(vpn_session_lookup_by_sid(hdr->session_id, &v_ip, &old_addr))) {
+    if (likely(vpn_session_lookup_by_sid(hsid, &v_ip, &old_addr))) {
         
         /* Refresh last_seen and handle potential NAT roaming */
-        vpn_session_update(v_ip, hdr->session_id, client_addr);
+        vpn_session_update(v_ip, hsid, client_addr);
 
         /* Log roaming if the public endpoint changed */
         if (unlikely(memcmp(&old_addr, client_addr, sizeof(struct sockaddr_in)) != 0)) {
             char ip_str[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &client_addr->sin_addr, ip_str, sizeof(ip_str));
-            log_info("ROAM: SID[0x%08x] now at %s:%d", hdr->session_id, ip_str, ntohs(client_addr->sin_port));
+            log_info("ROAM: SID[0x%08x] now at %s:%d", hsid, ip_str, ntohs(client_addr->sin_port));
         }
 
         /**
@@ -407,7 +443,7 @@ void vfast_keep(int res, int idx, vpn_io_data_t *data) {
 
     } else {
         /* Session doesn't exist (possibly expired) */
-        log_warn("KEEPALIVE REJECTED: Unknown SID 0x%08x", hdr->session_id);
+        log_warn("KEEPALIVE REJECTED: Unknown SID 0x%08x", hsid);
         /* OPTIONAL: Send a special 'Reset' packet or just drop and let client re-auth */
         vfast_udp_read(idx, data);
     }
