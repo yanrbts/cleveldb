@@ -109,7 +109,7 @@ static int vfast_clean_server(void) {
     /* 3. Close the TUN device */
     vpn_tun_destroy(&vfastctx.tun);
 
-     /* 4. Business logic teardown */
+    /* 4. Business logic teardown */
     vpn_session_destroy();
     vpn_ip_pool_destroy(&vfastctx.ip_pool);
 
@@ -211,18 +211,35 @@ int main(int argc, char *argv[]) {
 
             if (unlikely(res <= 0)) {
                 atomic_fetch_add(&vfastctx.stats.drop_io_errors, 1);
-                /* Error: Resubmit based on current state to keep the loop alive */
-                if (data->type == IO_TYPE_TUN_READ || data->type == IO_TYPE_SOCK_WRITE)
-                    vfast_tun_read(idx, data);
-                else
-                    vfast_udp_read(idx, data);
+                if (res == -ECONNREFUSED || res == -EBADF) {
+                    log_error("Permanent error on idx %d, releasing buffer.", idx);
+                    vfast_buf_push(&vfastctx, idx);
+                } else {
+                    /* Error: Resubmit based on current state to keep the loop alive */
+                    if (data->type == IO_TYPE_TUN_READ || data->type == IO_TYPE_SOCK_WRITE)
+                        vfast_tun_read(idx, data);
+                    else
+                        vfast_udp_read(idx, data);
+                }
             } else {
                 /* Finite State Machine: High-speed packet routing */
                 switch (data->type) {
-                    case IO_TYPE_TUN_READ: vfast_tun_rx(res, idx, data); break;
-                    case IO_TYPE_SOCK_WRITE: vfast_tun_read(idx, data);  break;
-                    case IO_TYPE_SOCK_READ:  vfast_udp_rx(res, idx, data); break;
-                    case IO_TYPE_TUN_WRITE: vfast_udp_read(idx, data);  break;
+                    case IO_TYPE_TUN_READ:
+                        vfast_tun_rx(res, idx, data);
+                        break;  // --->SOCK_WRITE
+                    case IO_TYPE_SOCK_WRITE:
+                        vfast_buf_push(&vfastctx, idx);
+                        int new_idx = vfast_buf_pop(&vfastctx);
+                        if (new_idx >= 0) vfast_tun_read(new_idx, data);
+                        break;
+                    case IO_TYPE_SOCK_READ: 
+                        vfast_udp_rx(res, idx, data);
+                        break; // --->TUN_WRITE
+                    case IO_TYPE_TUN_WRITE: 
+                        vfast_buf_push(&vfastctx, idx);
+                        int next_idx = vfast_buf_pop(&vfastctx);
+                        if (next_idx >= 0) vfast_udp_read(next_idx, data);
+                        break;
                 }
             }
             io_uring_cqe_seen(&vfastctx.io_ring.ring, cqe);

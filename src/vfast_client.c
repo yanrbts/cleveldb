@@ -67,7 +67,7 @@ static void handle_io_event(struct io_uring_cqe *cqe) {
         vfast_recycle_buffer(idx, data);
         return;
     }
-
+    int new_idx = -1;
     /* Primary State Transition Logic */
     switch (data->type) {
         case IO_TYPE_TUN_READ:
@@ -77,21 +77,21 @@ static void handle_io_event(struct io_uring_cqe *cqe) {
                 vfast_tun_read(idx, data);
             }
             break;
-
+        case IO_TYPE_SOCK_WRITE:
+            /* Transmission success: return buffer to TUN ingress */
+            vfast_buf_push(&vfastctx, idx);
+            new_idx = vfast_buf_pop(&vfastctx);
+            if (new_idx >= 0) vfast_tun_read(idx, data);
+            break;
         case IO_TYPE_SOCK_READ:
             vfast_udp_client_rx(res, idx, data);
             break;
-
-        case IO_TYPE_SOCK_WRITE:
-            /* Transmission success: return buffer to TUN ingress */
-            vfast_tun_read(idx, data);
-            break;
-
         case IO_TYPE_TUN_WRITE:
             /* Interface write success: return buffer to UDP egress */
-            vfast_udp_read(idx, data);
+            vfast_buf_push(&vfastctx, idx);
+            new_idx = vfast_buf_pop(&vfastctx);
+            if (new_idx >= 0) vfast_udp_read(idx, data);
             break;
-
         default:
             log_warn("Undefined state for buffer %d, forcing recycle", idx);
             vfast_recycle_buffer(idx, data);

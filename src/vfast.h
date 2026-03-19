@@ -71,7 +71,7 @@ static inline void vfast_udp_read(int idx, vpn_io_data_t *data) {
     vpn_submit_udp_recvmsg(&vfastctx.io_ring, vfastctx.udp->fd, idx, data);
 }
 
-static inline void vfast_udp_write(int idx, size_t tlen, vpn_io_data_t *data) {
+static inline void vfast_udp_writemsg(int idx, size_t tlen, vpn_io_data_t *data) {
     vpn_submit_udp_sendmsg(&vfastctx.io_ring, vfastctx.udp->fd, idx, tlen, data);
 }
 
@@ -82,6 +82,15 @@ static inline void vfast_tun_read(int idx, vpn_io_data_t *d) {
 static inline void vfast_tun_write(int idx, vpn_io_data_t *d) {
     vpn_submit_tun_write(&vfastctx.io_ring, vfastctx.tun.fd, idx, d);
 }
+
+static inline void vfast_udp_write(int idx, size_t tlen, vpn_io_data_t *data) {
+    int ret = vpn_submit_udp_send(&vfastctx.io_ring, vfastctx.udp->fd, idx, tlen, data);
+    if (ret != 0) {
+        atomic_fetch_add(&vfastctx.stats.drop_io_errors, 1);
+        vfast_tun_read(idx, data);
+    }
+}
+
 void vfast_report_performance(void);
 void vfast_io_warmup(vfast_ctx_t *ctx);
 void vfast_udp_rx(int res, int idx, vpn_io_data_t *data);

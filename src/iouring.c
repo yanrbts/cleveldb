@@ -94,6 +94,7 @@ int vpn_submit_udp_recvmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, vpn_io_d
     /* 2. Setup IO metadata for CQE tracking */
     io_data->fd = fd;
     io_data->buf_idx = buf_idx;
+    io_data->buf_len = ctx->iovecs[buf_idx].iov_len;
     io_data->type = IO_TYPE_SOCK_READ;
 
     /* 3. Prepare iovec pointing to the FULL capacity of the fixed buffer.
@@ -149,7 +150,7 @@ int vpn_submit_udp_sendmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t l
 
     io_data->fd = fd;
     io_data->buf_idx = buf_idx;
-    io_data->buf_len = len;
+    io_data->buf_len = ctx->iovecs[buf_idx].iov_len;
     io_data->type = IO_TYPE_SOCK_WRITE;
 
     /* Setup iovec pointing to the fixed registered buffer base */
@@ -171,6 +172,33 @@ int vpn_submit_udp_sendmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t l
         io_uring_submit(&ctx->ring);
         ctx->pending_sqes = 0;
     }
+    return 0;
+}
+
+int vpn_submit_udp_send(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t len, vpn_io_data_t *io_data) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
+    if (unlikely(!sqe)) {
+        io_uring_submit(&ctx->ring);
+        sqe = io_uring_get_sqe(&ctx->ring);
+        if (!sqe) return -EBUSY;
+    }
+
+    /* 3. Asynchronous Submission to io_uring
+     * Prepare the state machine for the next stage (Transmission Completion). */
+    io_data->type = IO_TYPE_SOCK_WRITE;
+    io_data->buf_idx = buf_idx;
+    io_data->buf_len = ctx->iovecs[buf_idx].iov_len;
+    io_data->fd = fd;
+
+    uint8_t *base = (uint8_t *)ctx->iovecs[buf_idx].iov_base;
+
+    /* 4. Prepare Fixed Buffer Write
+     * io_uring_prep_write_fixed provides the highest throughput by avoiding 
+     * repetitive page mapping and kernel-to-user memory pinning. */
+    io_uring_prep_write_fixed(sqe, fd, base, (unsigned)len, 0, buf_idx);
+    /* Re-attach metadata to the SQE for context recovery in the completion loop. */
+    io_uring_sqe_set_data(sqe, io_data);
+
     return 0;
 }
 
@@ -236,9 +264,6 @@ int vpn_submit_tun_read(vpn_iouring_ctx_t *ctx, int tun_fd, int buf_idx, vpn_io_
         if (!sqe) return -EBUSY;
     }
 
-    d->type = IO_TYPE_TUN_READ;
-    d->buf_idx = buf_idx;
-
     /* * OFFSET LOGIC: 
      * We point the kernel to start writing at (base + 8).
      * This leaves the first 8 bytes (VPN_TNL_HLEN) empty for the VFAST Header.
@@ -246,6 +271,11 @@ int vpn_submit_tun_read(vpn_iouring_ctx_t *ctx, int tun_fd, int buf_idx, vpn_io_
     uint8_t *target_ptr = (uint8_t *)ctx->iovecs[buf_idx].iov_base + VPN_TNL_HLEN;
     size_t target_len = ctx->iovecs[buf_idx].iov_len - VPN_TNL_HLEN;
 
+    d->type = IO_TYPE_TUN_READ;
+    d->buf_idx = buf_idx;
+    d->fd = tun_fd;
+    d->buf_len = ctx->iovecs[buf_idx].iov_len;
+    
     /* Use read_fixed for maximum performance with pre-registered buffers */
     io_uring_prep_read_fixed(sqe, tun_fd, target_ptr, target_len, 0, buf_idx);
     io_uring_sqe_set_data(sqe, d);
@@ -270,17 +300,18 @@ int vpn_submit_tun_write(vpn_iouring_ctx_t *ctx, int tun_fd, int buf_idx, vpn_io
         if (!sqe) return -EBUSY;
     }
 
-    /* 1. Set operation metadata */
-    d->type = IO_TYPE_TUN_WRITE;
-    d->buf_idx = buf_idx;
-
     /* 2. AUTOMATIC OFFSET CALCULATION
      * We know the IP packet starts right after the VFAST header (VPN_TNL_HLEN = 8).
      * By using ctx->iovecs[buf_idx].iov_base, we get the absolute start of the buffer.
      */
-    uint8_t *base_ptr = (uint8_t *)ctx->iovecs[buf_idx].iov_base;
-    uint8_t *target_ptr = base_ptr + VPN_TNL_HLEN;
+    uint8_t *target_ptr = (uint8_t *)ctx->iovecs[buf_idx].iov_base + VPN_TNL_HLEN;
     size_t target_len = ctx->iovecs[buf_idx].iov_len - VPN_TNL_HLEN;
+
+    /* 1. Set operation metadata */
+    d->type = IO_TYPE_TUN_WRITE;
+    d->buf_idx = buf_idx;
+    d->fd = tun_fd;
+    d->buf_len = target_len;
 
     /* 3. Prepare fixed write using the calculated internal pointer.
      * The kernel validates that target_ptr is within the buffer registered at buf_idx.

@@ -63,11 +63,11 @@ static void vfast_auth_request(int res, int idx, vpn_io_data_t *data) {
 
     /* Pack the auth response payload */
     vfast_auth_pack(&resp_payload, assigned_vip, expected_token, 0);
-    memcpy(base + sizeof(vpn_tunnel_hdr_t), &resp_payload, sizeof(vpn_auth_t));
+    memcpy(base + VPN_TNL_HLEN, &resp_payload, sizeof(vpn_auth_t));
 
     /* 6. Submit Async Write back to the Client */
-    int resp_len = sizeof(vpn_tunnel_hdr_t) + sizeof(vpn_auth_t);
-    vfast_udp_write(idx, resp_len, data);
+    int resp_len = VPN_TNL_HLEN + sizeof(vpn_auth_t);
+    vfast_udp_writemsg(idx, resp_len, data);
     
     log_info("Handshake Complete: VIP=%u.%u.%u.%u SID=0x%08x -> %s",
              (assigned_vip & 0xFF), (assigned_vip >> 8) & 0xFF,
@@ -295,7 +295,7 @@ void vfast_tun_rx(int res, int idx, vpn_io_data_t *data) {
      * we can specify destination per-packet (the server socket is not
      * connected to a single client). */
     memcpy(&data->udp_meta.client_addr, &remote, sizeof(remote));
-    vfast_udp_write(idx, tlen, data);
+    vfast_udp_writemsg(idx, tlen, data);
 }
 
 void vfast_udp_client_rx(int res, int idx, vpn_io_data_t *data) {
@@ -370,35 +370,7 @@ void vfast_tun_client_rx(int res, int idx, vpn_io_data_t *data) {
         return;
     }
 
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&vfastctx.io_ring.ring);
-    if (unlikely(!sqe)) {
-        /* If SQE ring is full, we must drop and recycle to prevent buffer leakage. */
-        log_error("SQE pool exhausted during client RX submission");
-        atomic_fetch_add(&vfastctx.stats.drop_io_errors, 1);
-        vfast_tun_read(idx, data);
-        return;
-    }
-
-    /* 3. Asynchronous Submission to io_uring
-     * Prepare the state machine for the next stage (Transmission Completion). */
-    data->type = IO_TYPE_SOCK_WRITE;
-    data->buf_idx = idx;
-
-    /* 4. Prepare Fixed Buffer Write
-     * io_uring_prep_write_fixed provides the highest throughput by avoiding 
-     * repetitive page mapping and kernel-to-user memory pinning. */
-    io_uring_prep_write_fixed(sqe, 
-                              vfastctx.udp->fd, 
-                              base_ptr, 
-                              (unsigned)total_len, 
-                              0,    /* offset: not used for sockets */
-                              idx); /* fixed_buf_index */
-    
-    /* Re-attach metadata to the SQE for context recovery in the completion loop. */
-    io_uring_sqe_set_data(sqe, data);
-
-    /* No explicit io_uring_submit() here; it will be flushed by the event loop's 
-     * batch submission for better syscall amortization. */
+    vfast_udp_write(idx, total_len, data);
 }
 
 /**
@@ -439,7 +411,7 @@ void vfast_keep(int res, int idx, vpn_io_data_t *data) {
 
         /* 3. Send Acknowledgment via io_uring */
         /* res is the length of the received keepalive packet */
-        vfast_udp_write(idx, res, data);
+        vfast_udp_writemsg(idx, res, data);
 
     } else {
         /* Session doesn't exist (possibly expired) */

@@ -121,6 +121,8 @@ int vpn_submit_udp_recvmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, vpn_io_d
  */
 int vpn_submit_udp_sendmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t len, vpn_io_data_t *io_data);
 
+int vpn_submit_udp_send(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t len, vpn_io_data_t *io_data);
+
 /**
  * @brief Submits a zero-copy read request to the TUN device.
  * @param ctx The io_uring context.
