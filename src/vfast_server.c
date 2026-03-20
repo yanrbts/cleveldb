@@ -153,7 +153,7 @@ static int vfast_init_server(void) {
         log_error("Failed to initialize TUN device");
         return -1;
     }
-    
+    vpn_tun_disable_ipv6("tun0");
     vpn_tun_set_ip(vfastctx.tun.name, "10.0.0.1", VFAST_BROADCAST);
     vpn_tun_set_status(vfastctx.tun.name, VPN_MTU_DEFAULT, 1); /* MTU 1400 to allow header overhead */
     vpn_set_nonblocking(vfastctx.tun.fd);

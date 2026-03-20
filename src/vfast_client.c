@@ -126,6 +126,7 @@ static int vfast_init_client(const char *remote_ip) {
 
     if (vpn_tun_init(&vfastctx.tun, "tun0", 0) < 0) return -1;
     // vpn_tun_set_ip(vfastctx.tun.name, "10.0.0.2", "255.255.255.0");
+    vpn_tun_disable_ipv6("tun0");
     vpn_tun_set_status(vfastctx.tun.name, VPN_MTU_DEFAULT, 1);
     
     vfastctx.udp = udp_init_listener(0, 20);

@@ -249,6 +249,11 @@ bool vfast_tun_rx(int res, int idx, vpn_io_data_t *data) {
         inet_ntop(AF_INET, &iph->daddr, ip_str, sizeof(ip_str));
         log_warn("SESSION MISS: Kernel wants to send to %s, but I don't know this client!", ip_str);
 
+        uint8_t *p = (uint8_t *)base;
+        log_debug("HEX: %02x %02x %02x %02x | %02x %02x %02x %02x | %02x %02x %02x %02x | %02x %02x %02x %02x",
+              p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15], 
+              p[16], p[17], p[18], p[19], p[20], p[21], p[22], p[23]);
+
         atomic_fetch_add(&vfastctx.stats.drop_session_miss, 1);
         return false;
     }

@@ -296,3 +296,13 @@ int vpn_tun_set_mtu(const char *dev_name, int mtu) {
 
     return result;
 }
+
+void vpn_tun_disable_ipv6(const char *dev_name) {
+    char path[128];
+    snprintf(path, sizeof(path), "/proc/sys/net/ipv6/conf/%s/disable_ipv6", dev_name);
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "1");
+        fclose(f);
+    }
+}
