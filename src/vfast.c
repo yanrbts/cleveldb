@@ -9,8 +9,6 @@
 #include <net/if.h>
 #include <signal.h>
 #include <linux/ip.h>
-#include "log.h"
-#include "utils.h"
 #include "session.h"
 #include "protocol.h"
 #include "auth.h"
@@ -24,7 +22,7 @@ vfast_ctx_t vfastctx;
 /**
  * vfast_auth_request - Processes HELLO packet and submits a response.
  */
-static void vfast_auth_request(int res, int idx, vpn_io_data_t *data) {
+static bool vfast_auth_request(int res, int idx, vpn_io_data_t *data) {
     UNUSED(res);
 
     uint8_t *base = (uint8_t *)vfastctx.io_ring.iovecs[idx].iov_base;
@@ -41,14 +39,14 @@ static void vfast_auth_request(int res, int idx, vpn_io_data_t *data) {
     
     if (vfast_auth_verify((vpn_auth_t *)payload_ptr, expected_token) != 0) {
         log_warn("Unauthorized HELLO attempt from %s", inet_ntoa(data->udp_meta.client_addr.sin_addr));
-        goto recycle;
+        return false;
     }
 
     /* 3. Resource Allocation (Decoupled in your Control Plane) */
     uint32_t assigned_vip = vpn_ip_pool_alloc(&vfastctx.ip_pool);
     if (assigned_vip == 0) {
         log_error("IP Pool empty, dropping HELLO from %s", inet_ntoa(data->udp_meta.client_addr.sin_addr));
-        goto recycle;
+        return false;
     }
 
     /* 4. Generate SID and Persist Session */
@@ -67,23 +65,20 @@ static void vfast_auth_request(int res, int idx, vpn_io_data_t *data) {
 
     /* 6. Submit Async Write back to the Client */
     int resp_len = VPN_TNL_HLEN + sizeof(vpn_auth_t);
-    vfast_udp_writemsg(idx, resp_len, data);
-    
+
     log_info("Handshake Complete: VIP=%u.%u.%u.%u SID=0x%08x -> %s",
              (assigned_vip & 0xFF), (assigned_vip >> 8) & 0xFF,
              (assigned_vip >> 16) & 0xFF, (assigned_vip >> 24) & 0xFF, 
              new_sid, inet_ntoa(data->udp_meta.client_addr.sin_addr));
-    return;
 
-recycle:
-    vfast_udp_read(idx, data);
+    return vfast_udp_writemsg(idx, resp_len, data);
 }
 
 /**
  * vfast_udp_forward - Core data plane forwarding logic.
  * Process a valid VFAST DATA packet and forward it to the TUN device.
  */
-static void vfast_udp_forward(int res, int idx, vpn_io_data_t *data, uint8_t *base) {
+static bool vfast_udp_forward(int res, int idx, vpn_io_data_t *data) {
     int plen;
     uint32_t sid;
     struct msghdr *msg = &data->udp_meta.msg;
@@ -95,6 +90,7 @@ static void vfast_udp_forward(int res, int idx, vpn_io_data_t *data, uint8_t *ba
     }
 
     /* 2. Decapsulate: Strip VFAST header and get pointer to inner IP packet */
+    uint8_t *base = (uint8_t *)vfastctx.io_ring.iovecs[idx].iov_base;
     uint8_t *ip_pkt = vpn_unpack(base, res, &plen, &sid);
     
     if (likely(ip_pkt != NULL)) {
@@ -106,14 +102,12 @@ static void vfast_udp_forward(int res, int idx, vpn_io_data_t *data, uint8_t *ba
 
         /* 4. Forward: Write the inner IP packet to TUN device */
         vfast_tun_write(idx, data);
-        return;
-    } 
-
-    log_warn("Failed to unpack VFAST packet from client, dropping.");
+        return true;
+    }
 
 err:
     atomic_fetch_add(&vfastctx.stats.drop_unpack_error, 1);
-    vfast_udp_read(idx, data);
+    return false;
 }
 
 /**
@@ -191,49 +185,29 @@ void vfast_report_performance(void) {
  * @param ctx Pointer to the global VFAST context instance.
  */
 void vfast_io_warmup(vfast_ctx_t *ctx) {
-
     for (int i = 0; i < IO_BUF_POOL_SIZE; i++) {
-        vfast_buf_push(&vfastctx, i);
-    }
-
-    /* Balance initial requests between Ingress (TUN) and Egress (UDP) pipelines */
-    for (int i = 0; i < IO_BUF_POOL_SIZE / 2; i++) {
+        vpn_io_data_t *d = &ctx->io_data_pool[i];
+        memset(d, 0, sizeof(vpn_io_data_t));
         
-        /* 1. Initialize Downlink Pipeline (Google -> Server -> Client) 
-         * Pop a free buffer index to listen for incoming packets from the TUN device. */
-        int idx_t = vfast_buf_pop(ctx);
-        if (idx_t != -1) {
-            /* Map the buffer index to its corresponding static data structure */
-            vpn_io_data_t *d = &ctx->io_data_pool[idx_t];
-            memset(d, 0, sizeof(vpn_io_data_t));
-            d->buf_idx = idx_t;
-            
-            /* Start listening for raw IP packets routed into the virtual interface */
-            vfast_tun_read(idx_t, d);
-        }
+        d->sid = 0;
 
-        /* 2. Initialize Uplink Pipeline (Client -> Server -> Google) 
-         * Pop a free buffer index to listen for encapsulated UDP packets from clients. */
-        int idx_s = vfast_buf_pop(ctx);
-        if (idx_s != -1) {
-            /* Map the buffer index to its corresponding static data structure */
-            vpn_io_data_t *d = &ctx->io_data_pool[idx_s];
-            memset(d, 0, sizeof(vpn_io_data_t));
-            d->buf_idx = idx_s;
-            
-            /* Start listening for VFAST encapsulated traffic on the public UDP port */
-            vfast_udp_read(idx_s, d);
+        if (i < IO_BUF_POOL_SIZE / 2) {
+            /* Google -> Server -> Client */
+            d->source = SOURCE_TUN;
+            vfast_tun_read(i, d);
+        } else {
+            /* Client -> Server -> Google */
+            d->source = SOURCE_UDP;
+            vfast_udp_read(i, d);
         }
     }
-
-    /* Perform a single batch flush to sync all SQEs to the kernel's submission queue.
-     * This maximizes efficiency, especially when IORING_SETUP_SQPOLL is enabled. */
     vpn_iouring_flush(&ctx->io_ring);
     
-    log_info("I/O Pipeline Warmed: %d buffers initialized from the static pool.", IO_BUF_POOL_SIZE);
+    log_info("I/O Pipeline Warmed: [Fixed Pool] TUN_WATCHERS: %d, UDP_WATCHERS: %d", 
+             IO_BUF_POOL_SIZE / 2, IO_BUF_POOL_SIZE - (IO_BUF_POOL_SIZE / 2));
 }
 
-void vfast_udp_rx(int res, int idx, vpn_io_data_t *data) {
+bool vfast_udp_rx(int res, int idx, vpn_io_data_t *data) {
     atomic_fetch_add(&vfastctx.stats.tx_packets, 1);
     atomic_fetch_add(&vfastctx.stats.tx_bytes, (uint64_t)res);
 
@@ -243,30 +217,26 @@ void vfast_udp_rx(int res, int idx, vpn_io_data_t *data) {
     /* Basic sanity check: must at least contain the 8-byte header */
     if (unlikely(res < (int)VPN_TNL_HLEN)) {
         atomic_fetch_add(&vfastctx.stats.drop_unpack_error, 1);
-        vfast_udp_read(idx, data);
-        return;
+        return false;
     }
 
     switch (hdr->msg_type) {
     case VPN_MSG_DATA:
-        vfast_udp_forward(res, idx, data, base);
-        break;
+        return vfast_udp_forward(res, idx, data);
     case VPN_MSG_HELLO:
-        vfast_auth_request(res, idx, data);
-        break;
+        return vfast_auth_request(res, idx, data);
     case VPN_MSG_KEEPALIVE:
-        vfast_keep(res, idx, data);
-        break;
+        return vfast_keeplive(res, idx, data);
     case VPN_MSG_DISCONNECT:
     default:
         log_warn("Unknown msg_type 0x%02x from %s", 
                     hdr->msg_type, inet_ntoa(data->udp_meta.client_addr.sin_addr));
-        vfast_udp_read(idx, data);
-        break;
+        return false;
     }
+    return false;
 }
 
-void vfast_tun_rx(int res, int idx, vpn_io_data_t *data) {
+bool vfast_tun_rx(int res, int idx, vpn_io_data_t *data) {
     atomic_fetch_add(&vfastctx.stats.rx_packets, 1);
     atomic_fetch_add(&vfastctx.stats.rx_bytes, (uint64_t)res);
 
@@ -280,25 +250,22 @@ void vfast_tun_rx(int res, int idx, vpn_io_data_t *data) {
         log_warn("SESSION MISS: Kernel wants to send to %s, but I don't know this client!", ip_str);
 
         atomic_fetch_add(&vfastctx.stats.drop_session_miss, 1);
-        vfast_tun_read(idx, data);
-        return;
+        return false;
     }
 
     int tlen = vpn_pack(base, res, IO_BUF_SIZE, VPN_MSG_DATA, data->sid);
     if (unlikely(tlen <= 0)) {
         atomic_fetch_add(&vfastctx.stats.drop_pack_error, 1);
-        vfast_tun_read(idx, data);
-        return;
+        return false;
     }
-
     /* Send encapsulated packet to client's UDP endpoint. Use sendmsg so
      * we can specify destination per-packet (the server socket is not
      * connected to a single client). */
     memcpy(&data->udp_meta.client_addr, &remote, sizeof(remote));
-    vfast_udp_writemsg(idx, tlen, data);
+    return vfast_udp_writemsg(idx, tlen, data);
 }
 
-void vfast_udp_client_rx(int res, int idx, vpn_io_data_t *data) {
+bool vfast_udp_client_rx(int res, int idx, vpn_io_data_t *data) {
     UNUSED(res);
 
     uint8_t *base = (uint8_t *)vfastctx.io_ring.iovecs[idx].iov_base;
@@ -307,32 +274,31 @@ void vfast_udp_client_rx(int res, int idx, vpn_io_data_t *data) {
     vfast_fsm_update_rx();
 
     switch (hdr->msg_type) {
-        case VPN_MSG_HELLO: {
-            vpn_auth_t *auth = (vpn_auth_t *)(base + VPN_TNL_HLEN);
-            client_fsm.sid = ntohl(hdr->session_id);
-            client_fsm.vip = auth->vip;
-
-            /* 2. Dynamic IP Configuration */
-            char ip_str[16];
-            struct in_addr in = { .s_addr = auth->vip };
-            inet_ntop(AF_INET, &in, ip_str, sizeof(ip_str));
-            vpn_tun_set_ip(vfastctx.tun.name, ip_str, "255.255.255.0");
-
-            atomic_store(&client_fsm.state, ST_CONNECTED);
-            log_info("FSM: Authentication Successful. Virtual IP: %s SID: 0x%08x", ip_str, client_fsm.sid);
-            break;
+    case VPN_MSG_DATA:
+        if (vfast_fsm_is_connected()) {
+            return vfast_tun_write(idx, data);
         }
-        case VPN_MSG_DATA:
-            if (vfast_fsm_is_connected()) {
-                vfast_tun_write(idx, data);
-                return;
-            }
-            break;
-        case VPN_MSG_KEEPALIVE:
-        default:
-            break;
+        break;
+    case VPN_MSG_HELLO: {
+        vpn_auth_t *auth = (vpn_auth_t *)(base + VPN_TNL_HLEN);
+        client_fsm.sid = ntohl(hdr->session_id);
+        client_fsm.vip = auth->vip;
+
+        /* 2. Dynamic IP Configuration */
+        char ip_str[16];
+        struct in_addr in = { .s_addr = auth->vip };
+        inet_ntop(AF_INET, &in, ip_str, sizeof(ip_str));
+        vpn_tun_set_ip(vfastctx.tun.name, ip_str, VFAST_BROADCAST);
+
+        atomic_store(&client_fsm.state, ST_CONNECTED);
+        log_info("FSM: Authentication Successful. Virtual IP: %s SID: 0x%08x", ip_str, client_fsm.sid);
+        break;
     }
-    vfast_udp_read(idx, data);
+    case VPN_MSG_KEEPALIVE:
+    default:
+        break;
+    }
+    return false;
 }
 
 /**
@@ -346,7 +312,7 @@ void vfast_udp_client_rx(int res, int idx, vpn_io_data_t *data) {
  * @param idx  The index of the pre-registered buffer in the iovecs pool.
  * @param data Pointer to the buffer's metadata for state tracking.
  */
-void vfast_tun_client_rx(int res, int idx, vpn_io_data_t *data) {
+bool vfast_tun_client_rx(int res, int idx, vpn_io_data_t *data) {
     /* 1. Telemetry and Statistics Update
      * Using atomic operations to ensure thread-safety for monitoring tools. */
     atomic_fetch_add(&vfastctx.stats.rx_packets, 1);
@@ -365,18 +331,16 @@ void vfast_tun_client_rx(int res, int idx, vpn_io_data_t *data) {
 
     if (unlikely(total_len <= 0)) {
         atomic_fetch_add(&vfastctx.stats.drop_pack_error, 1);
-        /* Recycle buffer back to TUN listening state immediately on error. */
-        vfast_tun_read(idx, data);
-        return;
+        return false;
     }
 
-    vfast_udp_write(idx, total_len, data);
+    return vfast_udp_write(idx, total_len, data);
 }
 
 /**
  * vfast_keep - Process heartbeat and send acknowledgment back to client.
  */
-void vfast_keep(int res, int idx, vpn_io_data_t *data) {
+bool vfast_keeplive(int res, int idx, vpn_io_data_t *data) {
     uint8_t *base = (uint8_t *)vfastctx.io_ring.iovecs[idx].iov_base;
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)base;
     struct sockaddr_in *client_addr = &data->udp_meta.client_addr;
@@ -411,12 +375,11 @@ void vfast_keep(int res, int idx, vpn_io_data_t *data) {
 
         /* 3. Send Acknowledgment via io_uring */
         /* res is the length of the received keepalive packet */
-        vfast_udp_writemsg(idx, res, data);
-
+        return vfast_udp_writemsg(idx, res, data);
     } else {
         /* Session doesn't exist (possibly expired) */
         log_warn("KEEPALIVE REJECTED: Unknown SID 0x%08x", hsid);
         /* OPTIONAL: Send a special 'Reset' packet or just drop and let client re-auth */
-        vfast_udp_read(idx, data);
+        return false;
     }
 }

@@ -39,7 +39,7 @@
 
 #define IO_RING_DEPTH       4096  /* Depth of the completion queue */
 #define IO_MAX_BATCH_SIZE   32
-#define IO_BUF_POOL_SIZE    1024  /* Total buffers in pool */
+#define IO_BUF_POOL_SIZE    16  /* Total buffers in pool */
 #define IO_BUF_SIZE         2048  /* Size of each buffer, aligned to 4KB */
 
 /* Task types to identify the completion event */
@@ -50,10 +50,16 @@ typedef enum {
     IO_TYPE_SOCK_WRITE,      // (写进去了)  ──重置──>  IO_TYPE_SOCK_READ (回到网络继续等下一个包)
 } io_type_t;
 
+typedef enum {
+    SOURCE_TUN = 0,
+    SOURCE_UDP = 1
+} io_source_t;
+
 /* Structure passed into SQE user_data to track async operations */
 typedef struct {
     int fd;
     io_type_t type;
+    io_source_t source;  /* 职责来源：活干完了该回 TUN 还是 UDP */
     uint32_t sid;        /* Used to find the client in your hash table */
     int buf_idx;         /* 新增：记录 Fixed Buffer 的索引，必须！ */
     size_t buf_len;

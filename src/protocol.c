@@ -100,7 +100,7 @@ uint8_t* vpn_unpack(uint8_t *buf, int received_len, int *out_ip_len, uint32_t *o
     /* 3. Validate Internal IP Header Sanity */
     struct iphdr *ip = (struct iphdr *)(buf + VPN_TNL_HLEN);
     if (ip->version != 4 || ip->ihl < 5) {
-        // log_error("Invalid IP header: version %d, IHL %d", ip->version, ip->ihl);
+        log_error("Invalid IP header: version %d, IHL %d", ip->version, ip->ihl);
         return NULL;
     }
 

@@ -14,8 +14,11 @@
 #include "tun.h"
 #include "udp.h"
 #include "ippool.h"
+#include "log.h"
+#include "utils.h"
 
-#define VFAST_VERSION 1
+#define VFAST_VERSION       1
+#define VFAST_BROADCAST     "255.255.255.0"
 
 /* --- Global Context Structure --- */
 typedef struct {
@@ -24,10 +27,6 @@ typedef struct {
     vpn_tun_ctx_t     tun;       /* Virtual network interface */
     vpn_ip_pool_t     ip_pool;   /* IP address management */
     udp_conn_t        *udp;      /* UDP transport handle */
-
-    /* 2. Buffer Management (Lock-free pool using stack) */
-    int               free_buffers[IO_BUF_POOL_SIZE];
-    int               free_top;
 
     vpn_io_data_t     *io_data_pool;
     
@@ -54,48 +53,49 @@ typedef struct {
 
 extern vfast_ctx_t vfastctx;
 
-static inline void vfast_buf_push(vfast_ctx_t *ctx, int idx) {
-    if (ctx->free_top < IO_BUF_POOL_SIZE - 1) {
-        ctx->free_buffers[++(ctx->free_top)] = idx;
-    }
+static inline bool vfast_udp_read(int idx, vpn_io_data_t *data) {
+    return vpn_submit_udp_recvmsg(&vfastctx.io_ring, vfastctx.udp->fd, idx, data) == 0 ? true : false;
 }
 
-static inline int vfast_buf_pop(vfast_ctx_t *ctx) {
-    if (ctx->free_top >= 0) {
-        return ctx->free_buffers[(ctx->free_top)--];
-    }
-    return -1;
+static inline bool vfast_udp_writemsg(int idx, size_t tlen, vpn_io_data_t *data) {
+    return vpn_submit_udp_sendmsg(&vfastctx.io_ring, vfastctx.udp->fd, idx, tlen, data) == 0 ? true : false;
 }
 
-static inline void vfast_udp_read(int idx, vpn_io_data_t *data) {
-    vpn_submit_udp_recvmsg(&vfastctx.io_ring, vfastctx.udp->fd, idx, data);
+static inline bool vfast_tun_read(int idx, vpn_io_data_t *d) {
+    return vpn_submit_tun_read(&vfastctx.io_ring, vfastctx.tun.fd, idx, d) == 0 ? true : false;
 }
 
-static inline void vfast_udp_writemsg(int idx, size_t tlen, vpn_io_data_t *data) {
-    vpn_submit_udp_sendmsg(&vfastctx.io_ring, vfastctx.udp->fd, idx, tlen, data);
+static inline bool vfast_tun_write(int idx, vpn_io_data_t *d) {
+    return vpn_submit_tun_write(&vfastctx.io_ring, vfastctx.tun.fd, idx, d) == 0 ? true : false;
 }
 
-static inline void vfast_tun_read(int idx, vpn_io_data_t *d) {
-    vpn_submit_tun_read(&vfastctx.io_ring, vfastctx.tun.fd, idx, d);
-}
-
-static inline void vfast_tun_write(int idx, vpn_io_data_t *d) {
-    vpn_submit_tun_write(&vfastctx.io_ring, vfastctx.tun.fd, idx, d);
-}
-
-static inline void vfast_udp_write(int idx, size_t tlen, vpn_io_data_t *data) {
+static inline bool vfast_udp_write(int idx, size_t tlen, vpn_io_data_t *data) {
     int ret = vpn_submit_udp_send(&vfastctx.io_ring, vfastctx.udp->fd, idx, tlen, data);
     if (ret != 0) {
         atomic_fetch_add(&vfastctx.stats.drop_io_errors, 1);
-        vfast_tun_read(idx, data);
+        return false;
+    }
+    return true;
+}
+
+static inline void vfast_auto_reschedule(int idx) {
+    vpn_io_data_t *d = &vfastctx.io_data_pool[idx];
+    
+    d->sid = 0; 
+
+    if (d->source == SOURCE_TUN) {
+        vfast_tun_read(idx, d);
+    } else {
+        vfast_udp_read(idx, d);
     }
 }
 
 void vfast_report_performance(void);
 void vfast_io_warmup(vfast_ctx_t *ctx);
-void vfast_udp_rx(int res, int idx, vpn_io_data_t *data);
-void vfast_tun_rx(int res, int idx, vpn_io_data_t *data);
-void vfast_udp_client_rx(int res, int idx, vpn_io_data_t *data);
-void vfast_tun_client_rx(int res, int idx, vpn_io_data_t *data);
-void vfast_keep(int res, int idx, vpn_io_data_t *data);
+bool vfast_udp_rx(int res, int idx, vpn_io_data_t *data);
+bool vfast_tun_rx(int res, int idx, vpn_io_data_t *data);
+bool vfast_udp_client_rx(int res, int idx, vpn_io_data_t *data);
+bool vfast_tun_client_rx(int res, int idx, vpn_io_data_t *data);
+bool vfast_keeplive(int res, int idx, vpn_io_data_t *data);
+
 #endif

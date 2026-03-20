@@ -127,7 +127,6 @@ static int vfast_clean_server(void) {
 
 static int vfast_init_server(void) {
     memset(&vfastctx, 0, sizeof(vfast_ctx_t));
-    vfastctx.free_top = -1;
     atomic_store(&vfastctx.running, true);
 
     /* 1. Setup specialized signal handling */
@@ -150,12 +149,12 @@ static int vfast_init_server(void) {
         return -1;
     }
 
-    if (vpn_tun_init(&vfastctx.tun, "tun0", 1) < 0) {
+    if (vpn_tun_init(&vfastctx.tun, "tun0", 0) < 0) {
         log_error("Failed to initialize TUN device");
         return -1;
     }
     
-    vpn_tun_set_ip(vfastctx.tun.name, "10.0.0.1", "255.255.255.0");
+    vpn_tun_set_ip(vfastctx.tun.name, "10.0.0.1", VFAST_BROADCAST);
     vpn_tun_set_status(vfastctx.tun.name, VPN_MTU_DEFAULT, 1); /* MTU 1400 to allow header overhead */
     vpn_set_nonblocking(vfastctx.tun.fd);
 
@@ -166,7 +165,7 @@ static int vfast_init_server(void) {
     }
     vpn_set_nonblocking(vfastctx.udp->fd);
 
-    vfastctx.io_data_pool = zmalloc(sizeof(vpn_io_data_t) * IO_BUF_POOL_SIZE);
+    vfastctx.io_data_pool = zcalloc(sizeof(vpn_io_data_t) * IO_BUF_POOL_SIZE);
     if (!vfastctx.io_data_pool) goto cleanup;
 
     vfast_io_warmup(&vfastctx);
@@ -211,35 +210,24 @@ int main(int argc, char *argv[]) {
 
             if (unlikely(res <= 0)) {
                 atomic_fetch_add(&vfastctx.stats.drop_io_errors, 1);
-                if (res == -ECONNREFUSED || res == -EBADF) {
-                    log_error("Permanent error on idx %d, releasing buffer.", idx);
-                    vfast_buf_push(&vfastctx, idx);
-                } else {
-                    /* Error: Resubmit based on current state to keep the loop alive */
-                    if (data->type == IO_TYPE_TUN_READ || data->type == IO_TYPE_SOCK_WRITE)
-                        vfast_tun_read(idx, data);
-                    else
-                        vfast_udp_read(idx, data);
-                }
+                vfast_auto_reschedule(idx);
             } else {
                 /* Finite State Machine: High-speed packet routing */
                 switch (data->type) {
-                    case IO_TYPE_TUN_READ:
-                        vfast_tun_rx(res, idx, data);
-                        break;  // --->SOCK_WRITE
-                    case IO_TYPE_SOCK_WRITE:
-                        vfast_buf_push(&vfastctx, idx);
-                        int new_idx = vfast_buf_pop(&vfastctx);
-                        if (new_idx >= 0) vfast_tun_read(new_idx, data);
-                        break;
-                    case IO_TYPE_SOCK_READ: 
-                        vfast_udp_rx(res, idx, data);
-                        break; // --->TUN_WRITE
-                    case IO_TYPE_TUN_WRITE: 
-                        vfast_buf_push(&vfastctx, idx);
-                        int next_idx = vfast_buf_pop(&vfastctx);
-                        if (next_idx >= 0) vfast_udp_read(next_idx, data);
-                        break;
+                case IO_TYPE_TUN_READ:
+                    if (!vfast_tun_rx(res, idx, data)) {
+                        vfast_auto_reschedule(idx);
+                    }
+                    break;  // --->SOCK_WRITE
+                case IO_TYPE_SOCK_READ: 
+                    if (!vfast_udp_rx(res, idx, data)) {
+                        vfast_auto_reschedule(idx);
+                    }
+                    break; // --->TUN_WRITE
+                case IO_TYPE_SOCK_WRITE:
+                case IO_TYPE_TUN_WRITE:
+                    vfast_auto_reschedule(idx);
+                    break;
                 }
             }
             io_uring_cqe_seen(&vfastctx.io_ring.ring, cqe);

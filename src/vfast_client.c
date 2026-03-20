@@ -33,26 +33,12 @@ static void client_signal_handler(int sig) {
 }
 
 /**
- * vfast_recycle_buffer - Re-arms the I/O request based on its pipeline type.
- * Ensures no buffer is left idling in the pool after an error or completion.
- */
-static inline void vfast_recycle_buffer(int idx, vpn_io_data_t *data) {
-    if (data->type == IO_TYPE_TUN_READ || data->type == IO_TYPE_SOCK_WRITE) {
-        data->type = IO_TYPE_TUN_READ;
-        vfast_tun_read(idx, data);
-    } else {
-        data->type = IO_TYPE_SOCK_READ;
-        vfast_udp_read(idx, data);
-    }
-}
-
-/**
  * handle_io_event - FSM Dispatcher for I/O Completion.
  * Refactored to eliminate 'goto' statements for better structured flow.
  */
 static void handle_io_event(struct io_uring_cqe *cqe) {
     vpn_io_data_t *data = (vpn_io_data_t *)io_uring_cqe_get_data(cqe);
-    
+
     if (unlikely(!data)) return;
 
     int res = cqe->res;
@@ -61,41 +47,36 @@ static void handle_io_event(struct io_uring_cqe *cqe) {
 
     /* Handle I/O errors (e.g., interface down, buffer overflow) */
     if (unlikely(res <= 0)) {
-        if (res < 0 && res != -EAGAIN) {
-            log_error("I/O error at index %d: %s", idx, strerror(-res));
+        if (res < 0 && res != -EAGAIN && res != -ECANCELED) {
+            log_error("I/O error at idx %d, type %d: %s", idx, data->type, strerror(-res));
         }
-        vfast_recycle_buffer(idx, data);
+        vfast_auto_reschedule(idx);
         return;
     }
-    int new_idx = -1;
     /* Primary State Transition Logic */
     switch (data->type) {
-        case IO_TYPE_TUN_READ:
-           if (vfast_fsm_is_connected()) {
-                vfast_tun_client_rx(res, idx, data);
-            } else {
-                vfast_tun_read(idx, data);
+    case IO_TYPE_TUN_READ:
+        if (vfast_fsm_is_connected()) {
+            if (!vfast_tun_client_rx(res, idx, data)) {
+                vfast_auto_reschedule(idx);
             }
-            break;
-        case IO_TYPE_SOCK_WRITE:
-            /* Transmission success: return buffer to TUN ingress */
-            vfast_buf_push(&vfastctx, idx);
-            new_idx = vfast_buf_pop(&vfastctx);
-            if (new_idx >= 0) vfast_tun_read(idx, data);
-            break;
-        case IO_TYPE_SOCK_READ:
-            vfast_udp_client_rx(res, idx, data);
-            break;
-        case IO_TYPE_TUN_WRITE:
-            /* Interface write success: return buffer to UDP egress */
-            vfast_buf_push(&vfastctx, idx);
-            new_idx = vfast_buf_pop(&vfastctx);
-            if (new_idx >= 0) vfast_udp_read(idx, data);
-            break;
-        default:
-            log_warn("Undefined state for buffer %d, forcing recycle", idx);
-            vfast_recycle_buffer(idx, data);
-            break;
+        } else {
+            vfast_auto_reschedule(idx);
+        }
+        break; // --->SOCK_WRITE
+    case IO_TYPE_SOCK_READ:
+        if (!vfast_udp_client_rx(res, idx, data)) {
+            vfast_auto_reschedule(idx);
+        }
+        break; // --->TUN_WRITE
+    case IO_TYPE_SOCK_WRITE:
+    case IO_TYPE_TUN_WRITE:
+        vfast_auto_reschedule(idx);
+        break;
+    default:
+        log_warn("Undefined state for buffer %d, forcing recycle", idx);
+        vfast_auto_reschedule(idx);
+        break;
     }
 }
 
@@ -126,7 +107,6 @@ static void vfast_cleanup() {
  */
 static int vfast_init_client(const char *remote_ip) {
     memset(&vfastctx, 0, sizeof(vfast_ctx_t));
-    vfastctx.free_top = -1;
     atomic_store(&vfastctx.running, true);
 
     /* Signal Registration */
@@ -144,7 +124,7 @@ static int vfast_init_client(const char *remote_ip) {
     /* Networking Subsystem Initialization */
     if (vpn_iouring_init(&vfastctx.io_ring, IO_RING_DEPTH) < 0) return -1;
 
-    if (vpn_tun_init(&vfastctx.tun, "tun0", 1) < 0) return -1;
+    if (vpn_tun_init(&vfastctx.tun, "tun0", 0) < 0) return -1;
     // vpn_tun_set_ip(vfastctx.tun.name, "10.0.0.2", "255.255.255.0");
     vpn_tun_set_status(vfastctx.tun.name, VPN_MTU_DEFAULT, 1);
     

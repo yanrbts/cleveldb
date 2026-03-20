@@ -311,7 +311,7 @@ int vpn_submit_tun_write(vpn_iouring_ctx_t *ctx, int tun_fd, int buf_idx, vpn_io
     d->type = IO_TYPE_TUN_WRITE;
     d->buf_idx = buf_idx;
     d->fd = tun_fd;
-    d->buf_len = target_len;
+    d->buf_len = ctx->iovecs[buf_idx].iov_len;
 
     /* 3. Prepare fixed write using the calculated internal pointer.
      * The kernel validates that target_ptr is within the buffer registered at buf_idx.
