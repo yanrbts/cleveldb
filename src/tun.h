@@ -7,7 +7,6 @@
 #define __TUN_H__
 
 #include <stddef.h>
-
 #include <linux/if_tun.h>
 
 typedef struct {
