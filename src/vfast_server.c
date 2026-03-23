@@ -46,6 +46,7 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <errno.h>
+#include <locale.h>
 
 #include "log.h"
 #include "utils.h"
@@ -55,11 +56,17 @@
 #include "zmalloc.h"
 #include "udp.h"
 #include "protocol.h"
+#include "option.h"
+
+struct vfast_server {
+    vpn_option_t opt;
+    vfast_ctx_t ctx;
+} vfserver;
 
 /* Simple signal handling for graceful shutdown */
 static void vfast_signal_handler(int sig) {
     (void)sig;
-    atomic_store(&vfastctx.running, false);
+    atomic_store(&vfserver.ctx.running, false);
 }
 
 /**
@@ -101,40 +108,43 @@ int vfast_setup_signals(void) {
 static int vfast_clean_server(void) {
     log_info("Initiating graceful shutdown...");
     /* 1. Stop the Transport (UDP) */
-    if (vfastctx.udp) {
-        udp_close(vfastctx.udp);
-        vfastctx.udp = NULL;
+    if (vfserver.ctx.udp) {
+        udp_close(vfserver.ctx.udp);
+        vfserver.ctx.udp = NULL;
     }
 
     /* 3. Close the TUN device */
-    vpn_tun_destroy(&vfastctx.tun);
+    vpn_tun_destroy(&vfserver.ctx.tun);
 
     /* 4. Business logic teardown */
     vpn_session_destroy();
-    vpn_ip_pool_destroy(&vfastctx.ip_pool);
+    vpn_ip_pool_destroy(&vfserver.ctx.ip_pool);
 
     /* 2. Destroy the Ring FIRST (The most sensitive resource) */
     /* This will force cancellation of all inflight SQEs */
-    vpn_iouring_destroy(&vfastctx.io_ring);
+    vpn_iouring_destroy(&vfserver.ctx.io_ring);
 
-    if (vfastctx.io_data_pool) {
-        zfree(vfastctx.io_data_pool);
+    if (vfserver.ctx.io_data_pool) {
+        zfree(vfserver.ctx.io_data_pool);
     }
+
+    vpn_option_clean(&vfserver.opt);
 
     log_info("VFAST server halted safely.");
     return 0;
 }
 
 static int vfast_init_server(void) {
-    memset(&vfastctx, 0, sizeof(vfast_ctx_t));
-    atomic_store(&vfastctx.running, true);
+    memset(&vfserver.ctx, 0, sizeof(vfast_ctx_t));
+    atomic_store(&vfserver.ctx.running, true);
 
     /* 1. Setup specialized signal handling */
     if (vfast_setup_signals() < 0) return -1;
 
     /* Initialize IPAM (The IP Pool) - MUST be before sessions */
     /* Starting from 10.0.0.0 with 65536 addresses (/16) */
-    if (vpn_ip_pool_init(&vfastctx.ip_pool, "10.0.0.0", 65536) != 0) {
+    if (vpn_ip_pool_init(&vfserver.ctx.ip_pool, 
+        vfserver.opt.pool_network, vfserver.opt.pool_size) != 0) {
         log_error("Failed to initialize IP Pool");
         return -1;
     }
@@ -144,31 +154,31 @@ static int vfast_init_server(void) {
         return -1;
     }
 
-    if (vpn_iouring_init(&vfastctx.io_ring, IO_RING_DEPTH) < 0) {
+    if (vpn_iouring_init(&vfserver.ctx.io_ring, vfserver.opt.io_ring_depth) < 0) {
         log_error("Init iouring failed");
         return -1;
     }
 
-    if (vpn_tun_init(&vfastctx.tun, "tun0", 0) < 0) {
+    if (vpn_tun_init(&vfserver.ctx.tun, vfserver.opt.tun_name, 0) < 0) {
         log_error("Failed to initialize TUN device");
         return -1;
     }
-    vpn_tun_disable_ipv6("tun0");
-    vpn_tun_set_ip(vfastctx.tun.name, "10.0.0.1", VFAST_BROADCAST);
-    vpn_tun_set_status(vfastctx.tun.name, VPN_MTU_DEFAULT, 1); /* MTU 1400 to allow header overhead */
-    vpn_set_nonblocking(vfastctx.tun.fd);
+    vpn_tun_disable_ipv6(vfserver.opt.tun_name);
+    vpn_tun_set_ip(vfserver.ctx.tun.name, vfserver.opt.tun_ip, VFAST_BROADCAST);
+    vpn_tun_set_status(vfserver.ctx.tun.name, vfserver.opt.mtu, 1); /* MTU 1400 to allow header overhead */
+    vpn_set_nonblocking(vfserver.ctx.tun.fd);
 
-    vfastctx.udp = udp_init_listener(9999, 20); 
-    if (!vfastctx.udp) {
+    vfserver.ctx.udp = udp_init_listener(vfserver.opt.local_port, vfserver.opt.udp_backlog); 
+    if (!vfserver.ctx.udp) {
         log_error("Failed to init UDP listener");
         goto cleanup;
     }
-    vpn_set_nonblocking(vfastctx.udp->fd);
+    vpn_set_nonblocking(vfserver.ctx.udp->fd);
 
-    vfastctx.io_data_pool = zcalloc(sizeof(vpn_io_data_t) * IO_BUF_POOL_SIZE);
-    if (!vfastctx.io_data_pool) goto cleanup;
+    vfserver.ctx.io_data_pool = zcalloc(sizeof(vpn_io_data_t) * IO_BUF_POOL_SIZE);
+    if (!vfserver.ctx.io_data_pool) goto cleanup;
 
-    vfast_io_warmup(&vfastctx);
+    vfast_io_warmup(&vfserver.ctx);
     return 0;
 
 cleanup:
@@ -176,24 +186,77 @@ cleanup:
     return -1;
 }
 
+static void version(void) {
+    printf("vfast server v=%d\n", VFAST_VERSION);
+    exit(0);
+}
+
+static void usage(void) {
+    fprintf(stderr,"Usage: ./vfast_server [/path/to/config.conf]\n");
+    fprintf(stderr,"       ./vfast_server -v or --version\n");
+    fprintf(stderr,"       ./vfast_server -h or --help\n");
+    fprintf(stderr,"Examples:\n");
+    fprintf(stderr,"       ./vfast_server (run the server with default conf)\n");
+    fprintf(stderr,"       ./vfast_server /etc/vfast_server/config.conf\n");
+    exit(1);
+}
+
 /* * Core Event Loop - Optimized for Clarity
  */
 int main(int argc, char *argv[]) {
-    UNUSED(argc); UNUSED(argv);
+    int j;
+    /* The setlocale() function is used to set or query the program's current locale.
+     * 
+     * The function is used to set the current locale of the program and the 
+     * collation of the specified locale. Specifically, the LC_COLLATE parameter
+     * represents the collation of the region. By setting it to an empty string,
+     * the default locale collation is used.*/
+    setlocale(LC_COLLATE, "");
+
+    /* The  tzset()  function initializes the tzname variable from the TZ environment variable.  
+     * This function is automati‐cally called by the other time conversion functions 
+     * that depend on the timezone.*/
+    tzset();
+
+    vpn_option_init(&vfserver.opt);
+
+    if (argc >= 2) {
+        j = 1;
+        char *configfile = NULL;
+        char *tp = NULL;
+        /* Handle special options --help and --version */
+        if (strcmp(argv[1], "-v") == 0 ||
+            strcmp(argv[1], "--version") == 0) version();
+        if (strcmp(argv[1], "--help") == 0 ||
+            strcmp(argv[1], "-h") == 0) usage();
+        
+        /* First argument is the config file name? */
+        if (argv[j][0] != '-' || argv[j][1] != '-') {
+            configfile = argv[j];
+            if ((tp = (char*)vpn_get_absolute_path(configfile)) != NULL) {
+                zfree(vfserver.opt.cfile);
+                vfserver.opt.cfile = tp;
+            } else {
+                log_info("Warning: no config file specified, using the default config.");
+            }
+        }
+    }
+
+    vpn_option_conf(&vfserver.opt, vfserver.opt.cfile);
 
     if (vfast_init_server() < 0) return 1;
 
     struct io_uring_cqe *cqes[16]; // Batch processing array
     static uint64_t last_check_pkt = 0;
 
-    while (atomic_load(&vfastctx.running)) {
+    while (atomic_load(&vfserver.ctx.running)) {
         /* Batch-peek completions to minimize synchronization overhead */
-        int count = io_uring_peek_batch_cqe(&vfastctx.io_ring.ring, cqes, 16);
+        int count = io_uring_peek_batch_cqe(&vfserver.ctx.io_ring.ring, cqes, 16);
         
         /* If no completions, wait for at least one */
         if (count == 0) {
             struct io_uring_cqe *cqe;
-            int ret = io_uring_wait_cqe(&vfastctx.io_ring.ring, &cqe);
+            int ret = io_uring_wait_cqe(&vfserver.ctx.io_ring.ring, &cqe);
             if (ret < 0) {
                 if (ret == -EINTR) break; /* Normal exit on signal */
                 log_error("Fatal io_uring error: %d", ret);
@@ -209,41 +272,41 @@ int main(int argc, char *argv[]) {
             int res = cqe->res, idx = data->buf_idx;
 
             if (unlikely(res <= 0)) {
-                atomic_fetch_add(&vfastctx.stats.drop_io_errors, 1);
-                vfast_auto_reschedule(idx);
+                atomic_fetch_add(&vfserver.ctx.stats.drop_io_errors, 1);
+                vfast_auto_reschedule(&vfserver.ctx, idx);
             } else {
                 /* Finite State Machine: High-speed packet routing */
                 switch (data->type) {
                 case IO_TYPE_TUN_READ:
-                    if (!vfast_tun_rx(res, idx, data)) {
-                        vfast_auto_reschedule(idx);
+                    if (!vfast_tun_rx(&vfserver.ctx, res, idx, data)) {
+                        vfast_auto_reschedule(&vfserver.ctx, idx);
                     }
                     break;  // --->SOCK_WRITE
                 case IO_TYPE_SOCK_READ: 
-                    if (!vfast_udp_rx(res, idx, data)) {
-                        vfast_auto_reschedule(idx);
+                    if (!vfast_udp_rx(&vfserver.ctx, res, idx, data)) {
+                        vfast_auto_reschedule(&vfserver.ctx, idx);
                     }
                     break; // --->TUN_WRITE
                 case IO_TYPE_SOCK_WRITE:
                 case IO_TYPE_TUN_WRITE:
-                    vfast_auto_reschedule(idx);
+                    vfast_auto_reschedule(&vfserver.ctx, idx);
                     break;
                 }
             }
-            io_uring_cqe_seen(&vfastctx.io_ring.ring, cqe);
+            io_uring_cqe_seen(&vfserver.ctx.io_ring.ring, cqe);
 
             last_check_pkt++;
         }
 
         if (unlikely(last_check_pkt >= 50000)) {
             last_check_pkt = 0;
-            vpn_session_clean_timeout(&vfastctx.ip_pool, 60);
+            vpn_session_clean_timeout(&vfserver.ctx.ip_pool, 60);
             log_info("Periodic cleanup: scan timeout sessions.");
 
-            vfast_report_performance();
+            vfast_report_performance(&vfserver.ctx);
         }
         /* Submit all queued SQEs in one single batch to improve SQPOLL efficiency */
-        vpn_iouring_flush(&vfastctx.io_ring);
+        vpn_iouring_flush(&vfserver.ctx.io_ring);
     }
 
     vfast_clean_server();

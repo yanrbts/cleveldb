@@ -11,6 +11,6 @@
 #define unlikely(x)     __builtin_expect(!!(x), 0)
 
 int vpn_set_nonblocking(int fd);
-const char *get_absolute_path(char *filename);
+const char *vpn_get_absolute_path(char *filename);
 
 #endif

@@ -53,7 +53,7 @@ static void *fsm_worker(void *arg) {
     (void)arg;
     log_info("FSM: Background worker thread initiated.");
 
-    while (likely(atomic_load(&vfastctx.running))) {
+    while (likely(atomic_load(client_fsm.running))) {
         time_t now = time(NULL);
         int state = atomic_load(&client_fsm.state);
         long last_rx = atomic_load(&client_fsm.last_rx_time);
@@ -106,19 +106,21 @@ static void *fsm_worker(void *arg) {
 /**
  * @brief Initializes the FSM and spawns the management thread.
  */
-int vfast_fsm_init(const udp_conn_t *udp, const char *sip, uint16_t sport) {
+int vfast_fsm_init(const udp_conn_t *udp, const char *sip, uint16_t sport, atomic_bool *rig) {
     if (!udp || !sip) return -1;
 
     memset(&client_fsm, 0, sizeof(vfast_fsm_t));
     client_fsm.udp = (udp_conn_t*)udp;
     client_fsm.server_port = sport;
     strncpy(client_fsm.server_ip, sip, sizeof(client_fsm.server_ip) - 1);
+    client_fsm.server_ip[sizeof(client_fsm.server_ip) - 1] = '\0';
     
     /* Initialize activity timers to current time to prevent instant timeout */
     time_t now = time(NULL);
     atomic_store(&client_fsm.last_rx_time, now);
     client_fsm.last_tx_auth = 0;
     client_fsm.last_tx_keep = 0;
+    client_fsm.running = rig;
 
     atomic_store(&client_fsm.state, ST_IDLE);
 
@@ -139,4 +141,16 @@ void vfast_fsm_update_rx() {
  */
 int vfast_fsm_is_connected() { 
     return atomic_load(&client_fsm.state) == ST_CONNECTED; 
+}
+
+void vfast_fsm_force_reconnect() {
+    int current_state = atomic_load(&client_fsm.state);
+    if (current_state == ST_CONNECTED) {
+        atomic_store(&client_fsm.state, ST_IDLE);
+        atomic_store(&client_fsm.sid, 0); 
+    }
+}
+
+void vfast_fsm_pthread_join() {
+    pthread_join(client_fsm.thread_id, NULL);
 }

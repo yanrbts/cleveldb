@@ -30,12 +30,15 @@ typedef struct {
     char          server_ip[64];
     uint16_t      server_port;
     udp_conn_t    *udp;
+    atomic_bool   *running;   /* Control flag for main loop */
 } vfast_fsm_t;
 
 extern vfast_fsm_t client_fsm;
 
-int  vfast_fsm_init(const udp_conn_t *udp, const char *sip, uint16_t sport);
+int  vfast_fsm_init(const udp_conn_t *udp, const char *sip, uint16_t sport, atomic_bool *rig);
 void vfast_fsm_update_rx();
 int  vfast_fsm_is_connected();
+void vfast_fsm_force_reconnect();
+void vfast_fsm_pthread_join();
 
 #endif
