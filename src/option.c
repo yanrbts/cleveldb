@@ -22,7 +22,8 @@
 #define VPN_OPT_UDP_BACKLOG         20     /* Default 20MB for UDP receive buffer to prevent drops during bursts */
 #define VPN_OPT_DEFAULT_PID_FILE    "/var/run/vfast.pid"
 #define VPN_OPT_DEFAULT_FILE        "./config.conf"
-#define VPN_OPT_DEFAULT_LOG_FILE     "./vfast.conf"
+#define VPN_OPT_DEFAULT_LOG_FILE    "./vfast.log"
+#define VPN_OPT_DEFAULT_KEY_FILE    "./vfast.key"
 /* --- Client Defaults --- */
 #define VPN_OPT_REMOTE_HOST         "127.0.0.1"
 #define VPN_OPT_REMOTE_PORT         9999
@@ -70,6 +71,7 @@ void vpn_option_init(vpn_option_t *opt) {
     opt->cfile         = zstrdup(VPN_OPT_DEFAULT_FILE);
     opt->pidfile       = zstrdup(VPN_OPT_DEFAULT_PID_FILE);
     opt->logfile       = zstrdup(VPN_OPT_DEFAULT_LOG_FILE);
+    opt->keyfile       = zstrdup(VPN_OPT_DEFAULT_KEY_FILE);
     /* Client */
     strncpy(opt->remote_host, VPN_OPT_REMOTE_HOST, sizeof(opt->remote_host) - 1);
     opt->remote_port   = VPN_OPT_REMOTE_PORT;
@@ -210,6 +212,21 @@ void vpn_option_conf(vpn_option_t *opt, const char *cfile) {
                 }
                 fclose(logfp);
             }
+        } else if (!strcasecmp(first, "keyfile")) {
+            memset(tmp, 0, sizeof(tmp));
+            zfree(opt->keyfile);
+            opt->keyfile = zstrdup(second);
+            if (opt->keyfile[0] != '\0') {
+                /* Test if we are able to open the file. The server will not
+                 * be able to abort just for this problem later... */
+                logfp = fopen(opt->keyfile,"a");
+                if (logfp == NULL) {
+                    snprintf(tmp, sizeof(tmp), "Can't open the key file: %s", strerror(errno));
+                    err = tmp;
+                    goto loaderr;
+                }
+                fclose(logfp);
+            }
         } else if (!strcasecmp(first, "pidfile")) {
             zfree(opt->pidfile);
             opt->pidfile = zstrdup(second);
@@ -238,6 +255,7 @@ void vpn_option_clean(vpn_option_t *opt) {
     if (opt->logfile) zfree(opt->logfile);
     if (opt->pidfile) zfree(opt->pidfile);
     if (opt->cfile) zfree(opt->cfile);
+    if (opt->keyfile) zfree(opt->keyfile);
 
     log_info("Options resource cleanup...");
 }

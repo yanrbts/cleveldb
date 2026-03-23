@@ -16,6 +16,7 @@
 #include "ippool.h"
 #include "log.h"
 #include "utils.h"
+#include "crypto.h"
 
 #define VFAST_VERSION       1
 #define VFAST_BROADCAST     "255.255.255.0"
@@ -97,5 +98,6 @@ bool vfast_tun_rx(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t *data);
 bool vfast_udp_client_rx(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t *data);
 bool vfast_tun_client_rx(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t *data);
 bool vfast_keeplive(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t *data);
+int vfast_load_key(const char *key_path, uint8_t out_key[CRYPTO_KEY_SIZE]);
 
 #endif

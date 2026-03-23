@@ -134,7 +134,10 @@ static int vfast_init_client() {
     }
 
     /* Networking Subsystem Initialization */
-    if (vpn_iouring_init(&vfclient.ctx.io_ring, vfclient.opt.io_ring_depth) < 0) return -1;
+    if (vpn_iouring_init(
+        &vfclient.ctx.io_ring, 
+        vfclient.opt.io_ring_depth, 
+        vfclient.opt.master_key) < 0) return -1;
 
     if (vpn_tun_init(&vfclient.ctx.tun, vfclient.opt.tun_name, 0) < 0) return -1;
     // vpn_tun_set_ip(vfastctx.tun.name, "10.0.0.2", "255.255.255.0");

@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <net/if.h>
+#include "crypto.h"
 
 typedef struct vpn_option_s {
     /* Common Configuration (Shared by Server & Client) */
@@ -23,6 +24,8 @@ typedef struct vpn_option_s {
     char     *cfile;
     char     *logfile;
     char     *pidfile;
+    char     *keyfile;
+    uint8_t  master_key[CRYPTO_KEY_SIZE];
     /* Client-Specific Configuration */
     char     remote_host[64];       /* Remote server IP address or hostname to connect to */
     int      remote_port;           /* Destination port on the remote server (e.g., 9999) */

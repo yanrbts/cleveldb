@@ -70,6 +70,53 @@ static void vfast_signal_handler(int sig) {
 }
 
 /**
+ * @brief Command: --keygen
+ * Generates a 256-bit key and saves it to 'vfast.key' with restricted permissions.
+ */
+static void vfast_cmd_keygen(void) {
+    uint8_t tmp_key[CRYPTO_KEY_SIZE];
+    const char *key_file = "vfast.key";
+    
+    log_info("[ VFAST ] Generating industrial strength key...\n");
+
+    // 1. 获取系统随机数
+    if (vpn_generate_key(tmp_key) != 0) {
+        log_error("FATAL: Could not gather enough entropy from system.\n");
+        exit(1);
+    }
+
+    // 2. 打开文件。使用 O_EXCL 确保如果文件已存在则报错，防止意外覆盖旧密钥
+    // S_IRUSR | S_IWUSR 设置权限为 0600 (仅所有者可读写)
+    int fd = open(key_file, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        if (errno == EEXIST) {
+            log_error("ERROR: '%s' already exists. Refusing to overwrite.\n", key_file);
+        } else {
+            log_error("ERROR: Failed to create key file: %s\n", strerror(errno));
+        }
+        vpn_secure_cleanup(tmp_key, CRYPTO_KEY_SIZE);
+        exit(1);
+    }
+
+    // 3. 将 32 字节二进制密钥写入文件
+    ssize_t n = write(fd, tmp_key, CRYPTO_KEY_SIZE);
+    close(fd);
+
+    if (n != CRYPTO_KEY_SIZE) {
+        log_error("ERROR: Partial write to key file. Disk full?\n");
+        unlink(key_file); // 删除损坏的不完整文件
+        exit(1);
+    }
+
+    // 4. 清理并退出
+    vpn_secure_cleanup(tmp_key, CRYPTO_KEY_SIZE);
+    
+    log_info("[ SUCCESS ]: Key securely saved to '%s' (Permissions: 0600).\n", key_file);
+    log_info("Keep this file safe. Loss of this file means loss of access.\n");
+    exit(0);
+}
+
+/**
  * vfast_setup_signals - Industrial-grade signal registration.
  * Registers SIGINT and SIGTERM to trigger a graceful exit.
  * * NOTE: We explicitly omit SA_RESTART. This ensures that blocking 
@@ -138,6 +185,11 @@ static int vfast_init_server(void) {
     memset(&vfserver.ctx, 0, sizeof(vfast_ctx_t));
     atomic_store(&vfserver.ctx.running, true);
 
+    if (vfast_load_key(vfserver.opt.keyfile, vfserver.opt.master_key) < 0) {
+        log_error("Failed load key file.");
+        return -1;
+    }
+
     /* 1. Setup specialized signal handling */
     if (vfast_setup_signals() < 0) return -1;
 
@@ -154,7 +206,10 @@ static int vfast_init_server(void) {
         return -1;
     }
 
-    if (vpn_iouring_init(&vfserver.ctx.io_ring, vfserver.opt.io_ring_depth) < 0) {
+    if (vpn_iouring_init(
+        &vfserver.ctx.io_ring, 
+        vfserver.opt.io_ring_depth, 
+        vfserver.opt.master_key) < 0) {
         log_error("Init iouring failed");
         return -1;
     }
@@ -193,6 +248,7 @@ static void version(void) {
 
 static void usage(void) {
     fprintf(stderr,"Usage: ./vfast_server [/path/to/config.conf]\n");
+    fprintf(stderr,"       ./vfast_server -g or --keygen\n");
     fprintf(stderr,"       ./vfast_server -v or --version\n");
     fprintf(stderr,"       ./vfast_server -h or --help\n");
     fprintf(stderr,"Examples:\n");
@@ -229,7 +285,9 @@ int main(int argc, char *argv[]) {
             strcmp(argv[1], "--version") == 0) version();
         if (strcmp(argv[1], "--help") == 0 ||
             strcmp(argv[1], "-h") == 0) usage();
-        
+        if (strcmp(argv[1], "-g") == 0 || 
+            strcmp(argv[1], "--keygen") == 0)
+            vfast_cmd_keygen();
         /* First argument is the config file name? */
         if (argv[j][0] != '-' || argv[j][1] != '-') {
             configfile = argv[j];
@@ -270,6 +328,7 @@ int main(int argc, char *argv[]) {
             struct io_uring_cqe *cqe = cqes[i];
             vpn_io_data_t *data = (vpn_io_data_t *)io_uring_cqe_get_data(cqe);
             int res = cqe->res, idx = data->buf_idx;
+            data->res = res;
 
             if (unlikely(res <= 0)) {
                 atomic_fetch_add(&vfserver.ctx.stats.drop_io_errors, 1);
