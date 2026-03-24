@@ -101,10 +101,6 @@ static bool vfast_udp_forward(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t 
         data->sid = sid;
 
         /* 4. Forward: Write the inner IP packet to TUN device */
-        /* Provide exact inner packet length to the TUN write path so we
-         * don't attempt to write the entire buffer (which may contain
-         * trailing garbage or crypto material). */
-        data->res = (size_t)plen;
         vfast_tun_write(ctx, idx, data);
         return true;
     }
@@ -286,19 +282,31 @@ bool vfast_udp_client_rx(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t *data
     switch (hdr->msg_type) {
     case VPN_MSG_DATA:
         if (vfast_fsm_is_connected()) {
-            /* Decrypt and validate the incoming VFAST packet before writing to TUN */
-            int plen = 0;
-            uint32_t sid = 0;
-            uint8_t *ip_pkt = vpn_unpack(ctx->key, base, res, &plen, &sid);
-            if (!ip_pkt) {
-                atomic_fetch_add(&ctx->stats.drop_unpack_error, 1);
+            // return vfast_tun_write(ctx, idx, data);
+
+            int plain_ip_len = 0;
+            uint32_t recv_sid = 0;
+
+            /* 1. 解密操作：将 132 字节的加密包还原为 84 字节的明文 IP 包 */
+            // 注意：base + VPN_TNL_HLEN 处开始是加密数据，解密后明文也会放在这里
+            uint8_t *payload_ptr = vpn_unpack(ctx->key, base, res, &plain_ip_len, &recv_sid);
+
+            if (unlikely(!payload_ptr)) {
+                log_warn("Data packet decryption failed or MAC mismatch.");
                 return false;
             }
-            /* Update session and annotate metadata for the write path */
-            struct iphdr *iph = (struct iphdr *)ip_pkt;
-            data->sid = sid;
-            vpn_session_update(iph->saddr, sid, &data->udp_meta.client_addr);
-            data->res = (size_t)plen; /* actual plaintext length to write into TUN */
+
+            /* 2. 检查 SID 一致性：防止会话劫持或串扰 */
+            // if (unlikely(recv_sid != client_fsm.sid)) {
+            //     log_warn("SID mismatch: expected 0x%08x, got 0x%08x", client_fsm.sid, recv_sid);
+            //     return false;
+            // }
+
+            /* 3. 更新数据长度：告诉 vfast_tun_write 应该写入多少字节 (plain_ip_len) */
+            // 如果不更新这个长度，TUN 依然会尝试写入原始的 132 字节，导致内核报错
+            data->buf_len = plain_ip_len;
+
+            /* 4. 写入 TUN 设备 */
             return vfast_tun_write(ctx, idx, data);
         }
         break;
