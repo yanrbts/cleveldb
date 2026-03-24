@@ -91,7 +91,7 @@ static bool vfast_udp_forward(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t 
 
     /* 2. Decapsulate: Strip VFAST header and get pointer to inner IP packet */
     uint8_t *base = (uint8_t *)ctx->io_ring.iovecs[idx].iov_base;
-    uint8_t *ip_pkt = vpn_unpack(base, res, &plen, &sid);
+    uint8_t *ip_pkt = vpn_unpack(ctx->key, base, res, &plen, &sid);
     
     if (likely(ip_pkt != NULL)) {
         struct iphdr *iph = (struct iphdr *)ip_pkt;
@@ -101,7 +101,10 @@ static bool vfast_udp_forward(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t 
         data->sid = sid;
 
         /* 4. Forward: Write the inner IP packet to TUN device */
-        // data->buf_len = plain_len;
+        /* Provide exact inner packet length to the TUN write path so we
+         * don't attempt to write the entire buffer (which may contain
+         * trailing garbage or crypto material). */
+        data->res = (size_t)plen;
         vfast_tun_write(ctx, idx, data);
         return true;
     }
@@ -259,9 +262,10 @@ bool vfast_tun_rx(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t *data) {
         return false;
     }
 
-    int tlen = vpn_pack(base, res, IO_BUF_SIZE, VPN_MSG_DATA, data->sid);
+    int tlen = vpn_pack(ctx->key, base, res, IO_BUF_SIZE, VPN_MSG_DATA, data->sid);
     if (unlikely(tlen <= 0)) {
         atomic_fetch_add(&ctx->stats.drop_pack_error, 1);
+        log_error("Pack failed");
         return false;
     }
     /* Send encapsulated packet to client's UDP endpoint. Use sendmsg so
@@ -282,6 +286,19 @@ bool vfast_udp_client_rx(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t *data
     switch (hdr->msg_type) {
     case VPN_MSG_DATA:
         if (vfast_fsm_is_connected()) {
+            /* Decrypt and validate the incoming VFAST packet before writing to TUN */
+            int plen = 0;
+            uint32_t sid = 0;
+            uint8_t *ip_pkt = vpn_unpack(ctx->key, base, res, &plen, &sid);
+            if (!ip_pkt) {
+                atomic_fetch_add(&ctx->stats.drop_unpack_error, 1);
+                return false;
+            }
+            /* Update session and annotate metadata for the write path */
+            struct iphdr *iph = (struct iphdr *)ip_pkt;
+            data->sid = sid;
+            vpn_session_update(iph->saddr, sid, &data->udp_meta.client_addr);
+            data->res = (size_t)plen; /* actual plaintext length to write into TUN */
             return vfast_tun_write(ctx, idx, data);
         }
         break;
@@ -333,10 +350,13 @@ bool vfast_tun_client_rx(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t *data
      * - Writes the header starting at base_ptr[0].
      * - Expects the raw IP packet to already be at base_ptr[8].
      * - Returns: Total length (Header + Payload) or <= 0 on failure. */
-    int total_len = vpn_pack(base_ptr, res, IO_BUF_SIZE, VPN_MSG_DATA, data->sid);
+    int total_len = vpn_pack(ctx->key, base_ptr, res, IO_BUF_SIZE, VPN_MSG_DATA, data->sid);
+
+    // log_debug("POST-PACK [idx:%d]: total_len=%d, sid=0x%x", idx, total_len, data->sid);
 
     if (unlikely(total_len <= 0)) {
         atomic_fetch_add(&ctx->stats.drop_pack_error, 1);
+        log_error("Pack failed");
         return false;
     }
 

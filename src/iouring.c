@@ -18,7 +18,7 @@
  * vpn_iouring_init - Initialize the io_uring instance.
  * @entries: Queue depth (e.g., 4096).
  */
-int vpn_iouring_init(vpn_iouring_ctx_t *ctx, uint32_t entries, const uint8_t *key) {
+int vpn_iouring_init(vpn_iouring_ctx_t *ctx, uint32_t entries) {
     struct io_uring_params params;
     struct rlimit rlim;
 
@@ -71,8 +71,6 @@ int vpn_iouring_init(vpn_iouring_ctx_t *ctx, uint32_t entries, const uint8_t *ke
         log_error("io_uring_register_buffers");
         return -1;
     }
-
-    ctx->key = key;
 
     return 0;
 }
@@ -151,23 +149,6 @@ int vpn_submit_udp_sendmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t l
         return -EMSGSIZE;
     }
 
-    uint8_t *base = (uint8_t *)ctx->iovecs[buf_idx].iov_base;
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)base;
-
-    if (hdr->msg_type == VPN_MSG_DATA) {
-        uint8_t *plain_ptr = base + VPN_TNL_HLEN;
-        size_t plain_len = len - VPN_TNL_HLEN;
-        
-        size_t final_crypto_len = 0;
-        if (vpn_encrypt(ctx->key, plain_ptr, plain_len, 
-                        plain_ptr, &final_crypto_len) == 0) {
-            // Header(8) + Nonce(24) + Cipher(len) + Tag(16)
-            len = VPN_TNL_HLEN + final_crypto_len; 
-        } else {
-            return -EPERM;
-        }
-    }
-
     io_data->fd = fd;
     io_data->buf_idx = buf_idx;
     io_data->buf_len = ctx->iovecs[buf_idx].iov_len;
@@ -203,6 +184,15 @@ int vpn_submit_udp_send(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t len,
         if (!sqe) return -EBUSY;
     }
 
+    /* Defensive validation: prevent submitting a write larger than the fixed buffer.
+     * Without this check, io_uring_prep_write_fixed may later fail and produce a
+     * negative completion result (e.g., -EMSGSIZE), which surfaces as I/O errors.
+     */
+    if (unlikely(len > IO_BUF_SIZE || len == 0)) {
+        log_error("Invalid send length (write): %zu", len);
+        return -EMSGSIZE;
+    }
+
     /* 3. Asynchronous Submission to io_uring
      * Prepare the state machine for the next stage (Transmission Completion). */
     io_data->type = IO_TYPE_SOCK_WRITE;
@@ -211,7 +201,6 @@ int vpn_submit_udp_send(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t len,
     io_data->fd = fd;
 
     uint8_t *base = (uint8_t *)ctx->iovecs[buf_idx].iov_base;
-
     /* 4. Prepare Fixed Buffer Write
      * io_uring_prep_write_fixed provides the highest throughput by avoiding 
      * repetitive page mapping and kernel-to-user memory pinning. */
@@ -320,38 +309,12 @@ int vpn_submit_tun_write(vpn_iouring_ctx_t *ctx, int tun_fd, int buf_idx, vpn_io
         if (!sqe) return -EBUSY;
     }
 
-    uint8_t *base = (uint8_t *)ctx->iovecs[buf_idx].iov_base;
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)base;
-
-    /* --- 核心修改：入站解密逻辑 --- */
-    uint8_t *target_ptr = base + VPN_TNL_HLEN; // 最终要写入 TUN 的位置
-    size_t final_len = 0;
-
-    if (hdr->msg_type == VPN_MSG_DATA) {
-        // packet_ptr 指向加密数据的开头（Header 之后）
-        const uint8_t *packet_ptr = base + VPN_TNL_HLEN;
-        size_t packet_len = d->res - VPN_TNL_HLEN; // 密文 + Nonce + Tag 的总长
-
-        // 调用你的解密函数
-        // 假设 ctx->key 已经初始化
-        int ret = vpn_decrypt(ctx->key, packet_ptr, packet_len, target_ptr, &final_len);
-        
-        if (ret != 0) {
-            log_warn("Decryption failed (code: %d) for SID: 0x%08x", ret, hdr->session_id);
-            return -EACCES; // 认证失败，丢弃该包
-        }
-    } else {
-        // 如果不是 DATA 包（比如是控制包），可能不需要写入 TUN
-        // 或者你有其他的处理逻辑
-        return 0; 
-    }
-
     /* 2. AUTOMATIC OFFSET CALCULATION
      * We know the IP packet starts right after the VFAST header (VPN_TNL_HLEN = 8).
      * By using ctx->iovecs[buf_idx].iov_base, we get the absolute start of the buffer.
      */
-    // uint8_t *target_ptr = (uint8_t *)ctx->iovecs[buf_idx].iov_base + VPN_TNL_HLEN;
-    // size_t target_len = ctx->iovecs[buf_idx].iov_len - VPN_TNL_HLEN;
+    uint8_t *target_ptr = (uint8_t *)ctx->iovecs[buf_idx].iov_base + VPN_TNL_HLEN;
+    size_t target_len = ctx->iovecs[buf_idx].iov_len - VPN_TNL_HLEN;
 
     /* 1. Set operation metadata */
     d->type = IO_TYPE_TUN_WRITE;
@@ -362,8 +325,7 @@ int vpn_submit_tun_write(vpn_iouring_ctx_t *ctx, int tun_fd, int buf_idx, vpn_io
     /* 3. Prepare fixed write using the calculated internal pointer.
      * The kernel validates that target_ptr is within the buffer registered at buf_idx.
      */
-    // io_uring_prep_write_fixed(sqe, tun_fd, target_ptr, target_len, 0, buf_idx);
-    io_uring_prep_write_fixed(sqe, tun_fd, target_ptr, (unsigned)final_len, 0, buf_idx);
+    io_uring_prep_write_fixed(sqe, tun_fd, target_ptr, target_len, 0, buf_idx);
     
     io_uring_sqe_set_data(sqe, d);
 

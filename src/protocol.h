@@ -76,24 +76,52 @@ typedef struct {
 #define VPN_TNL_HLEN sizeof(vpn_tunnel_hdr_t)
 
 /**
- * @brief Encapsulates payload into VFAST + IPv4 tunnel
- * @param buf The buffer containing raw payload. Must be large enough for headers.
- * @param payload_len Length of the data currently in buf
- * @param max_buf_size Total capacity of buf to prevent overflow
- * @param type The VFAST message type (DATA, HELLO, KEEPALIVE, etc.)
- * @param sid Session ID for the tunnel
- * @return Total packet length on success, -1 on buffer overflow
+ * @brief Encapsulates and encrypts a VFAST tunnel packet.
+ *
+ * This function handles the full lifecycle of a VFAST packet creation, including
+ * mandatory AEAD encryption (ChaCha20-Poly1305) and header construction.
+ * @section Architecture Zero-Copy Logic
+ * To achieve maximum performance, this function performs in-place encryption. 
+ * The caller MUST ensure the raw payload is already positioned at:
+ * [buf + VPN_TNL_HLEN] (typically offset 8).
+ *
+ * @param[in]     key          A 32-byte symmetric encryption key.
+ * @param[in,out] buf          The base address of the buffer. Encrypts in-place.
+ * @param[in]     payload_len  The original length of the raw payload (e.g., IP packet).
+ * @param[in]     max_buf_size Total capacity of buf to prevent overflow after encryption expansion (+40B).
+ * @param[in]     type         VFAST message type (e.g., VPN_MSG_DATA, VPN_MSG_HEARTBEAT).
+ * @param[in]     sid          Session ID (Host Order; converted to Network Order internally).
+ *
+ * @return Total packet length (Header + Nonce + Cipher + Tag) on success; -1 on failure.
+ *
+ * @note Memory Layout Transition:
+ * Before: [8B Gap] [Payload(N)]
+ * After:  [Header(8B)] [Nonce(24B)] [Cipher(N)] [Tag(16B)]
  */
-int vpn_pack(uint8_t *buf, int payload_len, int max_buf_size, vpn_msg_t type, uint32_t sid);
+int vpn_pack(const uint8_t *key, uint8_t *buf, int payload_len, int max_buf_size, vpn_msg_t type, uint32_t sid);
 
 /**
- * @brief Decapsulates and validates incoming VFAST tunnel packets
- * @param buf Pointer to the received data
- * @param received_len Length of data received from socket
- * @param out_ip_len Output parameter for the internal IP packet length
- * @param out_sid Output parameter for the session ID
- * @return Pointer to the start of the internal IP packet, or NULL if invalid
+ * @brief Decapsulates, authenticates, and decrypts incoming VFAST packets.
+ *
+ * Performs strict validation and full AEAD decryption. This is a fail-safe function
+ * that prioritizes security: it authenticates the data before any protocol parsing.
+ *
+ * @section Security Protocol
+ * 1. Length Check: Discards any fragments smaller than 48 bytes.
+ * 2. Authentication: Verifies the AEAD Tag. Fails if the key is wrong or data is tampered.
+ * 3. Validation: For DATA packets, performs deep inspection of the inner IPv4 header.
+ *
+ * @param[in]  key          A 32-byte symmetric encryption key.
+ * @param[in]  buf          Base address of the received UDP packet.
+ * @param[in]  received_len Total bytes received from the network.
+ * @param[out] out_ip_len   Pointer to store the decrypted payload length.
+ * @param[out] out_sid      Pointer to store the extracted Session ID (Host Order).
+ *
+ * @return Pointer to the decrypted plaintext (at buf + VPN_TNL_HLEN) on success; 
+ * NULL if decryption fails, version mismatches, or IP header is malformed.
+ *
+ * @warning This function modifies the buffer in-place during decryption.
  */
-uint8_t* vpn_unpack(uint8_t *buf, int received_len, int *out_ip_len, uint32_t *out_sid);
+uint8_t* vpn_unpack(const uint8_t *key, uint8_t *buf, int received_len, int *out_ip_len, uint32_t *out_sid);
 
 #endif /* __PROTOCOL_H__ */

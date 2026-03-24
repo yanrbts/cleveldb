@@ -58,38 +58,41 @@ static void get_fast_nonce(uint8_t nonce[CRYPTO_NONCE_SIZE]) {
 }
 
 /**
- * @brief Encrypts plaintext using XChaCha20-Poly1305 AEAD.
- * * Verified Packet Layout: 
- * [ Nonce (24B) ] [ Ciphertext (len bytes) ] [ MAC Tag (16B) ]
- *
- * @param key        32-byte secret key.
- * @param plain      Original data to encrypt.
- * @param len        Length of plain data.
- * @param out_packet Buffer to hold the complete encrypted package.
- * @param out_len    Final size: len + CRYPTO_NONCE_SIZE + CRYPTO_TAG_SIZE.
+ * @brief Encrypts plaintext with support for IN-PLACE operations.
+ * * DESIGN NOTE: To support in-place encryption (out_packet == plain), 
+ * we must shift the data to make room for the 24-byte Nonce header.
  */
 int vpn_encrypt(const uint8_t key[CRYPTO_KEY_SIZE], 
-                const uint8_t *plain, size_t len, 
-                uint8_t *out_packet, size_t *out_len) {
+                const uint8_t *restrict plain, size_t len, 
+                uint8_t *restrict out_packet, size_t *out_len) {
     
-    /* Pointer Arithmetic based on your requirements */
-    uint8_t *nonce  = out_packet;                            /* Start of packet */
-    uint8_t *cipher = out_packet + CRYPTO_NONCE_SIZE;        /* Offset 24 */
-    uint8_t *tag    = cipher + len;                          /* Offset 24 + len */
+    uint8_t local_nonce[CRYPTO_NONCE_SIZE];
+    get_fast_nonce(local_nonce);
 
-    /* 1. Fill the first 24 bytes with a unique Nonce */
-    get_fast_nonce(nonce);
+    // Calculate offsets
+    uint8_t *cipher_ptr = out_packet + CRYPTO_NONCE_SIZE;
+    uint8_t *tag_ptr    = cipher_ptr + len;
 
-    /* 2. Execute AEAD Lock
-     * - cipher: Destination for encrypted data (24 bytes offset)
-     * - tag:    Destination for the 16-byte Auth Tag (after ciphertext)
-     * - plain:  Source data
-     * - len:    Amount of data to process
+    /*
+     * IN-PLACE HANDLING:
+     * If output overlaps with input, we use memmove to shift the plaintext
+     * forward by 24 bytes, ensuring the Nonce write won't corrupt it.
      */
-    crypto_aead_lock(cipher, tag, key, nonce, NULL, 0, plain, len);
+    if (unlikely(plain == out_packet)) {
+        memmove(cipher_ptr, plain, len);
+        // Encrypt from shifted source to shifted destination
+        crypto_aead_lock(cipher_ptr, tag_ptr, key, local_nonce, NULL, 0, cipher_ptr, len);
+    } else {
+        // Standard out-of-place encryption
+        crypto_aead_lock(cipher_ptr, tag_ptr, key, local_nonce, NULL, 0, plain, len);
+    }
 
-    /* 3. Calculate total wire length */
-    *out_len = CRYPTO_NONCE_SIZE + len + CRYPTO_TAG_SIZE;
+    // Prepend Nonce to the final packet
+    memcpy(out_packet, local_nonce, CRYPTO_NONCE_SIZE);
+
+    if (likely(out_len)) {
+        *out_len = CRYPTO_NONCE_SIZE + len + CRYPTO_TAG_SIZE;
+    }
     
     return 0;
 }

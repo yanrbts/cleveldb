@@ -30,6 +30,7 @@ typedef struct {
     udp_conn_t        *udp;      /* UDP transport handle */
 
     vpn_io_data_t     *io_data_pool;
+    const uint8_t     *key;
     
     /* 3. Global Status & Config */
     atomic_bool       running;   /* Control flag for main loop */

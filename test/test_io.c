@@ -34,10 +34,9 @@ int main() {
     int ret;
     int tun_fd = 3;  // 假设的 TUN 文件描述符
     int sock_fd = 4; // 假设的 Socket 文件描述符
-    const uint8_t key[32] = {0};
 
     /* 1. 初始化 io_uring */
-    if (vpn_iouring_init(&ctx, IO_RING_DEPTH, key) < 0) {
+    if (vpn_iouring_init(&ctx, IO_RING_DEPTH) < 0) {
         fprintf(stderr, "Failed to init io_uring\n");
         return 1;
     }

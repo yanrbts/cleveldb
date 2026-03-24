@@ -77,10 +77,9 @@ typedef struct {
     struct iovec iovecs[IO_BUF_POOL_SIZE];  // Used for Fixed Buffers
     void *buffer_base;                      // Base pointer for memory alignment
     int pending_sqes;                       // Counter for batching
-    const uint8_t *key;
 } vpn_iouring_ctx_t;
 
-int vpn_iouring_init(vpn_iouring_ctx_t *ctx, uint32_t entries, const uint8_t *key);
+int vpn_iouring_init(vpn_iouring_ctx_t *ctx, uint32_t entries);
 void vpn_iouring_destroy(vpn_iouring_ctx_t *ctx);
 void vpn_iouring_flush(vpn_iouring_ctx_t *ctx);
 

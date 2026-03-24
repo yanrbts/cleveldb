@@ -189,7 +189,7 @@ static int vfast_init_server(void) {
         log_error("Failed load key file.");
         return -1;
     }
-
+    vfserver.ctx.key = vfserver.opt.master_key;
     /* 1. Setup specialized signal handling */
     if (vfast_setup_signals() < 0) return -1;
 
@@ -208,8 +208,7 @@ static int vfast_init_server(void) {
 
     if (vpn_iouring_init(
         &vfserver.ctx.io_ring, 
-        vfserver.opt.io_ring_depth, 
-        vfserver.opt.master_key) < 0) {
+        vfserver.opt.io_ring_depth) < 0) {
         log_error("Init iouring failed");
         return -1;
     }
