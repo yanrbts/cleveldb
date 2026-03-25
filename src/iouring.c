@@ -69,6 +69,8 @@ int vpn_iouring_init(vpn_iouring_ctx_t *ctx, uint32_t entries) {
     // After this, kernel 'knows' this memory, avoiding repeated mapping
     if (io_uring_register_buffers(&ctx->ring, ctx->iovecs, IO_BUF_POOL_SIZE) < 0) {
         log_error("io_uring_register_buffers");
+        free(ctx->buffer_base);
+        ctx->buffer_base = NULL;
         return -1;
     }
 
@@ -151,7 +153,7 @@ int vpn_submit_udp_sendmsg(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t l
 
     io_data->fd = fd;
     io_data->buf_idx = buf_idx;
-    io_data->buf_len = ctx->iovecs[buf_idx].iov_len;
+    io_data->buf_len = len;
     io_data->type = IO_TYPE_SOCK_WRITE;
 
     /* Setup iovec pointing to the fixed registered buffer base */
@@ -197,7 +199,7 @@ int vpn_submit_udp_send(vpn_iouring_ctx_t *ctx, int fd, int buf_idx, size_t len,
      * Prepare the state machine for the next stage (Transmission Completion). */
     io_data->type = IO_TYPE_SOCK_WRITE;
     io_data->buf_idx = buf_idx;
-    io_data->buf_len = ctx->iovecs[buf_idx].iov_len;
+    io_data->buf_len = len;
     io_data->fd = fd;
 
     uint8_t *base = (uint8_t *)ctx->iovecs[buf_idx].iov_base;
