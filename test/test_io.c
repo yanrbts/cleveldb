@@ -1,114 +1,130 @@
-/*
- * Copyright (c) 2026-2026, cleveldb.
- * Author: [yanruibing]
- */
+#include "io.h"
+#include <arpa/inet.h>
+#include <linux/if_tun.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <stdio.h>
 
+#include "io.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <netinet/in.h>
-#include <liburing.h>
-#include <errno.h>
-#include "iouring.h"
-#include "utils.h"
-#include "vfast.h"
+#include <fcntl.h>
+#include <arpa/inet.h>
+#include <sys/ioctl.h>
+#include <linux/if.h>
+#include <linux/if_tun.h>
 
-/* 模拟外部定义的封装/解包长度 */
-#define VPN_TNL_HLEN 8 
+/* --- 工具函数：分配 TUN 设备 --- */
+int alloc_tun(char *dev) {
+    struct ifreq ifr;
+    int fd, err;
 
-/* Buffer index management */
-static int free_stack[IO_BUF_POOL_SIZE];
-static int top = -1;
+    if ((fd = open("/dev/net/tun", O_RDWR)) < 0) {
+        perror("Opening /dev/net/tun");
+        return fd;
+    }
 
-void push_index(int idx) {
-    if (top < IO_BUF_POOL_SIZE - 1) free_stack[++top] = idx;
+    memset(&ifr, 0, sizeof(ifr));
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI; // IFF_TUN (IP层), IFF_NO_PI (不包含额外包头)
+    if (*dev) strncpy(ifr.ifr_name, dev, IFNAMSIZ);
+
+    if ((err = ioctl(fd, TUNSETIFF, (void *)&ifr)) < 0) {
+        perror("ioctl(TUNSETIFF)");
+        close(fd);
+        return err;
+    }
+    strcpy(dev, ifr.ifr_name);
+    return fd;
 }
 
-int pop_index() {
-    return (top >= 0) ? free_stack[top--] : -1;
+/* --- 工具函数：创建 UDP 套接字 --- */
+int alloc_udp(int port) {
+    int fd;
+    struct sockaddr_in addr;
+
+    if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        perror("socket");
+        return -1;
+    }
+
+    // 设置端口复用，方便调试
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        close(fd);
+        return -1;
+    }
+
+    return fd;
 }
 
-int main() {
-    vpn_iouring_ctx_t ctx;
-    int ret;
-    int tun_fd = 3;  // 假设的 TUN 文件描述符
-    int sock_fd = 4; // 假设的 Socket 文件描述符
+/* --- 业务回调：处理 UDP -> TUN (解密/剥包路径) --- */
+int my_on_udp_recv(vfast_vpn_t *vpn, uint8_t **data, int len, vfast_ioctx_t *ctx) {
+    (void)vpn;
+    // 假设 VFast 协议头是 24 字节
+    if (len <= 24) return -1; 
 
-    /* 1. 初始化 io_uring */
-    if (vpn_iouring_init(&ctx, IO_RING_DEPTH) < 0) {
-        fprintf(stderr, "Failed to init io_uring\n");
+    // 零拷贝剥离头部：直接移动指针
+    *data += 24; 
+
+    printf("[UDP -> TUN] Src: %s:%d, Payload: %d bytes\n", 
+           inet_ntoa(ctx->addr.sin_addr), ntohs(ctx->addr.sin_port), len - 24);
+    return len - 24;
+}
+
+/* --- 业务回调：处理 TUN -> UDP (加密/封包路径) --- */
+int my_on_tun_read(vfast_vpn_t *vpn, uint8_t **data, int len, vfast_ioctx_t *ctx) {
+    (void)vpn;
+    // 演示：强制将所有从 TUN 读到的包发往特定对端 (127.0.0.1:9999)
+    // 实际业务中这里应该根据 IP 头部的目的地址查找 Session 表
+    ctx->addr.sin_family = AF_INET;
+    ctx->addr.sin_port = htons(9999); 
+    inet_pton(AF_INET, "127.0.0.1", &ctx->addr.sin_addr);
+
+    // 演示：这里不加头直接发（如果需要加头，需要配合 Headroom 预留空间，否则会越界）
+    printf("[TUN -> UDP] Captured IP Packet: %d bytes -> 127.0.0.1:9999\n", len);
+    return len; 
+}
+
+int main(int argc, char *argv[]) {
+    char tun_name[IFNAMSIZ] = "vfast0";
+    int udp_port = 8888;
+
+    if (argc > 1) udp_port = atoi(argv[1]);
+
+    // 1. 准备文件描述符
+    int tun_fd = alloc_tun(tun_name);
+    if (tun_fd < 0) return 1;
+
+    int udp_fd = alloc_udp(udp_port);
+    if (udp_fd < 0) return 1;
+
+    printf("Successfully initialized %s and UDP port %d\n", tun_name, udp_port);
+    printf("Please run: 'sudo ip addr add 10.0.0.1/24 dev %s && sudo ip link set %s up'\n", tun_name, tun_name);
+
+    // 2. 初始化引擎
+    vfast_vpn_t vpn;
+    if (vfast_vpn_init(&vpn, udp_fd, tun_fd) < 0) {
+        fprintf(stderr, "VPN Engine Init Failed\n");
         return 1;
     }
 
-    for (int i = 0; i < IO_BUF_POOL_SIZE; i++) push_index(i);
+    // 3. 注册业务逻辑
+    vpn.on_udp_recv = my_on_udp_recv;
+    vpn.on_tun_read = my_on_tun_read;
 
-    /* 2. 初始投放：启动 TUN 读取 (方向 A 开始) */
-    for (int i = 0; i < 128; i++) {
-        int idx = pop_index();
-        if (idx == -1) break;
+    // 4. 进入 io_uring 运行循环
+    vfast_vpn_run(&vpn);
 
-        vpn_io_data_t *io_data = malloc(sizeof(vpn_io_data_t));
-        io_data->buf_idx = idx;
-        io_data->fd = tun_fd;
-        
-        /* 使用你的接口：内部自动处理 Base + 8 偏移 */
-        vpn_submit_tun_read(&ctx, tun_fd, idx, io_data);
-    }
-    vpn_iouring_flush(&ctx);
-
-    /* 3. 事件循环 */
-    while (1) {
-        struct io_uring_cqe *cqe;
-        ret = io_uring_wait_cqe(&ctx.ring, &cqe);
-        if (ret < 0) break;
-
-        vpn_io_data_t *d = (vpn_io_data_t *)io_uring_cqe_get_data(cqe);
-        int res = cqe->res;
-
-        if (unlikely(res <= 0)) {
-            /* 错误处理：回收并重新挂载 */
-            if (d->type == IO_TYPE_TUN_READ) vpn_submit_tun_read(&ctx, tun_fd, d->buf_idx, d);
-            else push_index(d->buf_idx); // 简化处理
-            goto seen;
-        }
-
-        switch (d->type) {
-            case IO_TYPE_TUN_READ:
-                /* 方向 A (1): 读完网卡 -> 转换 -> 准备发给 UDP */
-                // 此时 IP 包在 Base + 8，长度为 res
-                // 假设此处进行了 vpn_pack，总长度变为 res + 8
-                d->buf_len = res + VPN_TNL_HLEN; 
-                
-                /* 使用 sendmsg 发送封包后的数据 */
-                vpn_submit_udp_sendmsg(&ctx, sock_fd, d->buf_idx, d->buf_len, d);
-                break;
-
-            case IO_TYPE_SOCK_WRITE:
-                /* 方向 A (2): 发完了 -> 重置 -> 回到网卡继续等下一个包 */
-                vpn_submit_tun_read(&ctx, tun_fd, d->buf_idx, d);
-                break;
-
-            case IO_TYPE_SOCK_READ:
-                /* 方向 B (1): 读完物理网络 -> 转换 -> 准备写回内核 */
-                // 假设此处进行了 vpn_unpack，得到纯 IP 包长度存入 buf_len
-                // d->buf_len = unpack_result_len; 
-                
-                /* 使用你的接口：内部自动计算 Base + 8 偏移并使用 d->buf_len */
-                vpn_submit_tun_write(&ctx, tun_fd, d->buf_idx, d);
-                break;
-
-            case IO_TYPE_TUN_WRITE:
-                /* 方向 B (2): 写进去了 -> 重置 -> 回到网络继续等下一个包 */
-                vpn_submit_udp_recvmsg(&ctx, sock_fd, d->buf_idx, d);
-                break;
-        }
-
-    seen:
-        io_uring_cqe_seen(&ctx.ring, cqe);
-        vpn_iouring_flush(&ctx);
-    }
-
-    vpn_iouring_destroy(&ctx);
+    vfast_vpn_destroy(&vpn);
     return 0;
 }

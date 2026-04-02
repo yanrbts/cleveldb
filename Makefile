@@ -3,7 +3,7 @@
 # ==========================================
 
 CC      := gcc
-CFLAGS  := -O3 -ggdb -Wall -Wextra -D_GNU_SOURCE -std=gnu11 -Isrc
+CFLAGS  := -O3 -ggdb -Wall -Wextra -D_GNU_SOURCE -std=gnu11 -Isrc -Itest
 LDFLAGS := -luring -lpthread
 
 # Directories
