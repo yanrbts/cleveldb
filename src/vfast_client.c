@@ -15,19 +15,23 @@
 #include <stdatomic.h>
 #include <sys/uio.h>
 #include <locale.h>
+#include <liburing.h>
 
 #include "log.h"
 #include "utils.h"
-#include "vfast.h"
 #include "fsm.h"
 #include "zmalloc.h"
 #include "protocol.h"
-#include "iouring.h"
 #include "option.h"
+#include "tun.h"
+#include "io.h"
+#include "vfast.h"
 
 struct vfast_client {
-    vpn_option_t opt;
-    vfast_ctx_t ctx;
+    vpn_option_t        opt;
+    vfast_io_t          io;
+    udp_conn_t         *udp;       /* UDP transport handle */
+    vpn_tun_ctx_t       tun;       /* Virtual network interface */
 } vfclient;
 
 /**
@@ -36,59 +40,12 @@ struct vfast_client {
  */
 static void client_signal_handler(int sig) {
     (void)sig;
-    atomic_store(&vfclient.ctx.running, false);
-}
+    atomic_store(&vfclient.io.running, false);
 
-/**
- * handle_io_event - FSM Dispatcher for I/O Completion.
- * Refactored to eliminate 'goto' statements for better structured flow.
- */
-static void handle_io_event(struct io_uring_cqe *cqe) {
-    vpn_io_data_t *data = (vpn_io_data_t *)io_uring_cqe_get_data(cqe);
-
-    if (unlikely(!data)) return;
-
-    int res = cqe->res;
-    int idx = data->buf_idx;
-    data->sid = client_fsm.sid;
-
-    /* Handle I/O errors (e.g., interface down, buffer overflow) */
-    if (unlikely(res <= 0)) {
-        if (res < 0 && res != -EAGAIN && res != -ECANCELED) {
-            log_error("I/O error at idx %d, type %d: %s", idx, data->type, strerror(-res));
-
-            if (res == -ECONNREFUSED || res == -EPIPE || res == -ECONNRESET) {
-                log_warn("FSM: Critical network error detected, forcing reconnection.");
-                vfast_fsm_force_reconnect();
-            }
-        }
-        vfast_auto_reschedule(&vfclient.ctx, idx);
-        return;
-    }
-    /* Primary State Transition Logic */
-    switch (data->type) {
-    case IO_TYPE_TUN_READ:
-        if (vfast_fsm_is_connected()) {
-            if (!vfast_tun_client_rx(&vfclient.ctx, res, idx, data)) {
-                vfast_auto_reschedule(&vfclient.ctx, idx);
-            }
-        } else {
-            vfast_auto_reschedule(&vfclient.ctx, idx);
-        }
-        break; // --->SOCK_WRITE
-    case IO_TYPE_SOCK_READ:
-        if (!vfast_udp_client_rx(&vfclient.ctx, res, idx, data)) {
-            vfast_auto_reschedule(&vfclient.ctx, idx);
-        }
-        break; // --->TUN_WRITE
-    case IO_TYPE_SOCK_WRITE:
-    case IO_TYPE_TUN_WRITE:
-        vfast_auto_reschedule(&vfclient.ctx, idx);
-        break;
-    default:
-        log_warn("Undefined state for buffer %d, forcing recycle", idx);
-        vfast_auto_reschedule(&vfclient.ctx, idx);
-        break;
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&vfclient.io.ring);
+    if (sqe) {
+        io_uring_prep_nop(sqe);
+        io_uring_submit(&vfclient.io.ring);
     }
 }
 
@@ -99,18 +56,25 @@ static void handle_io_event(struct io_uring_cqe *cqe) {
 static void vfast_cleanup() {
     log_info("Initiating system shutdown and resource cleanup...");
     
-    vpn_iouring_destroy(&vfclient.ctx.io_ring);
-    vpn_tun_destroy(&vfclient.ctx.tun);
+    vpn_tun_destroy(&vfclient.tun);
     
-    if (vfclient.ctx.udp) {
-        udp_close(vfclient.ctx.udp);
+    if (vfclient.udp) {
+        udp_close(vfclient.udp);
     }
     
-    if (vfclient.ctx.io_data_pool) {
-        zfree(vfclient.ctx.io_data_pool);
-    }
     vpn_option_clean(&vfclient.opt);
     log_info("Cleanup complete. Exit.");
+}
+
+int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src) {
+    UNUSED(src);
+    vfast_submit_write(io, io->tun_fd, OP_TUN_WRITE, data, len, NULL);
+    return 0;
+}
+
+int client_on_tun(vfast_io_t *io, uint8_t *data, int len) {
+    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, data, len, &io->remote_addr);
+    return 0;
 }
 
 /**
@@ -118,44 +82,36 @@ static void vfast_cleanup() {
  * Initializes memory, kernel interfaces, and warms up the I/O ring.
  */
 static int vfast_init_client() {
-    memset(&vfclient.ctx, 0, sizeof(vfast_ctx_t));
-    atomic_store(&vfclient.ctx.running, true);
+    memset(&vfclient.io, 0, sizeof(vfast_io_t));
+    atomic_store(&vfclient.io.running, true);
 
     if (vfast_load_key(vfclient.opt.keyfile, vfclient.opt.master_key) < 0) {
         log_error("Failed load key file.");
         return -1;
     }
-    vfclient.ctx.key = vfclient.opt.master_key;
 
     /* Signal Registration */
     struct sigaction sa = { .sa_handler = client_signal_handler };
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
 
-    /* Memory Allocation */
-    vfclient.ctx.io_data_pool = (vpn_io_data_t *)zmalloc(IO_BUF_POOL_SIZE * sizeof(vpn_io_data_t));
-    if (!vfclient.ctx.io_data_pool) {
-        log_error("Critical: Failed to allocate I/O buffer pool.");
-        return -1;
-    }
-
-    /* Networking Subsystem Initialization */
-    if (vpn_iouring_init(&vfclient.ctx.io_ring, vfclient.opt.io_ring_depth) < 0) return -1;
-
-    if (vpn_tun_init(&vfclient.ctx.tun, vfclient.opt.tun_name, 0) < 0) return -1;
+    if (vpn_tun_init(&vfclient.tun, vfclient.opt.tun_name, 0) < 0) return -1;
     // vpn_tun_set_ip(vfastctx.tun.name, "10.0.0.2", "255.255.255.0");
     vpn_tun_disable_ipv6(vfclient.opt.tun_name);
-    vpn_tun_set_status(vfclient.ctx.tun.name, vfclient.opt.mtu, 1);
+    vpn_tun_set_status(vfclient.tun.name, vfclient.opt.mtu, 1);
     
-    vfclient.ctx.udp = udp_init_listener(0, vfclient.opt.udp_backlog);
-    if (!vfclient.ctx.udp) {
+    vfclient.udp = udp_init_listener(0, vfclient.opt.udp_backlog);
+    if (!vfclient.udp) {
         log_error("Failed to initialize UDP listener.");
         return -1;
     }
-    udp_set_connect(vfclient.ctx.udp, inet_addr(vfclient.opt.remote_host), vfclient.opt.remote_port);
+    udp_set_connect(vfclient.udp, inet_addr(vfclient.opt.remote_host), vfclient.opt.remote_port);
 
-    /* Prime the I/O pipelines */
-    vfast_io_warmup(&vfclient.ctx);
+    vfast_ops_t ops = {
+        .on_udp_data = client_on_udp,
+        .on_tun_data = client_on_tun
+    };
+    vfast_io_init(&vfclient.io, vfclient.udp->fd, vfclient.tun.fd, ops);
 
     log_info("VFAST Client initialized successfully. Connecting to %s...", vfclient.opt.remote_host);
     return 0;
@@ -225,36 +181,14 @@ int main(int argc, char *argv[]) {
     }
 
     vfast_fsm_init(
-        vfclient.ctx.udp,
+        vfclient.udp,
         vfclient.opt.remote_host, 
         vfclient.opt.remote_port, 
-        &vfclient.ctx.running
+        &vfclient.io.running
     );
 
-    struct io_uring_cqe *cqes[16];
-    
-    /* Main Event Loop */
-    while (likely(atomic_load(&vfclient.ctx.running))) {
-        struct io_uring_cqe *cqe_wait;
-        
-        /* Blocking wait for at least one event */
-        int ret = io_uring_wait_cqe(&vfclient.ctx.io_ring.ring, &cqe_wait);
-        if (unlikely(ret < 0)) {
-            if (ret == -EINTR) continue;
-            log_error("io_uring_wait_cqe failed: %s", strerror(-ret));
-            break;
-        }
+    vfast_io_run(&vfclient.io);
 
-        /* Batch processing for high-load efficiency */
-        int count = io_uring_peek_batch_cqe(&vfclient.ctx.io_ring.ring, cqes, 16);
-        for (int i = 0; i < count; i++) {
-            handle_io_event(cqes[i]);
-            io_uring_cqe_seen(&vfclient.ctx.io_ring.ring, cqes[i]);
-        }
-        
-        /* Flush all pending SQEs generated in handle_io_event */
-        io_uring_submit(&vfclient.ctx.io_ring.ring);
-    }
     vfast_fsm_pthread_join();
     vfast_cleanup();
     return EXIT_SUCCESS;

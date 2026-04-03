@@ -1,7 +1,11 @@
-/*
- * Copyright (c) 2026-2026, cleveldb.
- * Author: [yanruibing]
- * All rights reserved.
+/**
+ * @file io.h
+ * @brief High-performance Asynchronous Network Core based on io_uring.
+ * This framework implements a proactive I/O model (Proactor) optimized for 
+ * VPN and Tunneling services. It minimizes context switches through 
+ * registered files and batched SQE submissions.
+ * @author yanruibing
+ * @date 2026-04-03
  */
 
 #ifndef __IO_H__
@@ -10,97 +14,112 @@
 #include <liburing.h>
 #include <netinet/in.h>
 #include <stdint.h>
-#include <stdlib.h>
+#include <stdbool.h>
+#include <stdatomic.h>
 
-#define IO_BUF_COUNT     4096    /**< Buffer Ring 中的缓冲区数量 */
-#define IO_BUF_SIZE      4096    /**< 单个缓冲区大小 (4KB，适配标准页大小) */
-#define IO_RING_DEPTH    8192    /**< io_uring 提交/完成队列深度 */
+#define BUF_SIZE        2048        /**< MTU-aligned buffer size (including overhead) */
+#define CQ_RING_DEPTH   256         /**< Depth of the completion queue ring */
 
-#define IDX_UDP          0       /**< 注册文件集中的 UDP Socket 索引 */
-#define IDX_TUN          1       /**< 注册文件集中的 TUN 设备索引 */
-#define BR_GROUP_ID      0       /**< Provided Buffer Group ID */
-
-/**
- * @brief 异步操作类型枚举
- * @details 用于在 io_uring 完成队列 (CQE) 中识别请求的上下文状态。
- */
-typedef enum {
-    OP_TYPE_UDP_RECV        = 1, /**< UDP Multishot 接收 */
-    OP_TYPE_TUN_READ        = 2, /**< 从 TUN 设备异步读取 IP 包 */
-    OP_TYPE_TUN_WRITE_ASYNC = 3, /**< 异步向 TUN 设备写入数据完成 */
-    OP_TYPE_SEND_BACK       = 4  /**< 异步向 UDP 发送加密包完成 */
-} op_type_t;
-
-/* 前置声明，解决回调函数循环依赖 */
-typedef struct vfast_vpn vfast_vpn_t;
-typedef struct vfast_ioctx vfast_ioctx_t;
+struct vfast_io;
+typedef struct vfast_io vfast_io_t;
 
 /**
- * @brief IO 上下文结构体
- * @details 每个 Buffer 对应一个上下文，管理该缓冲区当前的 IO 状态。
+ * @brief Functional interface for business logic callbacks.
+ * These are invoked upon successful completion of asynchronous read operations.
  */
-struct vfast_ioctx {
-    op_type_t           op;      /**< 当前正在进行的异步操作类型 */
-    uint32_t            bid;     /**< Buffer ID (与 Buffer Ring 索引对应) */
-    struct msghdr       msg;     /**< 用于 sendmsg/recvmsg 的消息头 */
-    struct iovec        iov;     /**< 数据向量，指向关联的物理缓冲区 */
-    struct sockaddr_in  addr;    /**< UDP 对端地址信息 (Src/Dst) */
-    void               *priv;    /**< 业务自定义私有数据指针 (如 Session 信息) */
+typedef int (*udp_data_cb)(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src);
+typedef int (*tun_data_cb)(vfast_io_t *io, uint8_t *data, int len);
+
+/**
+ * @brief Dispatch table for network event handling.
+ */
+typedef struct {
+    udp_data_cb on_udp_data;        /**< Triggered on UDP RX completion */
+    tun_data_cb on_tun_data;        /**< Triggered on TUN/TAP read completion */
+} vfast_ops_t;
+
+/**
+ * @brief The primary I/O context holding the io_uring instance and state.
+ */
+struct vfast_io {
+    struct io_uring     ring;           /**< The core io_uring structure */
+    int                 udp_fd;         /**< Bound UDP socket file descriptor */
+    int                 tun_fd;         /**< TUN/TAP device file descriptor */
+    vfast_ops_t         ops;            /**< Registered callback handlers */
+    struct sockaddr_in  remote_addr;    /**< Pre-calculated remote peer address */
+    bool                is_server;      /**< Operation mode (Server vs Client) */
+    atomic_bool         running;
 };
 
 /**
- * @brief UDP 接收回调函数指针
- * @param vpn 引擎实例指针
- * @param data [in,out] 指向数据缓冲区的指针。业务层可修改此指针实现零拷贝剥离头部。
- * @param len 接收到的原始数据长度
- * @param ctx 关联的 IO 上下文
- * @return 处理后的有效数据长度。返回 <= 0 则丢弃该包并回收缓冲区。
+ * @brief Async state machine operation codes.
  */
-typedef int (*vfast_on_udp_recv_cb)(vfast_vpn_t *vpn, uint8_t **data, int len, vfast_ioctx_t *ctx);
-
-/**
- * @brief TUN 读取回调函数指针
- * @param vpn 引擎实例指针
- * @param data [in,out] 指向数据缓冲区的指针。业务层可在此缓冲区前部预留空间添加协议头。
- * @param len 从 TUN 读到的原始包长度
- * @param ctx 关联的 IO 上下文
- * @return 处理后的总包长度 (包含协议头)。返回 <= 0 则丢弃该包。
- */
-typedef int (*vfast_on_tun_read_cb)(vfast_vpn_t *vpn, uint8_t **data, int len, vfast_ioctx_t *ctx);
-
-/**
- * @brief VFast VPN 核心引擎结构体
- */
-struct vfast_vpn {
-    struct io_uring      ring;     /**< io_uring 实例句柄 */
-    struct io_uring_buf_ring *br;  /**< 注册的 Buffer Ring 指针 */
-    void                *buf_base; /**< 缓冲区内存基地址 (4KB 对齐) */
-    vfast_ioctx_t       *ctx_pool; /**< 上下文池，数组索引即为 bid */
-    vfast_on_udp_recv_cb  on_udp_recv; /**< 解密、解压及协议头校验逻辑 */
-    vfast_on_tun_read_cb  on_tun_read; /**< 路由查找、加解密及封包逻辑 */
+enum {
+    OP_TUN_READ  = 1,               /**< Async read from TUN device */
+    OP_TUN_WRITE = 2,               /**< Async write to TUN device */
+    OP_UDP_RECV  = 3,               /**< Async recvmsg from UDP socket */
+    OP_UDP_SEND  = 4                /**< Async sendmsg to UDP socket */
 };
 
 /**
- * @brief 初始化 VPN 引擎
- * @param vpn 引擎指针
- * @param udp_fd 已经 bind 好的 UDP 套接字描述符
- * @param tun_fd 已经打开并配置好的 TUN 设备描述符
- * @return 0 成功，-1 失败 (可通过 errno 或 stderr 观察错误原因)
+ * @brief Per-operation context (Task) used for tracking async state.
+ * This structure is mapped to the 'user_data' field in SQEs.
+ * It encapsulates buffers and metadata to ensure zero-copy pathing 
+ * within the event loop.
  */
-int  vfast_vpn_init(vfast_vpn_t *vpn, int udp_fd, int tun_fd);
+typedef struct {
+    int                 op;             /**< Operation type (OP_XXX) */
+    uint8_t             buf[BUF_SIZE];  /**< Static packet buffer */
+    struct iovec        iov;            /**< Vector for scatter/gather I/O */
+    struct msghdr       msg;            /**< Header for recvmsg/sendmsg ops */
+    struct sockaddr_in  addr;           /**< Source/Dest address storage */
+    socklen_t           addr_len;       /**< Length of sockaddr */
+    bool                in_use;         /**< Spin-lock style usage flag for pool safety */
+} vfast_task_t;
+
 
 /**
- * @brief 运行引擎主循环
- * @details 该函数内部会阻塞运行，使用 io_uring_submit_and_wait 驱动事件。
- * @param vpn 引擎指针
+ * @brief Initializes the vfast_io context and io_uring subsystem.
+ * @return 0 on success, negative error code on failure.
  */
-void vfast_vpn_run(vfast_vpn_t *vpn);
+int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, vfast_ops_t ops);
 
 /**
- * @brief 销毁引擎并释放资源
- * @details 负责注销 Buffer Ring、关闭 io_uring 实例及释放池内存。
- * @param vpn 引擎指针
+ * @brief Starts the infinite event loop (blocking).
  */
-void vfast_vpn_destroy(vfast_vpn_t *vpn);
+void vfast_io_run(vfast_io_t *io);
 
-#endif
+/**
+ * @brief Gracefully terminates the I/O engine and releases resources.
+ */
+void vfast_io_exit(vfast_io_t *io);
+
+/**
+ * @brief Posts an asynchronous read or receive request to the Submission Queue (SQ).
+ * Prepares a task from the pool and submits a read/recvmsg operation. The actual 
+ * data processing occurs in the registered callbacks within @ref vfast_ops_t.
+ *
+ * @param io    Pointer to the initialized vfast_io_t context.
+ * @param fd    The raw file descriptor (UDP or TUN).
+ * @param op    Operation type: @ref OP_TUN_READ or @ref OP_UDP_RECV.
+ */
+void vfast_submit_read(vfast_io_t *io, int fd, int op);
+
+/**
+ * @brief Posts an asynchronous write or send request to the Submission Queue (SQ).
+ * This function handles both TUN device writes and UDP socket sends. It incorporates 
+ * an internal batching mechanism defined by SUBMIT_THRESHOLD to balance throughput 
+ * and per-packet latency.
+ *
+ * @param io    Pointer to the initialized vfast_io_t context.
+ * @param fd    The raw file descriptor (used to determine the registered file index).
+ * @param op    Operation type: @ref OP_TUN_WRITE or @ref OP_UDP_SEND.
+ * @param data  Pointer to the payload. If this points to a buffer within the 
+ * internal task pool, a zero-copy (in-place) path is taken.
+ * @param len   Length of the data to be written (capped at @ref BUF_SIZE).
+ * @param dest  Destination address (mandatory for @ref OP_UDP_SEND, 
+ * ignored for @ref OP_TUN_WRITE).
+ */
+void vfast_submit_write(vfast_io_t *io, int fd, int op, uint8_t *data, int len, struct sockaddr_in *dest);
+
+#endif /* VFAST_CORE_H */

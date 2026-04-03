@@ -47,26 +47,45 @@
 #include <stdatomic.h>
 #include <errno.h>
 #include <locale.h>
+#include <liburing.h>
 
 #include "log.h"
 #include "utils.h"
-#include "vfast.h"
+#include "auth.h"
 #include "session.h"
-#include "iouring.h"
 #include "zmalloc.h"
 #include "udp.h"
 #include "protocol.h"
 #include "option.h"
+#include "tun.h"
+#include "io.h"
+#include "vfast.h"
 
 struct vfast_server {
-    vpn_option_t opt;
-    vfast_ctx_t ctx;
+    vpn_option_t    opt;
+    vfast_io_t      io;
+    udp_conn_t     *udp;       /* UDP transport handle */
+    vpn_tun_ctx_t   tun;       /* Virtual network interface */
+    vpn_ip_pool_t   ip_pool;   /* IP address management */
+
+    struct {
+        atomic_uint_least64_t rx_pkts;
+        atomic_uint_least64_t tx_pkts;
+        atomic_uint_least64_t drops;
+    } stats;
 } vfserver;
 
 /* Simple signal handling for graceful shutdown */
-static void vfast_signal_handler(int sig) {
+static void signal_handler(int sig) {
     (void)sig;
-    atomic_store(&vfserver.ctx.running, false);
+    atomic_store(&vfserver.io.running, false);
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&vfserver.io.ring);
+    if (sqe) {
+        io_uring_prep_nop(sqe);
+        io_uring_submit(&vfserver.io.ring);
+    }
+    log_info("Signal received, initiating shutdown...");
 }
 
 /**
@@ -117,6 +136,139 @@ static void vfast_cmd_keygen(void) {
 }
 
 /**
+ * @brief Processes HELLO packet and submits a response.
+ * @param io    The io_uring engine context
+ * @param res   Number of bytes received (cqe->res)
+ * @param buf   Pointer to the task buffer (task->buf)
+ * @param src   Client's source address (task->addr)
+ */
+static bool vfast_auth_request(vfast_io_t *io, int res, uint8_t *buf, struct sockaddr_in *src) {
+    /* 1. 基础边界检查 (Header + Auth Payload) */
+    if (unlikely(res < (int)(sizeof(vpn_tunnel_hdr_t) + sizeof(vpn_auth_t)))) {
+        log_warn("Incomplete HELLO packet from %s", inet_ntoa(src->sin_addr));
+        return false;
+    }
+
+    /* 2. 原位指针映射 */
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
+    uint8_t *payload_ptr  = buf + sizeof(vpn_tunnel_hdr_t);
+
+    /* 3. 身份验证：调用你原有的验证逻辑 */
+    const uint8_t *expected_token = (const uint8_t *)"VFAST_SECRET"; 
+    if (vfast_auth_verify((vpn_auth_t *)payload_ptr, expected_token) != 0) {
+        log_warn("Unauthorized HELLO attempt from %s", inet_ntoa(src->sin_addr));
+        return false;
+    }
+
+    /* 4. 资源分配：从全局池分配虚拟 IP */
+    uint32_t assigned_vip = vpn_ip_pool_alloc(&vfserver.ip_pool);
+    if (assigned_vip == 0) {
+        log_error("IP Pool empty, dropping HELLO from %s", inet_ntoa(src->sin_addr));
+        return false;
+    }
+
+    /* 5. 生成会话 ID 并持久化 Session */
+    uint32_t new_sid = vpn_generate_sid(assigned_vip);
+    vpn_session_update(assigned_vip, new_sid, src);
+
+    /* 6. 原地构造响应报文 (Zero-copy reuse) */
+    
+    // 更新 Header：保持你的字段定义
+    hdr->version    = VFAST_VERSION;
+    hdr->msg_type   = VPN_MSG_HELLO; 
+    hdr->session_id = htonl(new_sid); // 转为网络字节序
+    hdr->flags      = 0;
+
+    /* 7. 【关键核心】：调用你的 vfast_auth_pack 函数 */
+    /* 我们直接把打包后的数据写入 header 之后的内存空间 */
+    vpn_auth_t resp_payload;
+    vfast_auth_pack(&resp_payload, assigned_vip, expected_token, 0);
+    memcpy(payload_ptr, &resp_payload, sizeof(vpn_auth_t));
+
+    /* 8. 提交异步回包 */
+    int resp_len = sizeof(vpn_tunnel_hdr_t) + sizeof(vpn_auth_t);
+    
+    log_info("Handshake Complete: VIP=%s SID=0x%08x -> %s",
+             inet_ntoa(*(struct in_addr *)&assigned_vip), 
+             new_sid, 
+             inet_ntoa(src->sin_addr));
+
+    /* 异步发送，直接复用当前 task 的 buffer */
+    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, buf, resp_len, src);
+
+    return true;
+}
+
+/**
+ * @brief Handles Data from UDP (Public Internet -> Virtual Network)
+ * Decapsulates the VPN header and writes the inner IP packet to TUN.
+ */
+static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src) {
+    if (unlikely(len < (int)sizeof(vpn_tunnel_hdr_t))) {
+        atomic_fetch_add(&vfserver.stats.drops, 1);
+        return -1;
+    }
+
+    /* 1. Map the VPN header */
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
+    uint8_t *inner_pkt = data + sizeof(vpn_tunnel_hdr_t);
+    int inner_len = len - sizeof(vpn_tunnel_hdr_t);
+
+    /* 2. Track the peer (Simple session sticky) */
+    memcpy(&io->remote_addr, src, sizeof(struct sockaddr_in));
+    
+    /* 3. Dispatch based on message type */
+    switch (hdr->msg_type) {
+        case VPN_MSG_DATA:
+            /* Future: Add Decryption here */
+            vfast_submit_write(io, io->tun_fd, OP_TUN_WRITE, inner_pkt, inner_len, NULL);
+            break;
+            
+        case VPN_MSG_KEEPALIVE:
+            log_debug("Keepalive received from %s", inet_ntoa(src->sin_addr));
+            break;
+
+        case VPN_MSG_HELLO:
+            vfast_auth_request(io, len, data, src);
+            break;
+
+        default:
+            log_warn("Unknown VPN msg type: 0x%02x", hdr->msg_type);
+            break;
+    }
+
+    atomic_fetch_add(&vfserver.stats.rx_pkts, 1);
+    return 0;
+}
+
+/**
+ * @brief Handles Data from TUN (Virtual Network -> Public Internet)
+ * Encapsulates the IP packet with a VPN header and sends it via UDP.
+ */
+static int server_on_tun(vfast_io_t *io, uint8_t *data, int len) {
+    /* To avoid double copy, ideally the vfast_task_t buffer should have 
+     * space reserved for the header. For now, we use a simple encapsulation. */
+    
+    uint8_t encap_buf[BUF_SIZE];
+    if (len + sizeof(vpn_tunnel_hdr_t) > BUF_SIZE) return -1;
+
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)encap_buf;
+    hdr->msg_type = VPN_MSG_DATA;
+    // hdr->seq = 0; // Increment this in production
+
+    memcpy(encap_buf + sizeof(vpn_tunnel_hdr_t), data, len);
+    int total_len = len + sizeof(vpn_tunnel_hdr_t);
+
+    /* Send to the last known remote peer */
+    if (io->remote_addr.sin_port != 0) {
+        vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, encap_buf, total_len, &io->remote_addr);
+        atomic_fetch_add(&vfserver.stats.tx_pkts, 1);
+    }
+
+    return 0;
+}
+
+/**
  * vfast_setup_signals - Industrial-grade signal registration.
  * Registers SIGINT and SIGTERM to trigger a graceful exit.
  * * NOTE: We explicitly omit SA_RESTART. This ensures that blocking 
@@ -128,7 +280,7 @@ int vfast_setup_signals(void) {
 
     /* Initialize sigaction structure */
     memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = vfast_signal_handler;
+    sa.sa_handler = signal_handler;
     sigemptyset(&sa.sa_mask);
 
     /* * sa_flags = 0 is critical here. 
@@ -155,25 +307,20 @@ int vfast_setup_signals(void) {
 static int vfast_clean_server(void) {
     log_info("Initiating graceful shutdown...");
     /* 1. Stop the Transport (UDP) */
-    if (vfserver.ctx.udp) {
-        udp_close(vfserver.ctx.udp);
-        vfserver.ctx.udp = NULL;
+    if (vfserver.udp) {
+        udp_close(vfserver.udp);
+        vfserver.udp = NULL;
     }
 
     /* 3. Close the TUN device */
-    vpn_tun_destroy(&vfserver.ctx.tun);
+    vpn_tun_destroy(&vfserver.tun);
 
     /* 4. Business logic teardown */
     vpn_session_destroy();
-    vpn_ip_pool_destroy(&vfserver.ctx.ip_pool);
+    vpn_ip_pool_destroy(&vfserver.ip_pool);
 
-    /* 2. Destroy the Ring FIRST (The most sensitive resource) */
-    /* This will force cancellation of all inflight SQEs */
-    vpn_iouring_destroy(&vfserver.ctx.io_ring);
-
-    if (vfserver.ctx.io_data_pool) {
-        zfree(vfserver.ctx.io_data_pool);
-    }
+    /* 5. Cleanup io_uring */
+    vfast_io_exit(&vfserver.io);
 
     vpn_option_clean(&vfserver.opt);
 
@@ -182,20 +329,20 @@ static int vfast_clean_server(void) {
 }
 
 static int vfast_init_server(void) {
-    memset(&vfserver.ctx, 0, sizeof(vfast_ctx_t));
-    atomic_store(&vfserver.ctx.running, true);
+    memset(&vfserver.io, 0, sizeof(vfast_io_t));
+    atomic_store(&vfserver.io.running, true);
 
     if (vfast_load_key(vfserver.opt.keyfile, vfserver.opt.master_key) < 0) {
         log_error("Failed load key file.");
         return -1;
     }
-    vfserver.ctx.key = vfserver.opt.master_key;
+
     /* 1. Setup specialized signal handling */
     if (vfast_setup_signals() < 0) return -1;
 
     /* Initialize IPAM (The IP Pool) - MUST be before sessions */
     /* Starting from 10.0.0.0 with 65536 addresses (/16) */
-    if (vpn_ip_pool_init(&vfserver.ctx.ip_pool, 
+    if (vpn_ip_pool_init(&vfserver.ip_pool, 
         vfserver.opt.pool_network, vfserver.opt.pool_size) != 0) {
         log_error("Failed to initialize IP Pool");
         return -1;
@@ -206,33 +353,28 @@ static int vfast_init_server(void) {
         return -1;
     }
 
-    if (vpn_iouring_init(
-        &vfserver.ctx.io_ring, 
-        vfserver.opt.io_ring_depth) < 0) {
-        log_error("Init iouring failed");
-        return -1;
-    }
-
-    if (vpn_tun_init(&vfserver.ctx.tun, vfserver.opt.tun_name, 0) < 0) {
+    if (vpn_tun_init(&vfserver.tun, vfserver.opt.tun_name, 0) < 0) {
         log_error("Failed to initialize TUN device");
         return -1;
     }
     vpn_tun_disable_ipv6(vfserver.opt.tun_name);
-    vpn_tun_set_ip(vfserver.ctx.tun.name, vfserver.opt.tun_ip, VFAST_BROADCAST);
-    vpn_tun_set_status(vfserver.ctx.tun.name, vfserver.opt.mtu, 1); /* MTU 1400 to allow header overhead */
-    vpn_set_nonblocking(vfserver.ctx.tun.fd);
+    vpn_tun_set_ip(vfserver.tun.name, vfserver.opt.tun_ip, VFAST_BROADCAST);
+    vpn_tun_set_status(vfserver.tun.name, vfserver.opt.mtu, 1); /* MTU 1400 to allow header overhead */
+    vpn_set_nonblocking(vfserver.tun.fd);
 
-    vfserver.ctx.udp = udp_init_listener(vfserver.opt.local_port, vfserver.opt.udp_backlog); 
-    if (!vfserver.ctx.udp) {
+    vfserver.udp = udp_init_listener(vfserver.opt.local_port, vfserver.opt.udp_backlog); 
+    if (!vfserver.udp) {
         log_error("Failed to init UDP listener");
         goto cleanup;
     }
-    vpn_set_nonblocking(vfserver.ctx.udp->fd);
+    vpn_set_nonblocking(vfserver.udp->fd);
+    
+    vfast_ops_t ops = {
+        .on_udp_data = server_on_udp,
+        .on_tun_data = server_on_tun
+    };
+    vfast_io_init(&vfserver.io, vfserver.udp->fd, vfserver.tun.fd, ops);
 
-    vfserver.ctx.io_data_pool = zcalloc(sizeof(vpn_io_data_t) * IO_BUF_POOL_SIZE);
-    if (!vfserver.ctx.io_data_pool) goto cleanup;
-
-    vfast_io_warmup(&vfserver.ctx);
     return 0;
 
 cleanup:
@@ -303,69 +445,8 @@ int main(int argc, char *argv[]) {
 
     if (vfast_init_server() < 0) return 1;
 
-    struct io_uring_cqe *cqes[16]; // Batch processing array
-    static uint64_t last_check_pkt = 0;
-
-    while (atomic_load(&vfserver.ctx.running)) {
-        /* Batch-peek completions to minimize synchronization overhead */
-        int count = io_uring_peek_batch_cqe(&vfserver.ctx.io_ring.ring, cqes, 16);
-        
-        /* If no completions, wait for at least one */
-        if (count == 0) {
-            struct io_uring_cqe *cqe;
-            int ret = io_uring_wait_cqe(&vfserver.ctx.io_ring.ring, &cqe);
-            if (ret < 0) {
-                if (ret == -EINTR) break; /* Normal exit on signal */
-                log_error("Fatal io_uring error: %d", ret);
-                break;
-            }
-            cqes[0] = cqe;
-            count = 1;
-        }
-
-        for (int i = 0; i < count; i++) {
-            struct io_uring_cqe *cqe = cqes[i];
-            vpn_io_data_t *data = (vpn_io_data_t *)io_uring_cqe_get_data(cqe);
-            int res = cqe->res, idx = data->buf_idx;
-            data->res = res;
-
-            if (unlikely(res <= 0)) {
-                atomic_fetch_add(&vfserver.ctx.stats.drop_io_errors, 1);
-                vfast_auto_reschedule(&vfserver.ctx, idx);
-            } else {
-                /* Finite State Machine: High-speed packet routing */
-                switch (data->type) {
-                case IO_TYPE_TUN_READ:
-                    if (!vfast_tun_rx(&vfserver.ctx, res, idx, data)) {
-                        vfast_auto_reschedule(&vfserver.ctx, idx);
-                    }
-                    break;  // --->SOCK_WRITE
-                case IO_TYPE_SOCK_READ: 
-                    if (!vfast_udp_rx(&vfserver.ctx, res, idx, data)) {
-                        vfast_auto_reschedule(&vfserver.ctx, idx);
-                    }
-                    break; // --->TUN_WRITE
-                case IO_TYPE_SOCK_WRITE:
-                case IO_TYPE_TUN_WRITE:
-                    vfast_auto_reschedule(&vfserver.ctx, idx);
-                    break;
-                }
-            }
-            io_uring_cqe_seen(&vfserver.ctx.io_ring.ring, cqe);
-
-            last_check_pkt++;
-        }
-
-        if (unlikely(last_check_pkt >= 50000)) {
-            last_check_pkt = 0;
-            vpn_session_clean_timeout(&vfserver.ctx.ip_pool, 60);
-            log_info("Periodic cleanup: scan timeout sessions.");
-
-            vfast_report_performance(&vfserver.ctx);
-        }
-        /* Submit all queued SQEs in one single batch to improve SQPOLL efficiency */
-        vpn_iouring_flush(&vfserver.ctx.io_ring);
-    }
+    log_info("VFAST server is up and running on port %d. Press Ctrl+C to stop.", vfserver.opt.local_port);
+    vfast_io_run(&vfserver.io);
 
     vfast_clean_server();
     return 0;
