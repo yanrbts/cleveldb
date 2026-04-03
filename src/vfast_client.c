@@ -20,6 +20,7 @@
 #include "log.h"
 #include "utils.h"
 #include "fsm.h"
+#include "auth.h"
 #include "zmalloc.h"
 #include "protocol.h"
 #include "option.h"
@@ -66,14 +67,144 @@ static void vfast_cleanup() {
     log_info("Cleanup complete. Exit.");
 }
 
+/**
+ * @brief Unified UDP reception callback for the VFast Client.
+ * * This function serves as the entry point for all packets arriving from the server.
+ * It handles decryption for data packets and state transitions for control packets.
+ * * @param io    Pointer to the io_uring engine context.
+ * @param data  Pointer to the received raw buffer (task->buf).
+ * @param len   Length of the received data.
+ * @param src   Source address of the server (usually ignored but kept for validation).
+ * @return 0 on success, -1 on fatal protocol error.
+ */
 int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src) {
     UNUSED(src);
-    vfast_submit_write(io, io->tun_fd, OP_TUN_WRITE, data, len, NULL);
+
+    /* 1. Basic Protocol Validation */
+    if (unlikely(len < (int)sizeof(vpn_tunnel_hdr_t))) {
+        return -1;
+    }
+
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
+
+    /* 2. Update Heartbeat Watchdog */
+    /* Every valid packet from the server proves the link is alive */
+    vfast_fsm_update_rx();
+
+    switch (hdr->msg_type) {
+    case VPN_MSG_DATA: {
+        /* Only process payload data if the tunnel is fully established */
+        if (unlikely(!vfast_fsm_is_connected())) {
+            return 0; 
+        }
+
+        int plain_ip_len = 0;
+        uint32_t recv_sid = 0;
+
+        /**
+         * 3. In-place Decryption & Unpacking:
+         * Converts the encrypted tunnel packet back into a standard IPv4/IPv6 packet.
+         * payload_ptr points to the decrypted IP header within 'data'.
+         */
+        uint8_t *payload_ptr = vpn_unpack(vfclient.opt.master_key, data, len, &plain_ip_len, &recv_sid);
+
+        if (unlikely(!payload_ptr)) {
+            log_warn("Ingress: Decryption failed or MAC mismatch from server.");
+            return -1;
+        }
+
+        /* 4. Session ID Validation: Multi-tenant / Stale session protection */
+        if (unlikely(recv_sid != client_fsm.sid)) {
+            log_warn("Ingress: SID mismatch (Expected: 0x%08x, Received: 0x%08x)", 
+                     client_fsm.sid, recv_sid);
+            return 0;
+        }
+
+        /**
+         * 5. Asynchronous TUN Write:
+         * Submit the decrypted plain IP packet to the TUN device via io_uring.
+         */
+        vfast_submit_write(io, io->tun_fd, OP_TUN_WRITE, payload_ptr, plain_ip_len, NULL);
+        break;
+    } 
+    case VPN_MSG_HELLO: {
+        /* This is the Handshake Response (Auth ACK) from the Server */
+        vpn_auth_t *auth = (vpn_auth_t *)(data + sizeof(vpn_tunnel_hdr_t));
+        
+        /* Persist session parameters provided by the server */
+        client_fsm.sid = ntohl(hdr->session_id);
+        client_fsm.vip = auth->vip;
+
+        /* 6. Dynamic IP Provisioning:
+         * Update the local TUN interface with the assigned Virtual IP.
+         */
+        char ip_str[INET_ADDRSTRLEN];
+        struct in_addr in = { .s_addr = auth->vip };
+        inet_ntop(AF_INET, &in, ip_str, sizeof(ip_str));
+        
+        /* Sync call to configure interface - essential for routing to start */
+        vpn_tun_set_ip(vfclient.tun.name, ip_str, VFAST_BROADCAST);
+
+        /* Transition FSM to CONNECTED state */
+        atomic_store(&client_fsm.state, ST_CONNECTED);
+        
+        log_info("Tunnel Ready: VIP=%s, SID=0x%08x", ip_str, client_fsm.sid);
+        break;
+    }
+    case VPN_MSG_KEEPALIVE:
+        /* Heartbeat ACK: No additional action needed as vfast_fsm_update_rx() 
+           already refreshed the timers. */
+        break;
+    default:
+        log_warn("Unknown message type [0x%02x] received from server.", hdr->msg_type);
+        break;
+    }
+
     return 0;
 }
 
+/**
+ * @brief Processes plain IP packets from TUN, encrypts/packs them, and sends to Server.
+ * * Path: TUN (Plain) -> vpn_pack (Encrypt + Header) -> UDP (Ciphertext)
+ * * @param io    The io_uring engine context.
+ * @param data  The pointer to the plain IP packet (already at task->buf + VPN_TNL_HLEN).
+ * @param len   The length of the plain IP packet.
+ * @return 0 on success, -1 on failure.
+ */
 int client_on_tun(vfast_io_t *io, uint8_t *data, int len) {
-    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, data, len, &io->remote_addr);
+    /* 1. Connection Check: Drop packets if not authenticated */
+    if (unlikely(!vfast_fsm_is_connected())) {
+        return 0;
+    }
+
+    /**
+     * 2. Direct Packing:
+     * Your vpn_pack expects 'buf' to be the start of the whole VFAST packet.
+     * Since 'data' starts at (task->buf + VPN_TNL_HLEN), we pass (data - VPN_TNL_HLEN).
+     */
+    uint8_t *vfast_packet_base = data - VPN_TNL_HLEN;
+    
+    /* We use BUF_SIZE to prevent overflows during encryption (+40 bytes) */
+    int total_len = vpn_pack(vfclient.opt.master_key, 
+                             vfast_packet_base, 
+                             len, 
+                             BUF_SIZE, 
+                             VPN_MSG_DATA, 
+                             client_fsm.sid);
+
+    if (unlikely(total_len < 0)) {
+        log_error("Failed to pack TUN packet for SID: 0x%08x", client_fsm.sid);
+        return -1;
+    }
+
+    /* 3. Submit Asynchronous UDP Send via io_uring */
+    vfast_submit_write(io, 
+                       io->udp_fd, 
+                       OP_UDP_SEND, 
+                       vfast_packet_base, 
+                       total_len, 
+                       &client_fsm.dst_addr);
+
     return 0;
 }
 
@@ -96,7 +227,6 @@ static int vfast_init_client() {
     sigaction(SIGINT, &sa, NULL);
 
     if (vpn_tun_init(&vfclient.tun, vfclient.opt.tun_name, 0) < 0) return -1;
-    // vpn_tun_set_ip(vfastctx.tun.name, "10.0.0.2", "255.255.255.0");
     vpn_tun_disable_ipv6(vfclient.opt.tun_name);
     vpn_tun_set_status(vfclient.tun.name, vfclient.opt.mtu, 1);
     
@@ -181,7 +311,7 @@ int main(int argc, char *argv[]) {
     }
 
     vfast_fsm_init(
-        vfclient.udp,
+        &vfclient.io,
         vfclient.opt.remote_host, 
         vfclient.opt.remote_port, 
         &vfclient.io.running

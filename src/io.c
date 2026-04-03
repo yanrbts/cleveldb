@@ -14,6 +14,8 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <arpa/inet.h>
+#include "protocol.h"
+#include "utils.h"
 #include "io.h"
 
 /* Optimization Constants */
@@ -71,23 +73,39 @@ int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, vfast_ops_t ops) {
 }
 
 /**
- * @brief Submits an asynchronous read/recv request.
+ * @brief Submits an asynchronous read or receive request to the io_uring submission queue.
+ * This function implements a strategic memory offset for TUN reads to facilitate 
+ * zero-copy encapsulation. By shifting the TUN read destination, we leave 
+ * immediate headroom for the VFAST protocol header.
+ *
+ * @param io  Pointer to the VFast I/O engine context.
+ * @param fd  The file descriptor to read from (UDP or TUN).
+ * @param op  The operation type (OP_UDP_RECV or OP_TUN_READ).
  */
 void vfast_submit_read(vfast_io_t *io, int fd, int op) {
+    /* 1. Acquire a task from the pre-allocated pool to ensure memory reuse */
     vfast_task_t *task = get_task_from_pool();
-    if (!task) return; 
+    if (unlikely(!task)) {
+        return; 
+    }
 
+    /* 2. Obtain a Submission Queue Entry (SQE) from the ring */
     struct io_uring_sqe *sqe = io_uring_get_sqe(&io->ring);
-    if (!sqe) {
-        task->in_use = false;
+    if (unlikely(!sqe)) {
+        task->in_use = false; /* Release task if SQE acquisition fails */
         return;
     }
 
     task->op = op;
-    /* Map FD to registered file index: UDP=0, TUN=1 */
+    /* Map FD to registered file index: UDP is 0, TUN is 1 */
     int f_idx = (fd == io->udp_fd) ? 0 : 1;
 
     if (op == OP_UDP_RECV) {
+        /**
+         * UDP Reception:
+         * We receive the full encrypted tunnel packet (Header + Nonce + Ciphertext + Tag).
+         * Data starts at the beginning of task->buf for full header parsing.
+         */
         task->addr_len        = sizeof(struct sockaddr_in);
         task->iov.iov_base    = task->buf;
         task->iov.iov_len     = BUF_SIZE;
@@ -95,12 +113,27 @@ void vfast_submit_read(vfast_io_t *io, int fd, int op) {
         task->msg.msg_namelen = task->addr_len;
         task->msg.msg_iov     = &task->iov;
         task->msg.msg_iovlen  = 1;
+        
         io_uring_prep_recvmsg(sqe, f_idx, &task->msg, 0);
     } else {
-        io_uring_prep_read(sqe, f_idx, task->buf, BUF_SIZE, 0);
+        /**
+         * TUN Read (Outbound Path Strategy):
+         * [CRITICAL OPTIMIZATION]
+         * We offset the read destination by VPN_TNL_HLEN (typically 8 bytes).
+         * This allows the kernel to write the raw IP packet directly into the 
+         * 'payload' section of the buffer, leaving the first 8 bytes empty 
+         * for the VFAST header to be filled later without a memcpy/memmove.
+         */
+        uint8_t *read_ptr = task->buf + VPN_TNL_HLEN;
+        int read_len      = BUF_SIZE - VPN_TNL_HLEN;
+        
+        io_uring_prep_read(sqe, f_idx, read_ptr, (unsigned)read_len, 0);
     }
 
+    /* Utilize registered files to bypass kernel-side file table overhead */
     sqe->flags |= IOSQE_FIXED_FILE;
+    
+    /* Attach the task pointer as user_data to identify the buffer on completion */
     io_uring_sqe_set_data(sqe, task);
 }
 
@@ -188,7 +221,8 @@ void vfast_io_run(vfast_io_t *io) {
             if (res >= 0) {
                 switch (task->op) {
                     case OP_TUN_READ:
-                        io->ops.on_tun_data(io, task->buf, res);
+                        uint8_t *tun_data = task->buf + VPN_TNL_HLEN;
+                        io->ops.on_tun_data(io, tun_data, res);
                         task->in_use = false; /* Release before re-submitting */
                         vfast_submit_read(io, io->tun_fd, OP_TUN_READ);
                         break;

@@ -226,7 +226,7 @@ bool vfast_udp_rx(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t *data) {
     case VPN_MSG_HELLO:
         return vfast_auth_request(ctx, res, idx, data);
     case VPN_MSG_KEEPALIVE:
-        return vfast_keeplive(ctx, res, idx, data);
+        // return vfast_keeplive(ctx, res, idx, data);
     case VPN_MSG_DISCONNECT:
     default:
         log_warn("Unknown msg_type 0x%02x from %s", 
@@ -364,53 +364,6 @@ bool vfast_tun_client_rx(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t *data
     }
 
     return vfast_udp_write(ctx, idx, total_len, data);
-}
-
-/**
- * vfast_keep - Process heartbeat and send acknowledgment back to client.
- */
-bool vfast_keeplive(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t *data) {
-    uint8_t *base = (uint8_t *)ctx->io_ring.iovecs[idx].iov_base;
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)base;
-    struct sockaddr_in *client_addr = &data->udp_meta.client_addr;
-
-    uint32_t v_ip;
-    struct sockaddr_in old_addr;
-    uint32_t hsid = ntohl(hdr->session_id);
-
-    /* 1. Session Validation & Update */
-    if (likely(vpn_session_lookup_by_sid(hsid, &v_ip, &old_addr))) {
-        
-        /* Refresh last_seen and handle potential NAT roaming */
-        vpn_session_update(v_ip, hsid, client_addr);
-
-        /* Log roaming if the public endpoint changed */
-        if (unlikely(memcmp(&old_addr, client_addr, sizeof(struct sockaddr_in)) != 0)) {
-            char ip_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &client_addr->sin_addr, ip_str, sizeof(ip_str));
-            log_info("ROAM: SID[0x%08x] now at %s:%d", hsid, ip_str, ntohs(client_addr->sin_port));
-        }
-
-        /**
-         * 2. Construct Response (Echo back)
-         * We reuse the same buffer and same header. 
-         * The client will see the same Session ID and MSG_TYPE.
-         */
-        vpn_auth_t *payload = (vpn_auth_t *)(base + sizeof(vpn_tunnel_hdr_t));
-        
-        /* Optional: Update the server-side timestamp in the payload */
-        payload->ts = (uint64_t)time(NULL);
-        payload->vip = v_ip; // Confirm their assigned VIP
-
-        /* 3. Send Acknowledgment via io_uring */
-        /* res is the length of the received keepalive packet */
-        return vfast_udp_writemsg(ctx, idx, res, data);
-    } else {
-        /* Session doesn't exist (possibly expired) */
-        log_warn("KEEPALIVE REJECTED: Unknown SID 0x%08x", hsid);
-        /* OPTIONAL: Send a special 'Reset' packet or just drop and let client re-auth */
-        return false;
-    }
 }
 
 /**

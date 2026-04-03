@@ -35,52 +35,6 @@ static inline uint16_t _calculate_checksum(uint16_t *buf, int len) {
     return (uint16_t)(~sum);
 }
 
-// /**
-//  * @brief Industrial-grade zero-copy encapsulation.
-//  * @param buf          The base address of the memory block (buffer start).
-//  * @param payload_len  The length of the actual payload currently in the buffer.
-//  * @param max_buf_size Total capacity of the buffer.
-//  * @param sid          Session ID.
-//  * @param src_ip       Source virtual IP (Network Order).
-//  * @param dst_ip       Destination virtual IP (Network Order).
-//  * @note To achieve zero-copy, the caller MUST have placed the payload at 
-//  * offset (VPN_TNL_HLEN + sizeof(struct iphdr)) within the buffer.
-//  * @return Total packet length on success, -1 on failure.
-//  */
-// int vpn_pack(const uint8_t *key, uint8_t *buf, int payload_len, int max_buf_size, vpn_msg_t type, uint32_t sid) {
-//     UNUSED(key);
-    
-//     // const int ip_hlen = sizeof(struct iphdr);
-//     // const int required_head = VPN_TNL_HLEN + ip_hlen;
-//     const int total_len = VPN_TNL_HLEN + payload_len;
-
-//     /* 1. Defensive Check: Ensure the total packet fits in the provided buffer */
-//     if (buf == NULL || total_len > max_buf_size) {
-//         log_error("Buffer overflow risk: required %d bytes, but max is %d", total_len, max_buf_size);
-//         return -1;
-//     }
-
-//     /* [ZERO-COPY LOGIC]
-//      * Instead of shifting data with memmove, we assume the payload is already
-//      * at buf + required_head. We simply fill the headers in the gap.
-//      */
-
-//     /* 2. Setup Tunnel Header at the very beginning of the buffer */
-//     vpn_tunnel_hdr_t *tnl = (vpn_tunnel_hdr_t *)buf;
-//     tnl->version    = VPN_VERSION;
-//     tnl->msg_type   = (uint8_t)type;
-//     tnl->flags      = 0;
-//     tnl->session_id = htonl(sid);
-
-//     /* 3. Setup Internal IP Header immediately following the tunnel header */
-//     // struct iphdr *ip = (struct iphdr *)(buf + VPN_TNL_HLEN);
-//     // _init_ip_header(ip, payload_len, src_ip, dst_ip);
-
-//     /* The entire packet now resides contiguously from 'buf' to 'buf + total_len' */
-//     return total_len;
-// }
-
-
 /**
  * @brief Industrial-grade encapsulation with mandatory AEAD encryption.
  * @param key          32-byte session key.
@@ -124,103 +78,26 @@ int vpn_pack(const uint8_t *key, uint8_t *buf, int payload_len, int max_buf_size
     return total_len;
 }
 
-// /**
-//  * @brief Decapsulates and validates incoming VFAST tunnel packets
-//  */
-// uint8_t* vpn_unpack(const uint8_t *key, uint8_t *buf, int received_len, int *out_ip_len, uint32_t *out_sid) {
-//     UNUSED(key);
-    
-//     const int min_header_len = VPN_TNL_HLEN + sizeof(struct iphdr);
-
-//     /* 1. Basic length validation */
-//     if (buf == NULL || received_len < min_header_len) {
-//         log_error("Received packet too short: %d bytes (minimum %d)", received_len, min_header_len);
-//         return NULL;
-//     }
-
-//     /* 2. Validate Tunnel Header */
-//     vpn_tunnel_hdr_t *tnl = (vpn_tunnel_hdr_t *)buf;
-//     if (tnl->version != VPN_VERSION) {
-//         log_error("Unsupported VPN version: %d", tnl->version);
-//         return NULL;
-//     }
-
-//     /* 3. Validate Internal IP Header Sanity */
-//     struct iphdr *ip = (struct iphdr *)(buf + VPN_TNL_HLEN);
-//     if (ip->version != 4 || ip->ihl < 5) {
-//         log_error("Invalid IP header: version %d, IHL %d", ip->version, ip->ihl);
-//         return NULL;
-//     }
-
-//     /* 4. Industrial Check: Cross-verify advertised length with actual received length 
-//      * This prevents processing of malformed packets or memory disclosure.
-//      */
-//     int inner_ip_tot_len = ntohs(ip->tot_len);
-//     if (inner_ip_tot_len > (received_len - (int)VPN_TNL_HLEN)) {
-//         log_error("Inner IP total length %d exceeds available data %d", inner_ip_tot_len, received_len - (int)VPN_TNL_HLEN);
-//         return NULL;
-//     }
-
-//     /* 5. Extract Metadata */
-//     *out_sid = ntohl(tnl->session_id);
-//     // *out_ip_len = received_len - VPN_TNL_HLEN;
-//     *out_ip_len = inner_ip_tot_len;
-
-//     /* Return pointer to start of Internal IP Header for TUN write */
-//     return (buf + VPN_TNL_HLEN);
-// }
-
 /**
- * @brief Decapsulates and decrypts incoming VFAST packets.
- * @return Pointer to the decrypted plaintext, or NULL on authentication failure.
+ * @brief Decapsulates VFAST header and decrypts payload in-place.
+ * @return Pointer to the decrypted plain IP packet, or NULL on failure.
  */
-uint8_t* vpn_unpack(const uint8_t *key, uint8_t *buf, int received_len, int *out_ip_len, uint32_t *out_sid) {
-    /* 1. Basic length check (Header 8 + Nonce 24 + Tag 16 = 48 bytes) */
-    if (unlikely(!buf || !key)) {
+uint8_t* vpn_unpack(const uint8_t *key, uint8_t *buf, int res, int *out_plain_len, uint32_t *out_sid) {
+    if (unlikely(res < (int)sizeof(vpn_tunnel_hdr_t))) return NULL;
+
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
+    *out_sid = ntohl(hdr->session_id);
+
+    /* Locate Ciphertext: Header (8B) + [Nonce + Payload + Tag] */
+    uint8_t *ciphertext_ptr = buf + sizeof(vpn_tunnel_hdr_t);
+    size_t ciphertext_len   = (size_t)(res - sizeof(vpn_tunnel_hdr_t));
+
+    /* Decrypt directly back into the same buffer area */
+    size_t plain_len = 0;
+    if (vpn_decrypt(key, ciphertext_ptr, ciphertext_len, ciphertext_ptr, &plain_len) != 0) {
         return NULL;
     }
 
-    /* 2. Header Validation */
-    vpn_tunnel_hdr_t *tnl = (vpn_tunnel_hdr_t *)buf;
-    if (unlikely(tnl->version != VPN_VERSION)) {
-        return NULL;
-    }
-
-    /* 3. Extract Metadata */
-    *out_sid = ntohl(tnl->session_id);
-    uint8_t *crypto_ptr = buf + VPN_TNL_HLEN;
-    size_t crypto_len   = (size_t)(received_len - VPN_TNL_HLEN);
-    size_t plain_len    = 0;
-
-    /* 4. Authenticated Decryption (In-place) */
-    // This handles DATA, HEARTBEAT, and Handshake responses.
-    if (unlikely(vpn_decrypt(key, crypto_ptr, crypto_len, crypto_ptr, &plain_len) != 0)) {
-        log_warn("MAC Authentication failed for SID: 0x%08x", *out_sid);
-        return NULL;
-    }
-
-    /* 5. Payload-Specific Validation */
-    if (tnl->msg_type == VPN_MSG_DATA) {
-        if (unlikely(plain_len < sizeof(struct iphdr))) return NULL;
-
-        struct iphdr *ip = (struct iphdr *)crypto_ptr;
-        // Verify IPv4 Sanity
-        if (unlikely(ip->version != 4 || ip->ihl < 5)) {
-            log_error("Decrypted data is not a valid IPv4 packet");
-            return NULL;
-        }
-
-        // Cross-verify IP total length with decrypted size
-        int inner_ip_tot_len = ntohs(ip->tot_len);
-        if (unlikely(inner_ip_tot_len > (int)plain_len)) {
-            log_error("IP length mismatch: tot_len %d, plain %zu", inner_ip_tot_len, plain_len);
-            return NULL;
-        }
-        *out_ip_len = inner_ip_tot_len;
-    } else {
-        // For control/heartbeat, return the full decrypted length
-        *out_ip_len = (int)plain_len;
-    }
-
-    return crypto_ptr;
+    *out_plain_len = (int)plain_len;
+    return ciphertext_ptr; // This is the start of the Plain IP Packet
 }

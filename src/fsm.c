@@ -1,7 +1,5 @@
-/*
- * Copyright (c) 2026-2026, cleveldb.
+/* * Copyright (c) 2026-2026, cleveldb.
  * Author: [yanruibing]
- * All rights reserved.
  */
 
 #include <arpa/inet.h>
@@ -14,44 +12,52 @@
 #include "fsm.h"
 #include "vfast.h"
 
-/* FSM timing configuration (seconds) */
-#define FSM_TICK        1    /* Polling interval for the FSM thread */
-#define FSM_AUTH_RETRY  5    /* Wait time before retrying HELLO if no ACK */
-#define FSM_KEEPALIVE   10   /* Interval between heartbeat packets */
-#define FSM_TIMEOUT     30   /* Dead Peer Detection (DPD) threshold */
+#define FSM_TICK        1    
+#define FSM_AUTH_RETRY  5    
+#define FSM_KEEPALIVE   10   
+#define FSM_TIMEOUT     30   
 
 vfast_fsm_t client_fsm = {0};
 
 /**
- * @brief Constructs and sends an FSM control packet (HELLO/KEEPALIVE).
- * * @param type The VFAST message type (VPN_MSG_HELLO or VPN_MSG_KEEPALIVE).
+ * @brief Constructs and sends an FSM control packet via io_uring.
+ * Optimization: Uses the unified vfast_submit_write for non-blocking I/O.
  */
-static void send_fsm_pkt(uint8_t type) {
-    uint8_t buf[128] = {0};
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
-    
-    hdr->version = VPN_VERSION;
-    hdr->msg_type = type;
-    /* HELLO packets use SID 0; subsequent packets use the assigned SID */
-    hdr->session_id = (type == VPN_MSG_HELLO) ? 0 : htonl(client_fsm.sid);
+static void fsm_send_pkt(uint8_t type) {
+    /* Use a static buffer or task-pool allocated buffer for io_uring safety.
+     * Since FSM is low-frequency, we can afford a small dedicated buffer. */
+    static uint8_t fsm_buf[256]; 
+    memset(fsm_buf, 0, sizeof(fsm_buf));
 
-    vpn_auth_t *auth = (vpn_auth_t *)(buf + VPN_TNL_HLEN);
-    /* Pack authentication payload with virtual IP and secret key */
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)fsm_buf;
+    
+    hdr->version = VFAST_VERSION;
+    hdr->msg_type = type;
+    /* Network Byte Order for SID */
+    hdr->session_id = (type == VPN_MSG_HELLO) ? 0 : htonl(client_fsm.sid);
+    hdr->flags = 0;
+
+    vpn_auth_t *auth = (vpn_auth_t *)(fsm_buf + sizeof(vpn_tunnel_hdr_t));
+    /* Pack authentication payload */
     vfast_auth_pack(auth, client_fsm.vip, (uint8_t *)"VFAST_SECRET", 0);
 
-    size_t len = VPN_TNL_HLEN + sizeof(vpn_auth_t);
+    size_t len = sizeof(vpn_tunnel_hdr_t) + sizeof(vpn_auth_t);
     
-    /* Send via raw UDP wrapper */
-    udp_send_raw(client_fsm.udp, client_fsm.server_ip, client_fsm.server_port, buf, len);
+    /**
+     * Unified Submission:
+     * This replaces udp_send_raw. vfast_submit_write is thread-safe 
+     * (ensure you have a mutex around io_uring_get_sqe if calling from multiple threads).
+     */
+    vfast_submit_write(client_fsm.io, client_fsm.io->udp_fd, OP_UDP_SEND, 
+                       fsm_buf, (int)len, &client_fsm.dst_addr);
 }
 
 /**
- * @brief FSM Background Worker Thread.
- * Monitors connection health and manages state transitions.
+ * @brief FSM Background Worker Thread (Logic remains consistent).
  */
 static void *fsm_worker(void *arg) {
     (void)arg;
-    log_info("FSM: Background worker thread initiated.");
+    log_info("FSM: Unified io_uring background worker initiated.");
 
     while (likely(atomic_load(client_fsm.running))) {
         time_t now = time(NULL);
@@ -61,94 +67,72 @@ static void *fsm_worker(void *arg) {
         switch (state) {
             case ST_IDLE:
             case ST_RECONNECTING:
-                /* Trigger initial handshake */
-                send_fsm_pkt(VPN_MSG_HELLO);
+                fsm_send_pkt(VPN_MSG_HELLO);
                 client_fsm.last_tx_auth = now;
                 atomic_store(&client_fsm.state, ST_WAIT_AUTH);
-                log_info("FSM: HELLO sent to %s:%d", 
+                log_info("FSM: HELLO submitted via io_uring to %s:%d", 
                          client_fsm.server_ip, client_fsm.server_port);
                 break;
 
             case ST_WAIT_AUTH:
-                /* Check for handshake timeout */
                 if (now - client_fsm.last_tx_auth >= FSM_AUTH_RETRY) {
-                    log_warn("FSM: Auth response timeout (%ds), retrying...", FSM_AUTH_RETRY);
+                    log_warn("FSM: Auth timeout, retrying...");
                     atomic_store(&client_fsm.state, ST_IDLE);
                 }
                 break;
 
             case ST_CONNECTED:
-                /* 1. Send periodic Keep-alive/Heartbeat */
                 if (now - client_fsm.last_tx_keep >= FSM_KEEPALIVE) {
-                    send_fsm_pkt(VPN_MSG_KEEPALIVE);
+                    fsm_send_pkt(VPN_MSG_KEEPALIVE);
                     client_fsm.last_tx_keep = now;
                 }
 
-                /* 2. Dead Peer Detection (DPD) based on last received packet */
                 if (now - last_rx >= FSM_TIMEOUT) {
-                    log_error("FSM: Connection timeout (No RX for %ds). Reconnecting...", FSM_TIMEOUT);
+                    log_error("FSM: Connection timeout (DPD). Reconnecting...");
                     atomic_store(&client_fsm.state, ST_RECONNECTING);
                 }
                 break;
-
-            default:
-                break;
         }
-
-        /* Sleep to prevent CPU spinning */
         sleep(FSM_TICK);
     }
-    
-    log_info("FSM: Worker thread terminating.");
     return NULL;
 }
 
 /**
- * @brief Initializes the FSM and spawns the management thread.
+ * @brief Initializes the FSM with io_uring support.
  */
-int vfast_fsm_init(const udp_conn_t *udp, const char *sip, uint16_t sport, atomic_bool *rig) {
-    if (!udp || !sip) return -1;
+int vfast_fsm_init(vfast_io_t *io, const char *sip, uint16_t sport, atomic_bool *rig) {
+    if (!io || !sip) return -1;
 
     memset(&client_fsm, 0, sizeof(vfast_fsm_t));
-    client_fsm.udp = (udp_conn_t*)udp;
+    client_fsm.io = io;
     client_fsm.server_port = sport;
     strncpy(client_fsm.server_ip, sip, sizeof(client_fsm.server_ip) - 1);
-    client_fsm.server_ip[sizeof(client_fsm.server_ip) - 1] = '\0';
     
-    /* Initialize activity timers to current time to prevent instant timeout */
-    time_t now = time(NULL);
-    atomic_store(&client_fsm.last_rx_time, now);
-    client_fsm.last_tx_auth = 0;
-    client_fsm.last_tx_keep = 0;
+    /* Pre-calculate sockaddr_in for io_uring performance */
+    client_fsm.dst_addr.sin_family = AF_INET;
+    client_fsm.dst_addr.sin_port = htons(sport);
+    inet_pton(AF_INET, sip, &client_fsm.dst_addr.sin_addr);
+    
+    atomic_store(&client_fsm.last_rx_time, time(NULL));
     client_fsm.running = rig;
-
     atomic_store(&client_fsm.state, ST_IDLE);
 
-    /* Launch the worker thread */
     return pthread_create(&client_fsm.thread_id, NULL, fsm_worker, NULL);
 }
 
-/**
- * @brief Updates the last received packet timestamp.
- * Should be called whenever io_uring receives a valid UDP packet from the server.
- */
+/* Remaining functions vfast_fsm_update_rx, etc., stay unchanged */
 void vfast_fsm_update_rx() { 
     atomic_store(&client_fsm.last_rx_time, time(NULL));
 }
 
-/**
- * @brief Thread-safe check if the client is fully authenticated and connected.
- */
 int vfast_fsm_is_connected() { 
     return atomic_load(&client_fsm.state) == ST_CONNECTED; 
 }
 
 void vfast_fsm_force_reconnect() {
-    int current_state = atomic_load(&client_fsm.state);
-    if (current_state == ST_CONNECTED) {
-        atomic_store(&client_fsm.state, ST_IDLE);
-        atomic_store(&client_fsm.sid, 0); 
-    }
+    atomic_store(&client_fsm.state, ST_IDLE);
+    atomic_store(&client_fsm.sid, 0); 
 }
 
 void vfast_fsm_pthread_join() {

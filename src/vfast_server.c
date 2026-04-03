@@ -136,67 +136,153 @@ static void vfast_cmd_keygen(void) {
 }
 
 /**
- * @brief Processes HELLO packet and submits a response.
- * @param io    The io_uring engine context
- * @param res   Number of bytes received (cqe->res)
- * @param buf   Pointer to the task buffer (task->buf)
- * @param src   Client's source address (task->addr)
+ * @brief Processes HELLO packet and submits an asynchronous response.
+ * Optimization Highlights:
+ * 1. Zero-copy Response Construction: Invokes vfast_auth_pack directly on the 
+ * task buffer to eliminate redundant stack allocation and memcpy.
+ * 2. Pre-calculated Offsets: Minimizes pointer arithmetic during the hot path.
+ * 3. Atomic Stats Integration: (Optional but recommended) for monitoring.
+ * @param io    Pointer to the io_uring engine context.
+ * @param res   Actual bytes received from the CQE.
+ * @param buf   Pointer to the specific task's buffer (task->buf).
+ * @param src   Source address of the requesting client.
+ * @return true if the request was handled successfully, false otherwise.
  */
 static bool vfast_auth_request(vfast_io_t *io, int res, uint8_t *buf, struct sockaddr_in *src) {
-    /* 1. 基础边界检查 (Header + Auth Payload) */
-    if (unlikely(res < (int)(sizeof(vpn_tunnel_hdr_t) + sizeof(vpn_auth_t)))) {
-        log_warn("Incomplete HELLO packet from %s", inet_ntoa(src->sin_addr));
+    /* 1. Pre-calculate response length and boundary check */
+    const int auth_size = (int)sizeof(vpn_auth_t);
+    const int head_size = (int)sizeof(vpn_tunnel_hdr_t);
+    const int resp_len  = head_size + auth_size;
+
+    /* Validate input length: must accommodate both header and auth payload */
+    if (unlikely(res < resp_len)) {
+        log_warn("Dropped malformed HELLO packet (size %d) from %s", res, inet_ntoa(src->sin_addr));
         return false;
     }
 
-    /* 2. 原位指针映射 */
+    /* 2. Direct pointer mapping (Zero-copy) */
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
-    uint8_t *payload_ptr  = buf + sizeof(vpn_tunnel_hdr_t);
+    vpn_auth_t *auth_ptr  = (vpn_auth_t *)(buf + head_size);
 
-    /* 3. 身份验证：调用你原有的验证逻辑 */
+    /* 3. Authentication: Validate client token using existing logic */
     const uint8_t *expected_token = (const uint8_t *)"VFAST_SECRET"; 
-    if (vfast_auth_verify((vpn_auth_t *)payload_ptr, expected_token) != 0) {
-        log_warn("Unauthorized HELLO attempt from %s", inet_ntoa(src->sin_addr));
+    if (vfast_auth_verify(auth_ptr, expected_token) != 0) {
+        log_warn("Authentication failed for client: %s", inet_ntoa(src->sin_addr));
         return false;
     }
 
-    /* 4. 资源分配：从全局池分配虚拟 IP */
+    /* 4. IPAM: Allocate Virtual IP from the global address pool */
     uint32_t assigned_vip = vpn_ip_pool_alloc(&vfserver.ip_pool);
-    if (assigned_vip == 0) {
-        log_error("IP Pool empty, dropping HELLO from %s", inet_ntoa(src->sin_addr));
+    if (unlikely(assigned_vip == 0)) {
+        log_error("Resource exhaustion: IP Pool is empty. Rejecting %s", inet_ntoa(src->sin_addr));
         return false;
     }
 
-    /* 5. 生成会话 ID 并持久化 Session */
+    /* 5. Session Management: Generate SID and link VIP to physical address */
     uint32_t new_sid = vpn_generate_sid(assigned_vip);
     vpn_session_update(assigned_vip, new_sid, src);
 
-    /* 6. 原地构造响应报文 (Zero-copy reuse) */
+    /* 6. Response Construction: Reuse the same buffer for Egress (Zero-copy) */
     
-    // 更新 Header：保持你的字段定义
+    /* Update Header Fields */
     hdr->version    = VFAST_VERSION;
     hdr->msg_type   = VPN_MSG_HELLO; 
-    hdr->session_id = htonl(new_sid); // 转为网络字节序
+    hdr->session_id = htonl(new_sid); // Ensure Network Byte Order
     hdr->flags      = 0;
 
-    /* 7. 【关键核心】：调用你的 vfast_auth_pack 函数 */
-    /* 我们直接把打包后的数据写入 header 之后的内存空间 */
-    vpn_auth_t resp_payload;
-    vfast_auth_pack(&resp_payload, assigned_vip, expected_token, 0);
-    memcpy(payload_ptr, &resp_payload, sizeof(vpn_auth_t));
+    /* 7. Optimized Packing:
+     * Directly pack response data into the task buffer.
+     * This avoids: 'vpn_auth_t tmp; vfast_auth_pack(&tmp...); memcpy(dest, &tmp...);'
+     */
+    vfast_auth_pack(auth_ptr, assigned_vip, expected_token, 0);
 
-    /* 8. 提交异步回包 */
-    int resp_len = sizeof(vpn_tunnel_hdr_t) + sizeof(vpn_auth_t);
-    
-    log_info("Handshake Complete: VIP=%s SID=0x%08x -> %s",
-             inet_ntoa(*(struct in_addr *)&assigned_vip), 
-             new_sid, 
-             inet_ntoa(src->sin_addr));
+    /* 8. Asynchronous Dispatch */
+    log_info("Handshake assigned VIP %u.%u.%u.%u [SID: 0x%08x] to %s",
+             (assigned_vip & 0xFF), (assigned_vip >> 8) & 0xFF,
+             (assigned_vip >> 16) & 0xFF, (assigned_vip >> 24) & 0xFF, 
+             new_sid, inet_ntoa(src->sin_addr));
 
-    /* 异步发送，直接复用当前 task 的 buffer */
+    /* Submit the buffer back to the network via io_uring */
     vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, buf, resp_len, src);
 
     return true;
+}
+
+/**
+ * @brief Processes HEARTBEAT/KEEPALIVE packets and refreshes session state.
+ * Optimization Highlights:
+ * 1. NAT Roaming Detection: Compares the source address to detect network changes 
+ * (e.g., switching from Wi-Fi to 5G) and updates the session routing table.
+ * 2. In-place Echo: Reuses the ingress buffer to construct the ACK, updating 
+ * only necessary timestamps and VIP fields.
+ * 3. Branch Prediction: Uses likely/unlikely hints to optimize the CPU pipeline 
+ * for the "hot path" (successful session lookup).
+ * @param io    Pointer to the io_uring engine context.
+ * @param res   Number of bytes received (cqe->res).
+ * @param buf   Pointer to the task buffer (task->buf).
+ * @param src   Physical source address of the client.
+ * @return true if the keepalive was processed/ACKed, false otherwise.
+ */
+static bool vfast_keeplive(vfast_io_t *io, int res, uint8_t *buf, struct sockaddr_in *src) {
+    /* 1. Basic Length Validation */
+    if (unlikely(res < (int)sizeof(vpn_tunnel_hdr_t))) {
+        return false;
+    }
+
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
+    uint32_t hsid = ntohl(hdr->session_id);
+    uint32_t v_ip;
+    struct sockaddr_in old_addr;
+
+    /* 2. Session Validation: Fast lookup in the session table */
+    if (likely(vpn_session_lookup_by_sid(hsid, &v_ip, &old_addr))) {
+        
+        /* 3. Handle NAT Roaming / Endpoint Change
+         * If the client's source IP or Port has changed, we log the event 
+         * and update the session mapping to ensure downlink traffic finds them.
+         */
+        if (unlikely(old_addr.sin_addr.s_addr != src->sin_addr.s_addr || 
+                     old_addr.sin_port != src->sin_port)) {
+            
+            char ip_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &src->sin_addr, ip_str, sizeof(ip_str));
+            log_info("ROAM: SID[0x%08x] migrated from %s:%d to %s:%d", 
+                     hsid, 
+                     inet_ntoa(old_addr.sin_addr), ntohs(old_addr.sin_port),
+                     ip_str, ntohs(src->sin_port));
+        }
+
+        /* 4. Refresh Session: Update 'last_seen' timestamp and endpoint */
+        vpn_session_update(v_ip, hsid, src);
+
+        /* 5. Response Construction (Zero-copy Echo)
+         * We reuse the header and update the payload with current server state.
+         * Note: We assume the packet contains a vpn_auth_t payload for heartbeat.
+         */
+        if (res >= (int)(sizeof(vpn_tunnel_hdr_t) + sizeof(vpn_auth_t))) {
+            vpn_auth_t *payload = (vpn_auth_t *)(buf + sizeof(vpn_tunnel_hdr_t));
+            
+            /* Update heartbeat metadata */
+            payload->ts  = (uint64_t)time(NULL);
+            payload->vip = v_ip; 
+            payload->magic = htonl(0x56465354); // "VFST"
+        }
+
+        /* 6. Submit Asynchronous ACK via io_uring
+         * By sending back the same length 'res', we ensure protocol consistency.
+         */
+        vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, buf, res, src);
+        
+        return true;
+
+    } else {
+        /* Session has likely expired or the client is unauthorized */
+        log_warn("KEEPALIVE REJECTED: Session 0x%08x not found for %s", 
+                 hsid, inet_ntoa(src->sin_addr));
+        
+        /* Future expansion: Submit a VPN_MSG_DISCONNECT to force client re-auth */
+        return false;
+    }
 }
 
 /**
@@ -226,6 +312,7 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
             
         case VPN_MSG_KEEPALIVE:
             log_debug("Keepalive received from %s", inet_ntoa(src->sin_addr));
+            vfast_keeplive(io, len, data, src);
             break;
 
         case VPN_MSG_HELLO:
