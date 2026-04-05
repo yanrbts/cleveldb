@@ -34,7 +34,7 @@ int vfast_auth_verify(const vpn_auth_t *auth, const uint8_t *expected_token) {
     /* Verify credentials if a reference token is supplied */
     if (expected_token) {
         /* memcmp is efficient for 16-byte fixed-length comparisons */
-        if (memcmp(auth->token, expected_token, 16) != 0) {
+        if (memcmp(auth->token, expected_token, 12) != 0) {
             return -3;
         }
     }

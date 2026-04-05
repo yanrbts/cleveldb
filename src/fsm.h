@@ -30,13 +30,14 @@ typedef struct {
     uint16_t        server_port;
     struct sockaddr_in dst_addr;   /* Pre-calculated server address */
     vfast_io_t     *io;            /* Unified IO Engine */
-    atomic_bool    *running;       
+    atomic_bool    *running;
+    const uint8_t  *key;          /* Pointer to the session key (set after auth) */
 } vfast_fsm_t;
 
 extern vfast_fsm_t client_fsm;
 
 /* Signature updated to accept vfast_io_t */
-int vfast_fsm_init(vfast_io_t *io, const char *sip, uint16_t sport, atomic_bool *rig);
+int vfast_fsm_init(vfast_io_t *io, const char *sip, uint16_t sport, atomic_bool *rig, const uint8_t *key);
 void vfast_fsm_update_rx();
 int vfast_fsm_is_connected();
 void vfast_fsm_force_reconnect();

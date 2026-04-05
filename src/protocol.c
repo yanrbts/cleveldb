@@ -37,6 +37,10 @@ static inline uint16_t _calculate_checksum(uint16_t *buf, int len) {
 
 /**
  * @brief Industrial-grade encapsulation with mandatory AEAD encryption.
+ * 1. For HELLO: Skips encryption to allow initial handshake.
+ * 2. For others: Performs in-place AEAD encryption.
+ * 3. Safety: Strict boundary checks and error logging included.
+ * 
  * @param key          32-byte session key.
  * @param buf          Buffer base (Payload MUST start at buf + VPN_TNL_HLEN).
  * @param payload_len  Length of the raw payload (e.g., IP packet or Control data).
@@ -45,35 +49,62 @@ static inline uint16_t _calculate_checksum(uint16_t *buf, int len) {
  * @param sid          Session ID for routing.
  * @return Total bytes to send over UDP, or -1 on error.
  */
-int vpn_pack(const uint8_t *key, uint8_t *buf, int payload_len, int max_buf_size, vpn_msg_t type, uint32_t sid) {
-    if (unlikely(!buf || !key)) return -1;
+/**
+ * @brief Encapsulates a VFAST packet with optional encryption and strict validation.
+ * * Logic:
+ * 1. For HELLO: Skips encryption to allow initial handshake.
+ * 2. For others: Performs in-place AEAD encryption.
+ * 3. Safety: Strict boundary checks and error logging included.
+ *
+ * @return Total bytes to send (Header + Payload), or -1 on error.
+ */
+int vpn_pack(const uint8_t *key, uint8_t *buf, int payload_len, 
+    int max_buf_size, vpn_msg_t type, uint32_t sid) {
+    /* 1. Basic Pointer Check */
+    if (unlikely(!buf)) return -1;
 
-    /* 1. Locate Payload: Assumes zero-copy placement at offset 8 */
+    /* 2. Locate Payload: Assumes zero-copy placement at offset 8 */
     uint8_t *payload_ptr = buf + VPN_TNL_HLEN;
     size_t crypto_out_len = 0;
 
-    /* 2. Full Encryption: All packet types are encrypted to protect 
-     * metadata (like allocated IPs in handshake) and evade basic DPI.
-     */
-    if (unlikely(vpn_encrypt(key, payload_ptr, (size_t)payload_len, payload_ptr, &crypto_out_len) != 0)) {
-        log_error("Encryption failed for SID: 0x%08x", sid);
-        return -1;
+    /* 3. Encryption Logic Branching with Strict Validation */
+    if (type == VPN_MSG_HELLO || type == VPN_MSG_KEEPALIVE) {
+        /**
+         * HANDSHAKE PHASE:
+         * No session key is available. Payload remains plain-text.
+         */
+        crypto_out_len = (size_t)payload_len;
+    } else {
+        /**
+         * ESTABLISHED PHASE:
+         * Encrypt in-place. Requires a valid session key.
+         */
+        if (unlikely(!key)) {
+            log_error("Encryption failed: Missing session key for SID: 0x%08x", sid);
+            return -1;
+        }
+
+        if (unlikely(vpn_encrypt(key, payload_ptr, (size_t)payload_len, payload_ptr, &crypto_out_len) != 0)) {
+            log_error("Encryption failed for SID: 0x%08x, Type: %d", sid, type);
+            return -1;
+        }
     }
 
+    /* 4. Final Safety Check: Header + (Encrypted or Plain) Payload vs Capacity */
     const int total_len = VPN_TNL_HLEN + (int)crypto_out_len;
-
-    /* 3. Safety Check: 48 bytes (Nonce+Tag+Hdr) + original payload */
     if (unlikely(total_len > max_buf_size)) {
-        log_error("Buffer overflow: needed %d, have %d", total_len, max_buf_size);
+        log_error("Buffer overflow: needed %d, capacity %d (SID: 0x%08x)", total_len, max_buf_size, sid);
         return -1;
     }
 
-    /* 4. Fill Tunnel Header (Sent in plaintext for now) */
+    /* 5. Fill Tunnel Header (Standard Wire Format) */
     vpn_tunnel_hdr_t *tnl = (vpn_tunnel_hdr_t *)buf;
+    
     tnl->version    = VPN_VERSION;
     tnl->msg_type   = (uint8_t)type;
     tnl->flags      = 0;
-    tnl->session_id = htonl(sid);
+    /* Ensure SID is in Network Byte Order (0 for HELLO) */
+    tnl->session_id = (type == VPN_MSG_HELLO) ? 0 : htonl(sid);
 
     return total_len;
 }

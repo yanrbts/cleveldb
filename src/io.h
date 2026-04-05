@@ -122,4 +122,6 @@ void vfast_submit_read(vfast_io_t *io, int fd, int op);
  */
 void vfast_submit_write(vfast_io_t *io, int fd, int op, uint8_t *data, int len, struct sockaddr_in *dest);
 
+vfast_task_t* vfast_borrow_task();
+
 #endif /* VFAST_CORE_H */

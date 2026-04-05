@@ -166,8 +166,9 @@ static bool vfast_auth_request(vfast_io_t *io, int res, uint8_t *buf, struct soc
 
     /* 3. Authentication: Validate client token using existing logic */
     const uint8_t *expected_token = (const uint8_t *)"VFAST_SECRET"; 
-    if (vfast_auth_verify(auth_ptr, expected_token) != 0) {
-        log_warn("Authentication failed for client: %s", inet_ntoa(src->sin_addr));
+    int ret = vfast_auth_verify(auth_ptr, expected_token);
+    if (ret != 0) {
+        log_warn("Authentication failed for client: %s %d", inet_ntoa(src->sin_addr), ret);
         return false;
     }
 
@@ -287,7 +288,8 @@ static bool vfast_keeplive(vfast_io_t *io, int res, uint8_t *buf, struct sockadd
 
 /**
  * @brief Handles Data from UDP (Public Internet -> Virtual Network)
- * Decapsulates the VPN header and writes the inner IP packet to TUN.
+ * Decapsulates the VPN header, decrypts the payload, and writes the 
+ * resulting plain IP packet to the TUN device.
  */
 static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src) {
     if (unlikely(len < (int)sizeof(vpn_tunnel_hdr_t))) {
@@ -295,20 +297,46 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
         return -1;
     }
 
-    /* 1. Map the VPN header */
+    /* 1. Map the VPN header to extract session information */
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
-    uint8_t *inner_pkt = data + sizeof(vpn_tunnel_hdr_t);
-    int inner_len = len - sizeof(vpn_tunnel_hdr_t);
 
-    /* 2. Track the peer (Simple session sticky) */
+    /* 2. Track the peer for return traffic (Simple session sticky) */
     memcpy(&io->remote_addr, src, sizeof(struct sockaddr_in));
     
     /* 3. Dispatch based on message type */
     switch (hdr->msg_type) {
-        case VPN_MSG_DATA:
-            /* Future: Add Decryption here */
-            vfast_submit_write(io, io->tun_fd, OP_TUN_WRITE, inner_pkt, inner_len, NULL);
+        case VPN_MSG_DATA: {
+            int plain_len = 0;
+            uint32_t recv_sid = 0;
+
+            /**
+             * CRITICAL: Decrypt and Unpack.
+             * vpn_unpack performs in-place decryption. It returns a pointer to the 
+             * start of the plain IP packet and updates 'plain_len'.
+             * * This replaces the old manual pointer math that caused the warnings.
+             */
+            uint8_t *payload_ptr = vpn_unpack(vfserver.opt.master_key, data, len, 
+                                              &plain_len, &recv_sid);
+
+            if (unlikely(!payload_ptr || plain_len <= 0)) {
+                log_warn("Ingress: Decryption failed or invalid packet from %s", 
+                         inet_ntoa(src->sin_addr));
+                return -1;
+            }
+
+            /* Optional: Verify that the Session ID in the packet matches our records */
+            uint32_t hsid = ntohl(hdr->session_id);
+            if (unlikely(hsid != recv_sid)) {
+                log_debug("Ingress: SID mismatch (HDR: 0x%08x, Payload: 0x%08x)", hsid, recv_sid);
+            }
+
+            /**
+             * 4. Submit to TUN.
+             * The kernel will now receive a valid, decrypted IPv4/IPv6 packet.
+             */
+            vfast_submit_write(io, io->tun_fd, OP_TUN_WRITE, payload_ptr, plain_len, NULL);
             break;
+        }
             
         case VPN_MSG_KEEPALIVE:
             log_debug("Keepalive received from %s", inet_ntoa(src->sin_addr));
@@ -329,27 +357,80 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
 }
 
 /**
- * @brief Handles Data from TUN (Virtual Network -> Public Internet)
- * Encapsulates the IP packet with a VPN header and sends it via UDP.
+ * @brief Handles Data from TUN (Egress Path: Virtual Network -> Public Internet).
+ * * This is a high-frequency "hot path". We implement:
+ * 1. Zero-copy alignment for payload mapping.
+ * 2. Static branch prediction hints (likely/unlikely).
+ * 3. Strict MTU and protocol verification.
+ * 4. Precise session-based routing to support multi-client NAT.
  */
 static int server_on_tun(vfast_io_t *io, uint8_t *data, int len) {
-    /* To avoid double copy, ideally the vfast_task_t buffer should have 
-     * space reserved for the header. For now, we use a simple encapsulation. */
+    /* 1. Fast boundary check: Ensure it's at least a valid IPv4 packet */
+    if (unlikely(len < (int)sizeof(struct iphdr) || len > BUF_SIZE)) {
+        atomic_fetch_add(&vfserver.stats.drops, 1);
+        return -1;
+    }
+
+    /* 2. Acquire a task from the pre-allocated ring buffer pool */
+    vfast_task_t *task = vfast_borrow_task();
+    if (unlikely(!task)) {
+        /* Pool exhaustion: log sporadically to avoid I/O blocking */
+        log_warn("Task pool exhausted, dropping egress packet.");
+        atomic_fetch_add(&vfserver.stats.drops, 1);
+        return -1;
+    }
+
+    /* 3. L3 Header Analysis (Network Byte Order) */
+    const struct iphdr *iph = (const struct iphdr *)data;
+    const uint32_t dest_vip = iph->daddr;
+
+    /* 4. Session Lookup: Map Virtual IP to Physical Endpoint & Session ID */
+    uint32_t real_sid = 0;
+    struct sockaddr_in client_addr;
     
-    uint8_t encap_buf[BUF_SIZE];
-    if (len + sizeof(vpn_tunnel_hdr_t) > BUF_SIZE) return -1;
+    /**
+     * NOTE: We pass the raw dest_vip (Big-Endian). 
+     * Ensure vpn_session_lookup_by_ip matches the endianness of your hash keys.
+     */
+    if (unlikely(!vpn_session_lookup_by_ip(dest_vip, &real_sid, &client_addr))) {
+        /* Unroutable packet: Destination VIP has no active session */
+        task->in_use = false; 
+        atomic_fetch_add(&vfserver.stats.drops, 1);
+        return 0; 
+    }
 
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)encap_buf;
-    hdr->msg_type = VPN_MSG_DATA;
-    // hdr->seq = 0; // Increment this in production
+    /* 5. Zero-copy Buffer Construction
+     * We map the payload directly after the protocol header to avoid internal fragmentation.
+     */
+    uint8_t *payload_ptr = task->buf + sizeof(vpn_tunnel_hdr_t);
+    
+    /* Ensure the buffer won't overflow including encryption overhead (MAC tag) */
+    if (unlikely(len + sizeof(vpn_tunnel_hdr_t) + 16 > BUF_SIZE)) {
+        task->in_use = false;
+        return -1;
+    }
+    
+    memcpy(payload_ptr, data, (size_t)len);
 
-    memcpy(encap_buf + sizeof(vpn_tunnel_hdr_t), data, len);
-    int total_len = len + sizeof(vpn_tunnel_hdr_t);
+    /**
+     * 6. AEAD Encryption & Packet Packing
+     * vpn_pack performs in-place encryption and computes the Auth Tag.
+     * real_sid is crucial here to prevent "SID Mismatch" on the client side.
+     */
+    int total_len = vpn_pack(vfserver.opt.master_key, task->buf, len, 
+                             BUF_SIZE, VPN_MSG_DATA, real_sid);
 
-    /* Send to the last known remote peer */
-    if (io->remote_addr.sin_port != 0) {
-        vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, encap_buf, total_len, &io->remote_addr);
+    if (likely(total_len > 0)) {
+        /* 7. Asynchronous I/O Submission via io_uring (Non-blocking) */
+        vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, task->buf, total_len, &client_addr);
+        
+        /* Thread-safe statistics update */
         atomic_fetch_add(&vfserver.stats.tx_pkts, 1);
+    } else {
+        /* Encryption failure (e.g., key mismatch or memory corruption) */
+        log_error("Failed to pack egress packet for VIP: 0x%08x", ntohl(dest_vip));
+        task->in_use = false;
+        atomic_fetch_add(&vfserver.stats.drops, 1);
     }
 
     return 0;

@@ -33,7 +33,7 @@ uint32_t vpn_generate_sid(uint32_t v_ip);
 int vpn_session_init(void);
 void vpn_session_destroy(void);
 void vpn_session_update(uint32_t v_ip, uint32_t s_id, const struct sockaddr_in *addr);
-bool vpn_session_lookup_by_ip(uint32_t v_ip, struct sockaddr_in *out_addr);
+bool vpn_session_lookup_by_ip(uint32_t v_ip, uint32_t *out_sid, struct sockaddr_in *out_addr);
 bool vpn_session_lookup_by_sid(uint32_t s_id, uint32_t *out_v_ip, struct sockaddr_in *out_addr);
 void vpn_session_delete(uint32_t v_ip);
 void vpn_session_clean_timeout(vpn_ip_pool_t *ipp, int timeout_sec);

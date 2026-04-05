@@ -153,30 +153,13 @@ void vfast_submit_write(vfast_io_t *io, int fd, int op, uint8_t *data, int len, 
     }
 
     task->op = op;
-    int write_len = (len > BUF_SIZE) ? BUF_SIZE : len;
-    
-    /**
-     * [Zero-Copy Pass-Through]
-     * Check if the data pointer is part of our global task pool memory.
-     */
+
     uint8_t *write_ptr = data;
-    uintptr_t data_addr = (uintptr_t)data;
-    uintptr_t pool_start = (uintptr_t)g_task_pool;
-    uintptr_t pool_end = (uintptr_t)&g_task_pool[TASK_POOL_SIZE - 1].buf[BUF_SIZE];
-
-    if (data_addr < pool_start || data_addr > pool_end) {
-        /* External data (e.g., from FSM): perform mandatory copy */
-        memcpy(task->buf, data, (size_t)write_len);
-        write_ptr = task->buf;
-    } else {
-        /* Internal data: Skip memcpy, use the provided pointer directly */
-    }
-
     int f_idx = (fd == io->udp_fd) ? 0 : 1;
 
     if (op == OP_UDP_SEND) {
         task->iov.iov_base    = write_ptr;
-        task->iov.iov_len     = (size_t)write_len;
+        task->iov.iov_len     = (size_t)len;
         task->msg.msg_name    = dest;
         task->msg.msg_namelen = sizeof(struct sockaddr_in);
         task->msg.msg_iov     = &task->iov;
@@ -184,7 +167,7 @@ void vfast_submit_write(vfast_io_t *io, int fd, int op, uint8_t *data, int len, 
         io_uring_prep_sendmsg(sqe, f_idx, &task->msg, 0);
     } else {
         /* Direct write to TUN device */
-        io_uring_prep_write(sqe, f_idx, write_ptr, (unsigned)write_len, 0);
+        io_uring_prep_write(sqe, f_idx, write_ptr, (unsigned)len, 0);
     }
 
     sqe->flags |= IOSQE_FIXED_FILE;
@@ -279,4 +262,8 @@ void vfast_io_exit(vfast_io_t *io) {
     io_uring_queue_exit(&io->ring);
     if (io->udp_fd >= 0) close(io->udp_fd);
     if (io->tun_fd >= 0) close(io->tun_fd);
+}
+
+vfast_task_t* vfast_borrow_task() {
+    return get_task_from_pool();
 }

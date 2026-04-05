@@ -122,7 +122,7 @@ void vpn_session_update(uint32_t v_ip, uint32_t s_id, const struct sockaddr_in *
     pthread_rwlock_unlock(&g_shards[idx].lock);
 }
 
-bool vpn_session_lookup_by_ip(uint32_t v_ip, struct sockaddr_in *out_addr) {
+bool vpn_session_lookup_by_ip(uint32_t v_ip, uint32_t *out_sid, struct sockaddr_in *out_addr) {
     uint32_t idx = vpn_get_shard_idx(v_ip);
     vpn_session_t *s = NULL;
     bool found = false;
@@ -131,6 +131,7 @@ bool vpn_session_lookup_by_ip(uint32_t v_ip, struct sockaddr_in *out_addr) {
     
     HASH_FIND(hh_ip, g_shards[idx].ip_table, &v_ip, sizeof(uint32_t), s);
     if (s) {
+        if (out_sid) *out_sid = s->session_id;
         if (out_addr) memcpy(out_addr, &s->remote_addr, sizeof(struct sockaddr_in));
         found = true;
     }

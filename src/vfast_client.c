@@ -69,31 +69,46 @@ static void vfast_cleanup() {
 
 /**
  * @brief Unified UDP reception callback for the VFast Client.
- * * This function serves as the entry point for all packets arriving from the server.
- * It handles decryption for data packets and state transitions for control packets.
- * * @param io    Pointer to the io_uring engine context.
- * @param data  Pointer to the received raw buffer (task->buf).
- * @param len   Length of the received data.
- * @param src   Source address of the server (usually ignored but kept for validation).
- * @return 0 on success, -1 on fatal protocol error.
+ *
+ * This function processes all incoming packets from the server. It handles:
+ * 1. Handshake responses (VPN_MSG_HELLO) with state-locking to prevent re-entry.
+ * 2. Encrypted data packets (VPN_MSG_DATA) for TUN injection.
+ * 3. Keep-alive acknowledgments to maintain session state.
+ *
+ * @param io   Pointer to the io_uring engine context.
+ * @param data Received raw buffer from the task pool.
+ * @param len  Length of the received data.
+ * @param src  Source address (Server).
+ * @return 0 on success, -1 on protocol/validation error.
  */
 int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src) {
     UNUSED(src);
 
-    /* 1. Basic Protocol Validation */
+    /* 1. Preliminary Boundary Check */
     if (unlikely(len < (int)sizeof(vpn_tunnel_hdr_t))) {
+        log_warn("Ingress: Packet dropped (too short: %d bytes)", len);
         return -1;
     }
 
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
 
-    /* 2. Update Heartbeat Watchdog */
-    /* Every valid packet from the server proves the link is alive */
-    vfast_fsm_update_rx();
+    /**
+     * 2. Heartbeat Watchdog Update
+     * Only update the last receive timestamp for valid protocol message types.
+     * This prevents Dead Peer Detection (DPD) from being spoofed by garbage traffic.
+     */
+    if (hdr->msg_type == VPN_MSG_DATA || 
+        hdr->msg_type == VPN_MSG_KEEPALIVE || 
+        hdr->msg_type == VPN_MSG_HELLO) {
+        vfast_fsm_update_rx();
+    }
 
     switch (hdr->msg_type) {
     case VPN_MSG_DATA: {
-        /* Only process payload data if the tunnel is fully established */
+        /**
+         * DATA PHASE:
+         * Silently drop data packets if the FSM is not in CONNECTED state.
+         */
         if (unlikely(!vfast_fsm_is_connected())) {
             return 0; 
         }
@@ -101,62 +116,78 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
         int plain_ip_len = 0;
         uint32_t recv_sid = 0;
 
-        /**
-         * 3. In-place Decryption & Unpacking:
-         * Converts the encrypted tunnel packet back into a standard IPv4/IPv6 packet.
-         * payload_ptr points to the decrypted IP header within 'data'.
-         */
-        uint8_t *payload_ptr = vpn_unpack(vfclient.opt.master_key, data, len, &plain_ip_len, &recv_sid);
+        /* In-place decryption and unpacking using the session master key */
+        uint8_t *payload_ptr = vpn_unpack(vfclient.opt.master_key, data, len, 
+                                          &plain_ip_len, &recv_sid);
 
         if (unlikely(!payload_ptr)) {
-            log_warn("Ingress: Decryption failed or MAC mismatch from server.");
+            log_warn("Ingress: Decryption failed or MAC mismatch.");
             return -1;
         }
 
-        /* 4. Session ID Validation: Multi-tenant / Stale session protection */
+        /* Verify Session ID to prevent cross-talk or stale session data */
         if (unlikely(recv_sid != client_fsm.sid)) {
-            log_warn("Ingress: SID mismatch (Expected: 0x%08x, Received: 0x%08x)", 
+            log_warn("Ingress: SID mismatch (Expected: 0x%08x, Got: 0x%08x)", 
                      client_fsm.sid, recv_sid);
             return 0;
         }
 
-        /**
-         * 5. Asynchronous TUN Write:
-         * Submit the decrypted plain IP packet to the TUN device via io_uring.
-         */
+        /* Forward decrypted IP packet to TUN device via asynchronous io_uring write */
         vfast_submit_write(io, io->tun_fd, OP_TUN_WRITE, payload_ptr, plain_ip_len, NULL);
         break;
     } 
+
     case VPN_MSG_HELLO: {
-        /* This is the Handshake Response (Auth ACK) from the Server */
+        /**
+         * HANDSHAKE RESPONSE (Auth ACK):
+         * CRITICAL: Use a State Lock. If the tunnel is already established, 
+         * ignore subsequent HELLO responses to prevent redundant interface 
+         * configurations and resource exhaustion.
+         */
+        if (vfast_fsm_is_connected()) {
+            return 0; 
+        }
+
         vpn_auth_t *auth = (vpn_auth_t *)(data + sizeof(vpn_tunnel_hdr_t));
         
-        /* Persist session parameters provided by the server */
-        client_fsm.sid = ntohl(hdr->session_id);
+        /* Validate Session ID provided by the server */
+        uint32_t new_sid = ntohl(hdr->session_id);
+        if (unlikely(new_sid == 0)) {
+            log_error("Ingress: Server returned an invalid Session ID (0)");
+            return -1;
+        }
+
+        /* Persist session parameters */
+        client_fsm.sid = new_sid;
         client_fsm.vip = auth->vip;
 
-        /* 6. Dynamic IP Provisioning:
-         * Update the local TUN interface with the assigned Virtual IP.
-         */
+        /* Convert Virtual IP to string for system configuration */
         char ip_str[INET_ADDRSTRLEN];
-        struct in_addr in = { .s_addr = auth->vip };
-        inet_ntop(AF_INET, &in, ip_str, sizeof(ip_str));
+        inet_ntop(AF_INET, &auth->vip, ip_str, sizeof(ip_str));
         
-        /* Sync call to configure interface - essential for routing to start */
-        vpn_tun_set_ip(vfclient.tun.name, ip_str, VFAST_BROADCAST);
-
-        /* Transition FSM to CONNECTED state */
-        atomic_store(&client_fsm.state, ST_CONNECTED);
-        
-        log_info("Tunnel Ready: VIP=%s, SID=0x%08x", ip_str, client_fsm.sid);
+        /**
+         * Synchronous Interface Configuration:
+         * We set the IP and bring the TUN interface up. Transition to 
+         * ST_CONNECTED only if the system call succeeds.
+         */
+        if (vpn_tun_set_ip(vfclient.tun.name, ip_str, VFAST_BROADCAST) == 0) {
+            atomic_store(&client_fsm.state, ST_CONNECTED);
+            log_info("Tunnel Successfully Established: VIP=%s, SID=0x%08x", 
+                     ip_str, client_fsm.sid);
+        } else {
+            log_error("FSM: Failed to configure TUN interface %s with IP %s", 
+                      vfclient.tun.name, ip_str);
+            return -1;
+        }
         break;
     }
+
     case VPN_MSG_KEEPALIVE:
-        /* Heartbeat ACK: No additional action needed as vfast_fsm_update_rx() 
-           already refreshed the timers. */
+        /* Heartbeat ACK: Timestamp already updated via vfast_fsm_update_rx() */
         break;
+
     default:
-        log_warn("Unknown message type [0x%02x] received from server.", hdr->msg_type);
+        log_warn("Ingress: Unknown message type [0x%02x] received.", hdr->msg_type);
         break;
     }
 
@@ -314,7 +345,8 @@ int main(int argc, char *argv[]) {
         &vfclient.io,
         vfclient.opt.remote_host, 
         vfclient.opt.remote_port, 
-        &vfclient.io.running
+        &vfclient.io.running,
+        vfclient.opt.master_key
     );
 
     vfast_io_run(&vfclient.io);

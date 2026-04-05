@@ -236,36 +236,6 @@ bool vfast_udp_rx(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t *data) {
     return false;
 }
 
-bool vfast_tun_rx(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t *data) {
-    atomic_fetch_add(&ctx->stats.rx_packets, 1);
-    atomic_fetch_add(&ctx->stats.rx_bytes, (uint64_t)res);
-
-    uint8_t *base = (uint8_t *)ctx->io_ring.iovecs[idx].iov_base;
-    struct iphdr *iph = (struct iphdr *)(base + VPN_TNL_HLEN);
-    struct sockaddr_in remote;
-
-    if (unlikely(!vpn_session_lookup_by_ip(iph->daddr, &remote))) {
-        char ip_str[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &iph->daddr, ip_str, sizeof(ip_str));
-        log_warn("SESSION MISS: Kernel wants to send to %s, but I don't know this client!", ip_str);
-
-        atomic_fetch_add(&ctx->stats.drop_session_miss, 1);
-        return false;
-    }
-
-    int tlen = vpn_pack(ctx->key, base, res, IO_BUF_SIZE, VPN_MSG_DATA, data->sid);
-    if (unlikely(tlen <= 0)) {
-        atomic_fetch_add(&ctx->stats.drop_pack_error, 1);
-        log_error("Pack failed");
-        return false;
-    }
-    /* Send encapsulated packet to client's UDP endpoint. Use sendmsg so
-     * we can specify destination per-packet (the server socket is not
-     * connected to a single client). */
-    memcpy(&data->udp_meta.client_addr, &remote, sizeof(remote));
-    return vfast_udp_writemsg(ctx, idx, tlen, data);
-}
-
 bool vfast_udp_client_rx(vfast_ctx_t *ctx, int res, int idx, vpn_io_data_t *data) {
     UNUSED(res);
 
