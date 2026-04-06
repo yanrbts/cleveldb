@@ -79,6 +79,7 @@ static void fsm_send_pkt(uint8_t type) {
          * vfast_submit_write will skip internal memcpy and submit the 
          * raw pointer directly to the io_uring SQ.
          */
+        task->in_use = false;
         vfast_submit_write(client_fsm.io, 
                            client_fsm.io->udp_fd, 
                            OP_UDP_SEND, 

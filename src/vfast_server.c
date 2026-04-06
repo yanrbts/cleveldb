@@ -394,7 +394,6 @@ static int server_on_tun(vfast_io_t *io, uint8_t *data, int len) {
      */
     if (unlikely(!vpn_session_lookup_by_ip(dest_vip, &real_sid, &client_addr))) {
         /* Unroutable packet: Destination VIP has no active session */
-        task->in_use = false; 
         atomic_fetch_add(&vfserver.stats.drops, 1);
         return 0; 
     }
@@ -406,7 +405,6 @@ static int server_on_tun(vfast_io_t *io, uint8_t *data, int len) {
     
     /* Ensure the buffer won't overflow including encryption overhead (MAC tag) */
     if (unlikely(len + sizeof(vpn_tunnel_hdr_t) + 16 > BUF_SIZE)) {
-        task->in_use = false;
         return -1;
     }
     
@@ -429,7 +427,6 @@ static int server_on_tun(vfast_io_t *io, uint8_t *data, int len) {
     } else {
         /* Encryption failure (e.g., key mismatch or memory corruption) */
         log_error("Failed to pack egress packet for VIP: 0x%08x", ntohl(dest_vip));
-        task->in_use = false;
         atomic_fetch_add(&vfserver.stats.drops, 1);
     }
 

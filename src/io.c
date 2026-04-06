@@ -220,13 +220,13 @@ void vfast_io_run(vfast_io_t *io) {
                 switch (task->op) {
                     case OP_TUN_READ:
                         uint8_t *tun_data = task->buf + VPN_TNL_HLEN;
-                        io->ops.on_tun_data(io, tun_data, res);
                         task->in_use = false; /* Release before re-submitting */
+                        io->ops.on_tun_data(io, tun_data, res);
                         vfast_submit_read(io, io->tun_fd, OP_TUN_READ);
                         break;
                     case OP_UDP_RECV:
-                        io->ops.on_udp_data(io, task->buf, res, &task->addr);
                         task->in_use = false;
+                        io->ops.on_udp_data(io, task->buf, res, &task->addr);
                         vfast_submit_read(io, io->udp_fd, OP_UDP_RECV);
                         break;
                     default: /* Write/Send completion */

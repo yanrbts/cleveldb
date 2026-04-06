@@ -183,9 +183,7 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     }
 
     case VPN_MSG_KEEPALIVE:
-        /* Heartbeat ACK: Timestamp already updated via vfast_fsm_update_rx() */
         break;
-
     default:
         log_warn("Ingress: Unknown message type [0x%02x] received.", hdr->msg_type);
         break;
