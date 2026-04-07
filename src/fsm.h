@@ -38,7 +38,7 @@ extern vfast_fsm_t client_fsm;
 
 /* Signature updated to accept vfast_io_t */
 int vfast_fsm_init(vfast_io_t *io, const char *sip, uint16_t sport, atomic_bool *rig, const uint8_t *key);
-void vfast_fsm_update_rx();
+void vfast_fsm_update();
 int vfast_fsm_is_connected();
 void vfast_fsm_force_reconnect();
 void vfast_fsm_pthread_join();

@@ -18,38 +18,9 @@
 #include <stdatomic.h>
 
 #define BUF_SIZE        2048        /**< MTU-aligned buffer size (including overhead) */
-#define CQ_RING_DEPTH   256         /**< Depth of the completion queue ring */
 
 struct vfast_io;
 typedef struct vfast_io vfast_io_t;
-
-/**
- * @brief Functional interface for business logic callbacks.
- * These are invoked upon successful completion of asynchronous read operations.
- */
-typedef int (*udp_data_cb)(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src);
-typedef int (*tun_data_cb)(vfast_io_t *io, uint8_t *data, int len);
-
-/**
- * @brief Dispatch table for network event handling.
- */
-typedef struct {
-    udp_data_cb on_udp_data;        /**< Triggered on UDP RX completion */
-    tun_data_cb on_tun_data;        /**< Triggered on TUN/TAP read completion */
-} vfast_ops_t;
-
-/**
- * @brief The primary I/O context holding the io_uring instance and state.
- */
-struct vfast_io {
-    struct io_uring     ring;           /**< The core io_uring structure */
-    int                 udp_fd;         /**< Bound UDP socket file descriptor */
-    int                 tun_fd;         /**< TUN/TAP device file descriptor */
-    vfast_ops_t         ops;            /**< Registered callback handlers */
-    struct sockaddr_in  remote_addr;    /**< Pre-calculated remote peer address */
-    bool                is_server;      /**< Operation mode (Server vs Client) */
-    atomic_bool         running;
-};
 
 /**
  * @brief Async state machine operation codes.
@@ -60,6 +31,21 @@ enum {
     OP_UDP_RECV  = 3,               /**< Async recvmsg from UDP socket */
     OP_UDP_SEND  = 4                /**< Async sendmsg to UDP socket */
 };
+
+/**
+ * @brief Functional interface for business logic callbacks.
+ * These are invoked upon successful completion of asynchronous read operations.
+ */
+typedef int (*on_data_cb)(vfast_io_t *io, uint8_t *buf, int len, struct sockaddr_in *addr, void *arg);
+
+/**
+ * @brief Dispatch table for network event handling.
+ */
+typedef struct {
+    on_data_cb on_udp_data;        /**< Triggered on UDP RX completion */
+    on_data_cb on_tun_data;        /**< Triggered on TUN/TAP read completion */
+    void *ctx;                    /**< User-defined context passed to callbacks */
+} vfast_ops_t;
 
 /**
  * @brief Per-operation context (Task) used for tracking async state.
@@ -77,12 +63,28 @@ typedef struct {
     bool                in_use;         /**< Spin-lock style usage flag for pool safety */
 } vfast_task_t;
 
+/**
+ * @brief The primary I/O context holding the io_uring instance and state.
+ */
+struct vfast_io {
+    struct io_uring     ring;           /**< The core io_uring structure */
+    int                 udp_fd;         /**< Bound UDP socket file descriptor */
+    int                 tun_fd;         /**< TUN/TAP device file descriptor */
+    vfast_ops_t         ops;            /**< Registered callback handlers */
+    struct sockaddr_in  remote_addr;    /**< Pre-calculated remote peer address */
+    bool                is_server;      /**< Operation mode (Server vs Client) */
+    atomic_bool         running;
+
+    vfast_task_t       *task_pool;
+    atomic_int          pool_idx;
+    int                 pool_size;
+};
 
 /**
  * @brief Initializes the vfast_io context and io_uring subsystem.
  * @return 0 on success, negative error code on failure.
  */
-int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, vfast_ops_t ops);
+int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, int pool_size, vfast_ops_t ops);
 
 /**
  * @brief Starts the infinite event loop (blocking).
@@ -122,6 +124,12 @@ void vfast_submit_read(vfast_io_t *io, int fd, int op);
  */
 void vfast_submit_write(vfast_io_t *io, int fd, int op, uint8_t *data, int len, struct sockaddr_in *dest);
 
-vfast_task_t* vfast_borrow_task();
+/**
+ * @brief Borrows a task from the pre-allocated pool for external use.
+ * This allows business logic to acquire a buffer for preparing outbound responses
+ * without directly managing the pool. The returned task is marked as 'in use' and
+ * must be released back to the pool by setting 'in_use' to false after use.
+ */
+vfast_task_t* vfast_borrow_task(vfast_io_t *io);
 
 #endif /* VFAST_CORE_H */

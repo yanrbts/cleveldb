@@ -25,6 +25,7 @@
 #include "protocol.h"
 #include "option.h"
 #include "tun.h"
+#include "udp.h"
 #include "io.h"
 #include "vfast.h"
 
@@ -81,8 +82,9 @@ static void vfast_cleanup() {
  * @param src  Source address (Server).
  * @return 0 on success, -1 on protocol/validation error.
  */
-int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src) {
+int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
     UNUSED(src);
+    UNUSED(arg);
 
     /* 1. Preliminary Boundary Check */
     if (unlikely(len < (int)sizeof(vpn_tunnel_hdr_t))) {
@@ -100,7 +102,7 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     if (hdr->msg_type == VPN_MSG_DATA || 
         hdr->msg_type == VPN_MSG_KEEPALIVE || 
         hdr->msg_type == VPN_MSG_HELLO) {
-        vfast_fsm_update_rx();
+        vfast_fsm_update();
     }
 
     switch (hdr->msg_type) {
@@ -195,12 +197,17 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
 /**
  * @brief Processes plain IP packets from TUN, encrypts/packs them, and sends to Server.
  * * Path: TUN (Plain) -> vpn_pack (Encrypt + Header) -> UDP (Ciphertext)
- * * @param io    The io_uring engine context.
+ * @param io    The io_uring engine context.
  * @param data  The pointer to the plain IP packet (already at task->buf + VPN_TNL_HLEN).
  * @param len   The length of the plain IP packet.
+ * @param src   The source address of the packet.
+ * @param arg   User-defined argument.
  * @return 0 on success, -1 on failure.
  */
-int client_on_tun(vfast_io_t *io, uint8_t *data, int len) {
+int client_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
+    UNUSED(src);
+    UNUSED(arg);
+    
     /* 1. Connection Check: Drop packets if not authenticated */
     if (unlikely(!vfast_fsm_is_connected())) {
         return 0;
@@ -268,9 +275,10 @@ static int vfast_init_client() {
 
     vfast_ops_t ops = {
         .on_udp_data = client_on_udp,
-        .on_tun_data = client_on_tun
+        .on_tun_data = client_on_tun,
+        .ctx = NULL
     };
-    vfast_io_init(&vfclient.io, vfclient.udp->fd, vfclient.tun.fd, ops);
+    vfast_io_init(&vfclient.io, vfclient.udp->fd, vfclient.tun.fd, 64, ops);
 
     log_info("VFAST Client initialized successfully. Connecting to %s...", vfclient.opt.remote_host);
     return 0;

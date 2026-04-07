@@ -7,7 +7,9 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <sys/ioctl.h>
@@ -16,51 +18,75 @@
 #include <arpa/inet.h>
 #include "protocol.h"
 #include "utils.h"
+#include "log.h"
 #include "io.h"
 
-/* Optimization Constants */
-#define SUBMIT_THRESHOLD    8               /* Batch submission trigger for SQEs */
-#define TASK_POOL_SIZE      (CQ_RING_DEPTH * 2)
-
-/* Global Task Pool for Memory Reuse */
-static vfast_task_t g_task_pool[TASK_POOL_SIZE];
-static int          g_pool_idx = 0;
-
 /**
- * @brief Fetches an available task from the circular pool.
- * @return Pointer to task, or NULL if the pool is saturated (backpressure).
+ * @brief Thread-safe acquisition of an available task from the instance's private pool.
+ * This function implements a Lock-Free "Round-Robin" search using Atomic CAS (Compare-And-Swap).
+ * It ensures that a task buffer currently owned by the kernel (in_use == true) is never 
+ * overwritten, preventing memory corruption and race conditions.
+ * @param io Pointer to the specific I/O instance (Data or Control plane).
+ * @return Pointer to an available vfast_task_t, or NULL if the pool is fully saturated.
  */
-static vfast_task_t* get_task_from_pool() {
-    int idx = __sync_fetch_and_add(&g_pool_idx, 1) % TASK_POOL_SIZE;
-    vfast_task_t* task = &g_task_pool[idx];
-    
-    /* Backpressure Check: Prevent overwriting tasks still owned by the kernel */
-    if (task->in_use) {
-        static int drop_count = 0;
-        if (++drop_count % 1000 == 0) {
-            fprintf(stderr, "[Warning] Task pool saturated. Dropped 1000 packets.\n");
+static vfast_task_t* get_task_from_instance(vfast_io_t *io) {
+    /* Limit the search to the pool size to avoid infinite loops.
+     * We attempt to find at least one free slot among all pre-allocated tasks.
+     */
+    for (int i = 0; i < io->pool_size; i++) {
+        /* Atomically increment the pool index and wrap around.
+         * This provides a simple load-balancing (Round-Robin) across the buffer pool.
+         */
+        int idx = atomic_fetch_add(&io->pool_idx, 1) % io->pool_size;
+        vfast_task_t* task = &io->task_pool[idx];
+        
+        /**
+         * CRITICAL SECTION: Atomic Ownership Acquisition.
+         * We only take the task if 'in_use' is false. 
+         * atomic_compare_exchange_strong performs the following atomically:
+         * 1. Check if task->in_use is equal to 'expected' (false).
+         * 2. If true, set task->in_use to true and return 1 (Success).
+         * 3. If false (meaning the kernel still owns the buffer), do nothing and return 0.
+         */
+        bool expected = false;
+        if (atomic_compare_exchange_strong(&task->in_use, &expected, true)) {
+            /* Ownership successfully transferred to the current thread.
+             * Reset task metadata before preparing the next I/O operation.
+             */
+            task->op = 0;
+            return task;
         }
-        return NULL; 
+
+        /* If CAS failed, the slot is busy. 
+         * Continue to the next index to find an available buffer.
+         */
     }
 
-    task->op       = 0;
-    task->addr_len = 0;
-    task->in_use   = true;
-    return task;
+    /**
+     * BACKPRESSURE: All tasks in this instance's pool are currently in-flight.
+     * The caller must handle this (e.g., drop the packet or retry later).
+     */
+    return NULL; 
 }
 
 /**
  * @brief Initializes the io_uring instance and registers fixed files.
  */
-int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, vfast_ops_t ops) {
+int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, int pool_size, vfast_ops_t ops) {
     io->udp_fd = udp_fd;
     io->tun_fd = tun_fd;
     io->ops    = ops;
-    g_pool_idx = 0;
+    io->pool_size = pool_size;
 
     /* Initialize io_uring with default parameters */
-    int ret = io_uring_queue_init(CQ_RING_DEPTH, &io->ring, 0);
-    if (ret < 0) return ret;
+    io->task_pool = calloc(pool_size, sizeof(vfast_task_t));
+    if (!io->task_pool) return -1;
+
+    int ret = io_uring_queue_init(pool_size, &io->ring, 0);
+    if (ret < 0) {
+        free(io->task_pool);
+        return ret;
+    }
 
     /* Optimization: Register file descriptors to skip kernel file table lookups */
     int fds[2] = { udp_fd, tun_fd };
@@ -84,9 +110,9 @@ int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, vfast_ops_t ops) {
  */
 void vfast_submit_read(vfast_io_t *io, int fd, int op) {
     /* 1. Acquire a task from the pre-allocated pool to ensure memory reuse */
-    vfast_task_t *task = get_task_from_pool();
+    vfast_task_t *task = get_task_from_instance(io);
     if (unlikely(!task)) {
-        return; 
+        return;
     }
 
     /* 2. Obtain a Submission Queue Entry (SQE) from the ring */
@@ -138,46 +164,81 @@ void vfast_submit_read(vfast_io_t *io, int fd, int op) {
 }
 
 /**
- * @brief Submits an asynchronous write/send request with Zero-Copy detection.
- * [Optimization] If the 'data' pointer already resides in the task pool,
- * we skip memcpy and submit the pointer directly to io_uring.
+ * @brief High-performance Zero-Copy write submission.
+ * [PRECONDITION]: This function assumes that 'data' ALWAYS originates from the 
+ * internal task_pool. This allows for a direct pointer-to-task resolution 
+ * without expensive memory range checks or memcpy operations.
+ *
+ * @param io   The I/O instance handle (supporting instance-level isolation).
+ * @param fd   Raw file descriptor (mapped to registered file index).
+ * @param op   Operation type: OP_TUN_WRITE or OP_UDP_SEND.
+ * @param data Pointer to the payload (usually task->buf or offsetted payload).
+ * @param len  Length of data to be transmitted.
+ * @param dest Destination address (used for UDP; ignored for TUN).
  */
 void vfast_submit_write(vfast_io_t *io, int fd, int op, uint8_t *data, int len, struct sockaddr_in *dest) {
-    vfast_task_t *task = get_task_from_pool();
-    if (unlikely(!task)) return;
+    /**
+     * Reconstruct the vfast_task_t pointer from the data buffer address.
+     * Since 'data' is guaranteed to be a member of the task pool, we calculate
+     * the task's base address using the fixed offset of the 'buf' member.
+     */
+    vfast_task_t *task = (vfast_task_t *)((uint8_t *)data - offsetof(vfast_task_t, buf));
 
+    /* Acquire a Submission Queue Entry (SQE) from the instance's ring */
     struct io_uring_sqe *sqe = io_uring_get_sqe(&io->ring);
     if (unlikely(!sqe)) {
-        task->in_use = false;
+        /**
+         * BACKPRESSURE: If the SQ is full, we must release the task ownership.
+         * Failing to reset 'in_use' here would cause a permanent leak in the pool.
+         */
+        atomic_store(&task->in_use, false);
         return;
     }
 
     task->op = op;
-
-    uint8_t *write_ptr = data;
+    /* Map FD to registered file index: UDP is 0, TUN is 1 */
     int f_idx = (fd == io->udp_fd) ? 0 : 1;
 
     if (op == OP_UDP_SEND) {
-        task->iov.iov_base    = write_ptr;
-        task->iov.iov_len     = (size_t)len;
-        task->msg.msg_name    = dest;
+        /**
+         * UDP Asynchronous Send:
+         * We point the iovec directly to the provided 'data' pointer, allowing 
+         * for zero-copy transmission of encapsulated payloads with protocol headers.
+         */
+        task->iov.iov_base = data; 
+        task->iov.iov_len  = (size_t)len;
+        task->msg.msg_name = dest;
         task->msg.msg_namelen = sizeof(struct sockaddr_in);
-        task->msg.msg_iov     = &task->iov;
-        task->msg.msg_iovlen  = 1;
+        task->msg.msg_iov  = &task->iov;
+        task->msg.msg_iovlen = 1;
         io_uring_prep_sendmsg(sqe, f_idx, &task->msg, 0);
     } else {
-        /* Direct write to TUN device */
-        io_uring_prep_write(sqe, f_idx, write_ptr, (unsigned)len, 0);
+        /**
+         * TUN Asynchronous Write:
+         * Direct write to the character device using the task's internal buffer.
+         */
+        io_uring_prep_write(sqe, f_idx, data, (unsigned)len, 0);
     }
 
+    /* Optimization: Use registered files to bypass kernel file table lookups */
     sqe->flags |= IOSQE_FIXED_FILE;
+    
+    /* Attach the task as user_data for retrieval in the completion loop */
     io_uring_sqe_set_data(sqe, task);
 
-    /* Batch submission to reduce context switches */
-    static __thread int pending_sqes = 0;
-    if (++pending_sqes >= SUBMIT_THRESHOLD) {
+    /**
+     * Strategic Batching:
+     * Control plane instances (small pools) favor low latency (immediate submit).
+     * Data plane instances (large pools) utilize thresholds to minimize syscall overhead.
+     */
+    if (io->pool_size <= 64) {
         io_uring_submit(&io->ring);
-        pending_sqes = 0;
+    } else {
+        static __thread int pending = 0;
+        if (++pending >= 8) { /* SUBMIT_THRESHOLD */
+            io_uring_submit(&io->ring);
+            pending = 0;
+        }
     }
 }
 
@@ -200,10 +261,12 @@ void vfast_io_run(vfast_io_t *io) {
 
     while (atomic_load(&io->running)) {
         /* Blocking wait for at least one completion event */
-        int ret = io_uring_wait_cqe(&io->ring, &cqe);
+        struct __kernel_timespec ts = {.tv_sec = 0, .tv_nsec = 100000000}; //100ms
+        int ret = io_uring_wait_cqe_timeout(&io->ring, &cqe, &ts);
+        // int ret = io_uring_wait_cqe(&io->ring, &cqe);
         if (ret < 0) {
-            if (ret == -EINTR) continue;
-            fprintf(stderr, "Fatal: io_uring_wait_cqe failed: %s\n", strerror(-ret));
+            if (ret == -ETIME || ret == -EINTR) continue;
+            log_error("Fatal: io_uring_wait_cqe failed: %s\n", strerror(-ret));
             break; 
         }
 
@@ -220,30 +283,33 @@ void vfast_io_run(vfast_io_t *io) {
                 switch (task->op) {
                     case OP_TUN_READ:
                         uint8_t *tun_data = task->buf + VPN_TNL_HLEN;
-                        task->in_use = false; /* Release before re-submitting */
-                        io->ops.on_tun_data(io, tun_data, res);
+                        io->ops.on_tun_data(io, tun_data, res, &task->addr, io->ops.ctx);
                         vfast_submit_read(io, io->tun_fd, OP_TUN_READ);
                         break;
                     case OP_UDP_RECV:
-                        task->in_use = false;
-                        io->ops.on_udp_data(io, task->buf, res, &task->addr);
+                        io->ops.on_udp_data(io, task->buf, res, &task->addr, io->ops.ctx);
                         vfast_submit_read(io, io->udp_fd, OP_UDP_RECV);
                         break;
                     default: /* Write/Send completion */
-                        task->in_use = false;
                         break;
                 }
             } else {
                 /* Error Handling: Recover and maintain pipeline depth */
-                task->in_use = false;
                 if (res != -EAGAIN && res != -EINTR) {
-                    fprintf(stderr, "CQE Error: op=%d, res=%d (%s)\n", task->op, res, strerror(-res));
+                    log_error("CQE Error: op=%d, res=%d (%s)", task->op, res, strerror(-res));
                 }
                 /* Re-submit read tasks to prevent pipeline starvation */
                 if (task->op == OP_TUN_READ || task->op == OP_UDP_RECV) {
                     vfast_submit_read(io, (task->op == OP_TUN_READ) ? io->tun_fd : io->udp_fd, task->op);
                 }
             }
+
+           /* RELEASE OWNERSHIP: 
+            * We mark the task as not in use BEFORE invoking the callback.
+            * This allows the business logic (ops) to immediately reuse this 
+            * buffer or borrow a new one for outbound responses (Zero-Copy).
+            */
+            atomic_store(&task->in_use, false);
         }
 
         if (count > 0) {
@@ -258,12 +324,24 @@ void vfast_io_run(vfast_io_t *io) {
  */
 void vfast_io_exit(vfast_io_t *io) {
     if (!io) return;
-    io_uring_unregister_files(&io->ring);
-    io_uring_queue_exit(&io->ring);
+
     if (io->udp_fd >= 0) close(io->udp_fd);
     if (io->tun_fd >= 0) close(io->tun_fd);
+
+    // io_uring_unregister_files(&io->ring);
+    io_uring_queue_exit(&io->ring);
+    
+    /* CRITICAL: Free the dynamically allocated private task pool.
+     * This was allocated during vfast_io_init via calloc.
+     */
+    if (io->task_pool) {
+        free(io->task_pool);
+        io->task_pool = NULL;
+    }
+    log_info("vfast_io resources released successfully.");
 }
 
-vfast_task_t* vfast_borrow_task() {
-    return get_task_from_pool();
+vfast_task_t* vfast_borrow_task(vfast_io_t *io) {
+    if (unlikely(!io)) return NULL;
+    return get_task_from_instance(io);
 }

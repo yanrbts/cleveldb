@@ -28,11 +28,11 @@ vfast_fsm_t client_fsm = {0};
  *
  * @param type The VFAST protocol message type (e.g., VPN_MSG_HELLO, VPN_MSG_KEEPALIVE).
  */
-static void fsm_send_pkt(uint8_t type) {
+static void fsm_send_pkt(vfast_io_t *io, uint8_t type) {
     /* 1. Acquire a pre-allocated task buffer from the IO engine's pool.
      * This ensures the data resides in a registered memory region for io_uring,
      * allowing for true zero-copy transmission in vfast_submit_write. */
-    vfast_task_t *task = vfast_borrow_task();
+    vfast_task_t *task = vfast_borrow_task(io);
     if (unlikely(!task)) {
         log_error("FSM: Task pool exhaustion. Cannot dispatch control packet (type: %d)", type);
         return;
@@ -79,7 +79,6 @@ static void fsm_send_pkt(uint8_t type) {
          * vfast_submit_write will skip internal memcpy and submit the 
          * raw pointer directly to the io_uring SQ.
          */
-        task->in_use = false;
         vfast_submit_write(client_fsm.io, 
                            client_fsm.io->udp_fd, 
                            OP_UDP_SEND, 
@@ -109,7 +108,7 @@ static void *fsm_worker(void *arg) {
         switch (state) {
             case ST_IDLE:
             case ST_RECONNECTING:
-                fsm_send_pkt(VPN_MSG_HELLO);
+                fsm_send_pkt(client_fsm.io, VPN_MSG_HELLO);
                 client_fsm.last_tx_auth = now;
                 atomic_store(&client_fsm.state, ST_WAIT_AUTH);
                 log_info("FSM: HELLO submitted via io_uring to %s:%d", 
@@ -125,7 +124,7 @@ static void *fsm_worker(void *arg) {
 
             case ST_CONNECTED:
                 if (now - client_fsm.last_tx_keep >= FSM_KEEPALIVE) {
-                    fsm_send_pkt(VPN_MSG_KEEPALIVE);
+                    fsm_send_pkt(client_fsm.io, VPN_MSG_KEEPALIVE);
                     client_fsm.last_tx_keep = now;
                 }
 
@@ -165,7 +164,7 @@ int vfast_fsm_init(vfast_io_t *io, const char *sip, uint16_t sport, atomic_bool 
 }
 
 /* Remaining functions vfast_fsm_update_rx, etc., stay unchanged */
-void vfast_fsm_update_rx() { 
+void vfast_fsm_update() { 
     atomic_store(&client_fsm.last_rx_time, time(NULL));
 }
 

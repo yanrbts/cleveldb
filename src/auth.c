@@ -19,7 +19,7 @@ void vfast_auth_pack(vpn_auth_t *auth, uint32_t vip, const uint8_t *token, uint6
     auth->ts    = (ts != 0) ? ts : (uint64_t)time(NULL);
 
     if (token) {
-        memcpy(auth->token, token, 16);
+        memcpy(auth->token, token, 12);
     }
 }
 
