@@ -69,6 +69,110 @@ static void vfast_cleanup() {
 }
 
 /**
+ * @brief Handles incoming encrypted data packets (VPN_MSG_DATA).
+ */
+static inline int client_handle_data(vfast_io_t *io, uint8_t *data, int len) {
+    /* Silently drop data packets if the FSM is not in CONNECTED state */
+    if (unlikely(!vfast_fsm_is_connected())) {
+        return 0; 
+    }
+
+    int plain_ip_len = 0;
+    uint32_t recv_sid = 0;
+
+    /* In-place decryption and unpacking using the session master key */
+    uint8_t *payload_ptr = vpn_unpack(vfclient.opt.master_key, data, len, 
+                                      &plain_ip_len, &recv_sid);
+
+    if (unlikely(!payload_ptr)) {
+        log_warn("Ingress: Decryption failed or MAC mismatch.");
+        return -1;
+    }
+
+    /* Verify Session ID to prevent cross-talk or stale session data */
+    if (unlikely(recv_sid != client_fsm.sid)) {
+        log_warn("Ingress: SID mismatch (Expected: 0x%08x, Got: 0x%08x)", 
+                 client_fsm.sid, recv_sid);
+        return 0;
+    }
+
+    /* Forward decrypted IP packet to TUN device via asynchronous io_uring write */
+    vfast_submit_write(io, io->tun_fd, OP_TUN_WRITE, payload_ptr, plain_ip_len, NULL);
+    return 0;
+}
+
+/**
+ * @brief Handles handshake responses (VPN_MSG_HELLO) from the server.
+ */
+static inline int client_handle_hello(vfast_io_t *io, uint8_t *data, int len) {
+    UNUSED(io);
+    UNUSED(len);
+
+    /* State Lock: ignore subsequent HELLO if already established */
+    if (vfast_fsm_is_connected()) {
+        return 0; 
+    }
+
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
+    vpn_auth_t *auth = (vpn_auth_t *)(data + sizeof(vpn_tunnel_hdr_t));
+    
+    /* Validate Session ID provided by the server */
+    uint32_t new_sid = ntohl(hdr->session_id);
+    if (unlikely(new_sid == 0)) {
+        log_error("Ingress: Server returned an invalid Session ID (0)");
+        return -1;
+    }
+
+    /* Persist session parameters */
+    client_fsm.sid = new_sid;
+    client_fsm.vip = auth->vip;
+
+    /* Convert Virtual IP to string for system configuration */
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &auth->vip, ip_str, sizeof(ip_str));
+    
+    /**
+     * Synchronous Interface Configuration: transition to 
+     * ST_CONNECTED only if the system call succeeds.
+     */
+    if (vpn_tun_set_ip(vfclient.tun.name, ip_str, VFAST_BROADCAST) == 0) {
+        atomic_store(&client_fsm.state, ST_CONNECTED);
+        log_info("Tunnel Successfully Established: VIP=%s, SID=0x%08x", 
+                 ip_str, client_fsm.sid);
+        return 0;
+    } else {
+        log_error("FSM: Failed to configure TUN interface %s with IP %s", 
+                  vfclient.tun.name, ip_str);
+        return -1;
+    }
+}
+
+/**
+ * @brief Reflects a DPD request back to the server.
+ * @param io   The I/O context.
+ * @param data Pointer to the received packet buffer (task->buf).
+ * @param src  The remote address to reply to.
+ */
+static inline void client_handle_dpd(vfast_io_t *io, uint8_t *data, struct sockaddr_in *src) {
+    if (unlikely(!io || !data || !src)) return;
+
+    /* 1. Use the macro to find the original task context */
+    vfast_task_t *task = vfast_data_to_task(data);
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)task->buf;
+
+    /* 2. Modify header for response */
+    hdr->msg_type = VPN_DPD_RESPONSE;
+
+    /**
+     * 3. Send back only the header.
+     * The task->in_use remains true because this is an OP_UDP_SEND.
+     * It will be set to false in the main io_run loop's completion handling.
+     */
+    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, 
+                      task->buf, (int)sizeof(vpn_tunnel_hdr_t), src);
+}
+
+/**
  * @brief Unified UDP reception callback for the VFast Client.
  *
  * This function processes all incoming packets from the server. It handles:
@@ -101,90 +205,21 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
      */
     if (hdr->msg_type == VPN_MSG_DATA || 
         hdr->msg_type == VPN_MSG_KEEPALIVE || 
-        hdr->msg_type == VPN_MSG_HELLO) {
+        hdr->msg_type == VPN_MSG_HELLO ||
+        hdr->msg_type == VPN_DPD_REQUEST) {
         vfast_fsm_update();
     }
 
     switch (hdr->msg_type) {
-    case VPN_MSG_DATA: {
-        /**
-         * DATA PHASE:
-         * Silently drop data packets if the FSM is not in CONNECTED state.
-         */
-        if (unlikely(!vfast_fsm_is_connected())) {
-            return 0; 
-        }
-
-        int plain_ip_len = 0;
-        uint32_t recv_sid = 0;
-
-        /* In-place decryption and unpacking using the session master key */
-        uint8_t *payload_ptr = vpn_unpack(vfclient.opt.master_key, data, len, 
-                                          &plain_ip_len, &recv_sid);
-
-        if (unlikely(!payload_ptr)) {
-            log_warn("Ingress: Decryption failed or MAC mismatch.");
-            return -1;
-        }
-
-        /* Verify Session ID to prevent cross-talk or stale session data */
-        if (unlikely(recv_sid != client_fsm.sid)) {
-            log_warn("Ingress: SID mismatch (Expected: 0x%08x, Got: 0x%08x)", 
-                     client_fsm.sid, recv_sid);
-            return 0;
-        }
-
-        /* Forward decrypted IP packet to TUN device via asynchronous io_uring write */
-        vfast_submit_write(io, io->tun_fd, OP_TUN_WRITE, payload_ptr, plain_ip_len, NULL);
-        break;
-    } 
-
-    case VPN_MSG_HELLO: {
-        /**
-         * HANDSHAKE RESPONSE (Auth ACK):
-         * CRITICAL: Use a State Lock. If the tunnel is already established, 
-         * ignore subsequent HELLO responses to prevent redundant interface 
-         * configurations and resource exhaustion.
-         */
-        if (vfast_fsm_is_connected()) {
-            return 0; 
-        }
-
-        vpn_auth_t *auth = (vpn_auth_t *)(data + sizeof(vpn_tunnel_hdr_t));
-        
-        /* Validate Session ID provided by the server */
-        uint32_t new_sid = ntohl(hdr->session_id);
-        if (unlikely(new_sid == 0)) {
-            log_error("Ingress: Server returned an invalid Session ID (0)");
-            return -1;
-        }
-
-        /* Persist session parameters */
-        client_fsm.sid = new_sid;
-        client_fsm.vip = auth->vip;
-
-        /* Convert Virtual IP to string for system configuration */
-        char ip_str[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &auth->vip, ip_str, sizeof(ip_str));
-        
-        /**
-         * Synchronous Interface Configuration:
-         * We set the IP and bring the TUN interface up. Transition to 
-         * ST_CONNECTED only if the system call succeeds.
-         */
-        if (vpn_tun_set_ip(vfclient.tun.name, ip_str, VFAST_BROADCAST) == 0) {
-            atomic_store(&client_fsm.state, ST_CONNECTED);
-            log_info("Tunnel Successfully Established: VIP=%s, SID=0x%08x", 
-                     ip_str, client_fsm.sid);
-        } else {
-            log_error("FSM: Failed to configure TUN interface %s with IP %s", 
-                      vfclient.tun.name, ip_str);
-            return -1;
-        }
-        break;
-    }
-
+    case VPN_MSG_DATA:
+        return client_handle_data(io, data, len);
+    case VPN_MSG_HELLO:
+        return client_handle_hello(io, data, len);
     case VPN_MSG_KEEPALIVE:
+        break;
+    case VPN_DPD_REQUEST:
+        log_info("Received DPD Request from server. Responding with DPD Response.");
+        client_handle_dpd(io, data, src);
         break;
     default:
         log_warn("Ingress: Unknown message type [0x%02x] received.", hdr->msg_type);
@@ -266,7 +301,7 @@ static int vfast_init_client() {
     vpn_tun_disable_ipv6(vfclient.opt.tun_name);
     vpn_tun_set_status(vfclient.tun.name, vfclient.opt.mtu, 1);
     
-    vfclient.udp = udp_init_listener(0, vfclient.opt.udp_backlog);
+    vfclient.udp = udp_init_listener(5887, vfclient.opt.udp_backlog);
     if (!vfclient.udp) {
         log_error("Failed to initialize UDP listener.");
         return -1;

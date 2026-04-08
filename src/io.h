@@ -19,6 +19,14 @@
 
 #define BUF_SIZE        2048        /**< MTU-aligned buffer size (including overhead) */
 
+/**
+ * @brief Retrieves the parent vfast_task_t pointer from a buffer pointer.
+ * @details Since 'buf' is a member of 'vfast_task_t', we subtract the offset 
+ * of 'buf' from the current data pointer to get the structure's base address.
+ */
+#define vfast_data_to_task(d) \
+    ((vfast_task_t *)((uint8_t *)(d) - offsetof(vfast_task_t, buf)))
+
 struct vfast_io;
 typedef struct vfast_io vfast_io_t;
 
@@ -37,6 +45,7 @@ enum {
  * These are invoked upon successful completion of asynchronous read operations.
  */
 typedef int (*on_data_cb)(vfast_io_t *io, uint8_t *buf, int len, struct sockaddr_in *addr, void *arg);
+typedef void (*on_timer_cb)(vfast_io_t *io, void *arg);
 
 /**
  * @brief Dispatch table for network event handling.
@@ -78,6 +87,10 @@ struct vfast_io {
     vfast_task_t       *task_pool;
     atomic_int          pool_idx;
     int                 pool_size;
+
+    on_timer_cb         timer_cb;           /**< Optional timer callback for periodic tasks */  
+    void               *timer_arg;          /**< User-defined argument for timer callback */
+    uint32_t            timer_interval_ms;  /**< Timer interval in milliseconds */
 };
 
 /**
@@ -125,11 +138,30 @@ void vfast_submit_read(vfast_io_t *io, int fd, int op);
 void vfast_submit_write(vfast_io_t *io, int fd, int op, uint8_t *data, int len, struct sockaddr_in *dest);
 
 /**
+ * @brief Submits a raw buffer for asynchronous transmission, bypassing the task pool.
+ * @note The 'data' buffer must remain valid until the CQE is reaped (e.g., session member).
+ */
+void vfast_submit_raw(vfast_io_t *io, int fd, void *data, size_t len, struct sockaddr_in *dst);
+
+/**
  * @brief Borrows a task from the pre-allocated pool for external use.
  * This allows business logic to acquire a buffer for preparing outbound responses
  * without directly managing the pool. The returned task is marked as 'in use' and
  * must be released back to the pool by setting 'in_use' to false after use.
  */
 vfast_task_t* vfast_borrow_task(vfast_io_t *io);
+
+/**
+ * @brief Configures a periodic timer callback for the I/O event loop.
+ * @details 
+ * This implements the Dependency Injection pattern, allowing the I/O core 
+ * to trigger external logic (like session maintenance) without having 
+ * a direct compile-time dependency on those modules.
+ * @param io       Pointer to the initialized vfast_io_t context.
+ * @param ms       Interval in milliseconds. If 0, the timer is disabled.
+ * @param cb       The callback function to execute on every tick.
+ * @param arg      User-defined context passed back to the callback.
+ */
+void vfast_io_set_timer(vfast_io_t *io, uint32_t ms, on_timer_cb cb, void *arg);
 
 #endif /* VFAST_CORE_H */

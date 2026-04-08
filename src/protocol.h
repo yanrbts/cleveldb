@@ -60,7 +60,9 @@ typedef enum {
     VPN_MSG_DATA      = 0x01,
     VPN_MSG_HELLO     = 0x02,
     VPN_MSG_KEEPALIVE = 0x03,
-    VPN_MSG_DISCONNECT= 0x04
+    VPN_MSG_DISCONNECT= 0x04,
+    VPN_DPD_REQUEST   = 0x05, /* Dead Peer Detection Request */
+    VPN_DPD_RESPONSE  = 0x06  /* Dead Peer Detection Response */
 } vpn_msg_t;
 
 /* * Packed Structure for Network Transmission

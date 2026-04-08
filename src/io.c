@@ -243,6 +243,47 @@ void vfast_submit_write(vfast_io_t *io, int fd, int op, uint8_t *data, int len, 
 }
 
 /**
+ * @brief Submits a raw buffer for asynchronous transmission, bypassing the task pool.
+ * @note The 'data' buffer must remain valid until the CQE is reaped (e.g., session member).
+ */
+void vfast_submit_raw(vfast_io_t *io, int fd, void *data, size_t len, struct sockaddr_in *dst) {
+    if (unlikely(!io || !data || len == 0)) return;
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&io->ring);
+    
+    /* Handle SQ saturation: in a high-load scenario, we must flush and retry */
+    if (unlikely(!sqe)) {
+        io_uring_submit(&io->ring);
+        sqe = io_uring_get_sqe(&io->ring);
+        if (!sqe) return; // Drop if still full (Backpressure)
+    }
+
+    /* Map FD to registered fixed-file index: UDP=0, TUN=1 */
+    int f_idx = (fd == io->udp_fd) ? 0 : 1;
+
+    /**
+     * Set user_data to NULL to flag this as a 'RAW' operation.
+     * The completion loop must skip ownership release for NULL tasks.
+     */
+    io_uring_sqe_set_data(sqe, NULL);
+
+    /* Prepare asynchronous sendto */
+    io_uring_prep_sendto(sqe, f_idx, data, (unsigned)len, 0,
+                         (struct sockaddr *)dst, sizeof(struct sockaddr_in));
+
+    /* Optimization: Use registered files and trigger immediate submission 
+     * for control messages to ensure low-latency delivery. 
+     */
+    sqe->flags |= IOSQE_FIXED_FILE;
+    
+    /**
+     * For control packets (Probes/ACKs), we bypass the batching threshold 
+     * to avoid delay, ensuring heartbeat precision.
+     */
+    io_uring_submit(&io->ring);
+}
+
+/**
  * @brief Main event loop for processing completions.
  */
 void vfast_io_run(vfast_io_t *io) {
@@ -251,6 +292,7 @@ void vfast_io_run(vfast_io_t *io) {
     uint32_t count = 0;
 
     atomic_store(&io->running, true);
+    uint64_t last_tick_ms = vpn_now_ms();
 
     /* Initial Pipeline Warm-up */
     for (int i = 0; i < 16; i++) {
@@ -259,11 +301,32 @@ void vfast_io_run(vfast_io_t *io) {
     }
     io_uring_submit(&io->ring);
 
+    /* We set a 100ms wait timeout. 
+     * This ensures the loop wakes up even if there is no network traffic,
+     * allowing the timer callback to trigger with 100ms precision.
+     */
+    struct __kernel_timespec ts = {
+        .tv_sec = 0, 
+        .tv_nsec = 100000000 /* 100ms */
+    };
+
     while (atomic_load(&io->running)) {
         /* Blocking wait for at least one completion event */
-        struct __kernel_timespec ts = {.tv_sec = 0, .tv_nsec = 100000000}; //100ms
+        
         int ret = io_uring_wait_cqe_timeout(&io->ring, &cqe, &ts);
         // int ret = io_uring_wait_cqe(&io->ring, &cqe);
+
+        /* --- TICK PROCESSING SECTION --- */
+        if (io->timer_cb && io->timer_interval_ms > 0) {
+            uint64_t now = vpn_now_ms();
+            if (now - last_tick_ms >= io->timer_interval_ms) {
+                /* Execute injected business logic (e.g., Session Maintenance) */
+                io->timer_cb(io, io->timer_arg);
+                last_tick_ms = now;
+            }
+        }
+
+        /* --- I/O PROCESSING SECTION --- */
         if (ret < 0) {
             if (ret == -ETIME || ret == -EINTR) continue;
             log_error("Fatal: io_uring_wait_cqe failed: %s\n", strerror(-ret));
@@ -344,4 +407,32 @@ void vfast_io_exit(vfast_io_t *io) {
 vfast_task_t* vfast_borrow_task(vfast_io_t *io) {
     if (unlikely(!io)) return NULL;
     return get_task_from_instance(io);
+}
+
+/**
+ * @brief Configures a periodic timer callback for the I/O event loop.
+ * @details 
+ * This implements the Dependency Injection pattern, allowing the I/O core 
+ * to trigger external logic (like session maintenance) without having 
+ * a direct compile-time dependency on those modules.
+ * @param io       Pointer to the initialized vfast_io_t context.
+ * @param ms       Interval in milliseconds. If 0, the timer is disabled.
+ * @param cb       The callback function to execute on every tick.
+ * @param arg      User-defined context passed back to the callback.
+ */
+void vfast_io_set_timer(vfast_io_t *io, uint32_t ms, on_timer_cb cb, void *arg) {
+    if (unlikely(!io)) {
+        return;
+    }
+
+    /* Thread-safe assignment if called during initialization or reconfiguration */
+    io->timer_cb = cb;
+    io->timer_arg = arg;
+    io->timer_interval_ms = ms;
+
+    if (cb && ms > 0) {
+        log_info("IO: Timer registered at %u ms interval.", ms);
+    } else {
+        log_info("IO: Timer disabled.");
+    }
 }

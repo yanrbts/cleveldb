@@ -336,16 +336,17 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
         case VPN_MSG_DATA: 
             vfast_handle_data_msg(io, data, len, src);
             break;
-        
         case VPN_MSG_KEEPALIVE:
             // log_debug("Keepalive received from %s", inet_ntoa(src->sin_addr));
             vfast_keeplive(io, len, data, src);
             break;
-
         case VPN_MSG_HELLO:
             vfast_auth_request(io, len, data, src);
             break;
-
+        case VPN_DPD_RESPONSE:
+            log_info("Received DPD Response from %s. Session is alive.", inet_ntoa(src->sin_addr));
+            vpn_session_update_by_sid(hdr->session_id, src);
+            break;
         default:
             log_warn("Unknown VPN msg type: 0x%02x", hdr->msg_type);
             break;
@@ -613,6 +614,8 @@ int main(int argc, char *argv[]) {
     if (vfast_init_server() < 0) return 1;
 
     log_info("VFAST server is up and running on port %d. Press Ctrl+C to stop.", vfserver.opt.local_port);
+
+    vfast_io_set_timer(&vfserver.io, 5000, vfast_server_maintenance, &vfserver.ip_pool);
     vfast_io_run(&vfserver.io);
 
     vfast_clean_server();

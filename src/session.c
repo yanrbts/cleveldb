@@ -122,6 +122,59 @@ void vpn_session_update(uint32_t v_ip, uint32_t s_id, const struct sockaddr_in *
     pthread_rwlock_unlock(&g_shards[idx].lock);
 }
 
+/**
+ * vpn_session_update_by_sid - Rapidly refreshes session activity via SessionID.
+ * @s_id: The unique 32-bit SessionID extracted from the UDP tunnel header.
+ * @addr: The source address of the incoming UDP packet (for Roaming/Mobility support).
+ *
+ * DESIGN RATIONALE:
+ * This function leverages the shard-alignment property of our SessionIDs. Since
+ * vpn_generate_sid() ensures (sid ^ (sid >> 16)) maps to the same shard as the 
+ * associated Virtual IP, we can perform a localized search within a single shard
+ * lock, significantly reducing global contention.
+ */
+void vpn_session_update_by_sid(uint32_t s_id, const struct sockaddr_in *addr) {
+    /* 1. Defensive programming: Ensure input validity */
+    if (unlikely(!addr)) {
+        return;
+    }
+
+    /* 2. Locate the shard using the aligned SessionID */
+    uint32_t idx = vpn_get_shard_idx(s_id);
+    vpn_session_t *s = NULL;
+
+    /* 3. Acquire write lock: Needed for updating timestamps and roaming info */
+    pthread_rwlock_wrlock(&g_shards[idx].lock);
+
+    /**
+     * 4. Perform secondary index lookup.
+     * Use 'hh_sid' handle to query the session ID hash table within this shard.
+     */
+    HASH_FIND(hh_sid, g_shards[idx].sid_table, &s_id, sizeof(uint32_t), s);
+
+    if (likely(s)) {
+        /**
+         * 5. Handle Client Roaming (Mobility).
+         * If the client's source IP or Port changed (e.g., switched from Wi-Fi to 4G),
+         * update the remote_addr to ensure return traffic reaches the new endpoint.
+         */
+        if (unlikely(s->remote_addr.sin_addr.s_addr != addr->sin_addr.s_addr ||
+                     s->remote_addr.sin_port != addr->sin_port)) {
+            memcpy(&s->remote_addr, addr, sizeof(struct sockaddr_in));
+        }
+
+        /* 6. Heartbeat logic: Update last seen timestamp to prevent timeout */
+        s->last_seen = time(NULL);
+
+    } else {
+        /* Optional: Trace orphan management packets for debugging */
+        // log_debug("SESSION: Update failed, SID 0x%08x not found in shard %u", s_id, idx);
+    }
+
+    /* 8. Release lock as early as possible */
+    pthread_rwlock_unlock(&g_shards[idx].lock);
+}
+
 bool vpn_session_lookup_by_ip(uint32_t v_ip, uint32_t *out_sid, struct sockaddr_in *out_addr) {
     uint32_t idx = vpn_get_shard_idx(v_ip);
     vpn_session_t *s = NULL;
@@ -256,4 +309,31 @@ void vpn_session_destroy(void) {
         pthread_rwlock_destroy(&g_shards[i].lock);
     }
     log_info("VPN_SESSION: Manager destroyed.");
+}
+
+int vpn_session_get_expired(vpn_expired_node_t *list, int max_count, 
+                             int probe_sec, int dead_sec) {
+    int count = 0;
+    time_t now = time(NULL);
+
+    for (int i = 0; i < VPN_SESSION_SHARD_COUNT; i++) {
+        pthread_rwlock_rdlock(&g_shards[i].lock);
+        
+        vpn_session_t *s, *tmp;
+        HASH_ITER(hh_ip, g_shards[i].ip_table, s, tmp) {
+            long idle = now - s->last_seen;
+            if (idle >= probe_sec) {
+                list[count].session_id = s->session_id;
+                list[count].virtual_ip = s->virtual_ip;
+                list[count].remote_addr  = s->remote_addr;
+                list[count].is_dead    = (idle >= dead_sec);
+                
+                if (++count >= max_count) break;
+            }
+        }
+        
+        pthread_rwlock_unlock(&g_shards[i].lock);
+        if (count >= max_count) break;
+    }
+    return count;
 }

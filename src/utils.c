@@ -9,6 +9,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <time.h>
 #include "log.h"
 #include "zmalloc.h"
 #include "utils.h"
@@ -57,4 +58,11 @@ const char *vpn_get_absolute_path(char *filename) {
         log_error("Error resolving absolute path");
         return NULL;
     }
+}
+
+/* Internal helper to get monotonic time in milliseconds */
+uint64_t vpn_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }

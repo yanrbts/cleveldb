@@ -24,18 +24,32 @@ typedef struct {
 } __attribute__((aligned(64))) vpn_session_t;
 
 typedef struct {
+    uint32_t session_id;
+    uint32_t virtual_ip;
+    struct sockaddr_in remote_addr;
+    int is_dead; // 1: Expired, 0: Active
+} vpn_expired_node_t;
+
+typedef struct {
     vpn_session_t *ip_table;        /* Hash head for hh (virtual_ip) */
     vpn_session_t *sid_table;       /* Hash head for hh_sid */           
     pthread_rwlock_t lock;          
 } vpn_session_shard_t;
 
-uint32_t vpn_generate_sid(uint32_t v_ip);
+uint32_t vpn_generate_sid(uint32_t vip);
 int vpn_session_init(void);
 void vpn_session_destroy(void);
-void vpn_session_update(uint32_t v_ip, uint32_t s_id, const struct sockaddr_in *addr);
-bool vpn_session_lookup_by_ip(uint32_t v_ip, uint32_t *out_sid, struct sockaddr_in *out_addr);
-bool vpn_session_lookup_by_sid(uint32_t s_id, uint32_t *out_v_ip, struct sockaddr_in *out_addr);
-void vpn_session_delete(uint32_t v_ip);
+void vpn_session_update(uint32_t vip, uint32_t sid, const struct sockaddr_in *addr);
+void vpn_session_update_by_sid(uint32_t sid, const struct sockaddr_in *addr);
+bool vpn_session_lookup_by_ip(uint32_t vip, uint32_t *out_sid, struct sockaddr_in *out_addr);
+bool vpn_session_lookup_by_sid(uint32_t sid, uint32_t *out_vip, struct sockaddr_in *out_addr);
+void vpn_session_delete(uint32_t vip);
 void vpn_session_clean_timeout(vpn_ip_pool_t *ipp, int timeout_sec);
+/**
+ * @brief Scans all shards and collects sessions that exceed the given thresholds.
+ * @return Number of nodes collected.
+ */
+int vpn_session_get_expired(vpn_expired_node_t *list, int max_count, 
+                             int probe_sec, int dead_sec);
 
 #endif /* __SESSION_H__ */
