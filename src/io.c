@@ -118,7 +118,7 @@ void vfast_submit_read(vfast_io_t *io, int fd, int op) {
     /* 2. Obtain a Submission Queue Entry (SQE) from the ring */
     struct io_uring_sqe *sqe = io_uring_get_sqe(&io->ring);
     if (unlikely(!sqe)) {
-        task->in_use = false; /* Release task if SQE acquisition fails */
+        atomic_store(&task->in_use, false); /* Release task if SQE acquisition fails */
         return;
     }
 
@@ -207,8 +207,10 @@ void vfast_submit_write(vfast_io_t *io, int fd, int op, uint8_t *data, int len, 
          */
         task->iov.iov_base = data; 
         task->iov.iov_len  = (size_t)len;
-        task->msg.msg_name = dest;
-        task->msg.msg_namelen = sizeof(struct sockaddr_in);
+        task->addr_len = sizeof(struct sockaddr_in);
+        task->addr = *dest;
+        task->msg.msg_name = &task->addr;
+        task->msg.msg_namelen = task->addr_len;
         task->msg.msg_iov  = &task->iov;
         task->msg.msg_iovlen = 1;
         io_uring_prep_sendmsg(sqe, f_idx, &task->msg, 0);
@@ -283,6 +285,25 @@ void vfast_submit_raw(vfast_io_t *io, int fd, void *data, size_t len, struct soc
     io_uring_submit(&io->ring);
 }
 
+static inline void vfast_monitor_pool_status(vfast_task_t *pool, int pool_size) {
+    int busy = 0;
+    int idle = 0;
+
+    for (int i = 0; i < pool_size; i++) {
+        // 使用 __atomic_load_n 避开某些编译器对 _Atomic 关键字的严格要求
+        if (__atomic_load_n(&pool[i].in_use, __ATOMIC_RELAXED)) {
+            busy++;
+        } else {
+            idle++;
+        }
+    }
+
+    // \r 保证在终端同一行刷新，不会刷屏
+    printf("\r[vfast-io] Task Pool -> BUSY: %d | IDLE: %d | Total: %d", 
+            busy, idle, pool_size);
+    fflush(stdout); 
+}
+
 /**
  * @brief Main event loop for processing completions.
  */
@@ -293,6 +314,7 @@ void vfast_io_run(vfast_io_t *io) {
 
     atomic_store(&io->running, true);
     uint64_t last_tick_ms = vpn_now_ms();
+    uint64_t last_stat_ms = 0;
 
     /* Initial Pipeline Warm-up */
     for (int i = 0; i < 16; i++) {
@@ -317,8 +339,8 @@ void vfast_io_run(vfast_io_t *io) {
         // int ret = io_uring_wait_cqe(&io->ring, &cqe);
 
         /* --- TICK PROCESSING SECTION --- */
+        uint64_t now = vpn_now_ms();
         if (io->timer_cb && io->timer_interval_ms > 0) {
-            uint64_t now = vpn_now_ms();
             if (now - last_tick_ms >= io->timer_interval_ms) {
                 /* Execute injected business logic (e.g., Session Maintenance) */
                 io->timer_cb(io, io->timer_arg);
@@ -361,12 +383,12 @@ void vfast_io_run(vfast_io_t *io) {
                 if (res != -EAGAIN && res != -EINTR) {
                     log_error("CQE Error: op=%d, res=%d (%s)", task->op, res, strerror(-res));
                 }
+
                 /* Re-submit read tasks to prevent pipeline starvation */
                 if (task->op == OP_TUN_READ || task->op == OP_UDP_RECV) {
                     vfast_submit_read(io, (task->op == OP_TUN_READ) ? io->tun_fd : io->udp_fd, task->op);
                 }
             }
-
            /* RELEASE OWNERSHIP: 
             * We mark the task as not in use BEFORE invoking the callback.
             * This allows the business logic (ops) to immediately reuse this 
@@ -378,6 +400,11 @@ void vfast_io_run(vfast_io_t *io) {
         if (count > 0) {
             io_uring_cq_advance(&io->ring, count);
             io_uring_submit(&io->ring); /* Flush any pending SQEs from the threshold logic */
+        }
+
+        if (now - last_stat_ms >= 1000) {
+            vfast_monitor_pool_status(io->task_pool, io->pool_size); 
+            last_stat_ms = now;
         }
     }
 }
