@@ -69,7 +69,7 @@ typedef struct {
     struct msghdr       msg;            /**< Header for recvmsg/sendmsg ops */
     struct sockaddr_in  addr;           /**< Source/Dest address storage */
     socklen_t           addr_len;       /**< Length of sockaddr */
-    bool                in_use;         /**< Spin-lock style usage flag for pool safety */
+    atomic_bool         in_use;         /**< Spin-lock style usage flag for pool safety */
 } vfast_task_t;
 
 /**

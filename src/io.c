@@ -182,7 +182,7 @@ void vfast_submit_write(vfast_io_t *io, int fd, int op, uint8_t *data, int len, 
      * Since 'data' is guaranteed to be a member of the task pool, we calculate
      * the task's base address using the fixed offset of the 'buf' member.
      */
-    vfast_task_t *task = (vfast_task_t *)((uint8_t *)data - offsetof(vfast_task_t, buf));
+    vfast_task_t *task = vfast_data_to_task(data);
 
     /* Acquire a Submission Queue Entry (SQE) from the instance's ring */
     struct io_uring_sqe *sqe = io_uring_get_sqe(&io->ring);
