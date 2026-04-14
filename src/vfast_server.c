@@ -541,7 +541,14 @@ static int vfast_init_server(void) {
         .on_tun_data = server_on_tun,
         .ctx = NULL
     };
-    vfast_io_init(&vfserver.io, vfserver.udp->fd, vfserver.tun.fd, 64, ops);
+    vfast_io_init(
+        &vfserver.io, 
+        vfserver.udp->fd, 
+        vfserver.tun.fd, 
+        vfserver.opt.io_pool_size, 
+        vfserver.opt.io_ring_depth, 
+        ops
+    );
 
     return 0;
 

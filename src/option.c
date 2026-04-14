@@ -174,7 +174,7 @@ void vpn_option_conf(vpn_option_t *opt, const char *cfile) {
             }
         } else if (!strcasecmp(first, "io-pool-size")) {
             opt->io_pool_size = atoi(second);
-            if (opt->io_pool_size < 1) {
+            if (opt->io_pool_size < 1024 || opt->io_pool_size > 4096) {
                 err = "Invalid io-pool-size"; goto loaderr;
             }
         } else if (!strcasecmp(first, "pool-network")) {

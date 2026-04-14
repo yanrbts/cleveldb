@@ -313,7 +313,14 @@ static int vfast_init_client() {
         .on_tun_data = client_on_tun,
         .ctx = NULL
     };
-    vfast_io_init(&vfclient.io, vfclient.udp->fd, vfclient.tun.fd, 64, ops);
+    vfast_io_init(
+        &vfclient.io,
+        vfclient.udp->fd, 
+        vfclient.tun.fd, 
+        vfclient.opt.io_pool_size, 
+        vfclient.opt.io_ring_depth, 
+        ops
+    );
 
     log_info("VFAST Client initialized successfully. Connecting to %s...", vfclient.opt.remote_host);
     return 0;

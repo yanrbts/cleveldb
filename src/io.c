@@ -19,6 +19,7 @@
 #include "protocol.h"
 #include "utils.h"
 #include "log.h"
+#include "zmalloc.h"
 #include "io.h"
 
 /**
@@ -72,17 +73,18 @@ static vfast_task_t* get_task_from_instance(vfast_io_t *io) {
 /**
  * @brief Initializes the io_uring instance and registers fixed files.
  */
-int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, int pool_size, vfast_ops_t ops) {
+int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, int pool_size, int io_ring_depth, vfast_ops_t ops) {
     io->udp_fd = udp_fd;
     io->tun_fd = tun_fd;
     io->ops    = ops;
     io->pool_size = pool_size;
+    io->io_ring_depth = io_ring_depth;
 
     /* Initialize io_uring with default parameters */
-    io->task_pool = calloc(pool_size, sizeof(vfast_task_t));
+    io->task_pool = zcalloc(pool_size * sizeof(vfast_task_t));
     if (!io->task_pool) return -1;
 
-    int ret = io_uring_queue_init(pool_size, &io->ring, 0);
+    int ret = io_uring_queue_init(io_ring_depth, &io->ring, 0);
     if (ret < 0) {
         free(io->task_pool);
         return ret;
@@ -285,23 +287,26 @@ void vfast_submit_raw(vfast_io_t *io, int fd, void *data, size_t len, struct soc
     io_uring_submit(&io->ring);
 }
 
-static inline void vfast_monitor_pool_status(vfast_task_t *pool, int pool_size) {
-    int busy = 0;
-    int idle = 0;
+static inline void vfast_monitor_pool_status(vfast_io_t *io) {
+    int tun_read = 0, udp_recv = 0, tun_write = 0, udp_send = 0, unknown = 0;
+    int pool_size = io->pool_size;
+    vfast_task_t *pool = io->task_pool;
 
     for (int i = 0; i < pool_size; i++) {
-        // 使用 __atomic_load_n 避开某些编译器对 _Atomic 关键字的严格要求
         if (__atomic_load_n(&pool[i].in_use, __ATOMIC_RELAXED)) {
-            busy++;
-        } else {
-            idle++;
+            switch(pool[i].op) {
+                case OP_TUN_READ: tun_read++; break;
+                case OP_UDP_RECV: udp_recv++; break;
+                case OP_TUN_WRITE: tun_write++; break;
+                case OP_UDP_SEND: udp_send++; break;
+                default: unknown++; break;
+            }
         }
     }
-
-    // \r 保证在终端同一行刷新，不会刷屏
-    printf("\r[vfast-io] Task Pool -> BUSY: %d | IDLE: %d | Total: %d", 
-            busy, idle, pool_size);
-    fflush(stdout); 
+    printf("\r[POOL] R_TUN:%d R_UDP:%d | W_TUN:%d W_UDP:%d | UNK:%d | TOTAL_BUSY:%d/%d",
+            tun_read, udp_recv, tun_write, udp_send, unknown, 
+            (tun_read+udp_recv+tun_write+udp_send+unknown), pool_size);
+    fflush(stdout);
 }
 
 /**
@@ -402,10 +407,10 @@ void vfast_io_run(vfast_io_t *io) {
             io_uring_submit(&io->ring); /* Flush any pending SQEs from the threshold logic */
         }
 
-        if (now - last_stat_ms >= 1000) {
-            vfast_monitor_pool_status(io->task_pool, io->pool_size); 
-            last_stat_ms = now;
-        }
+        // if (now - last_stat_ms >= 1000) {
+        //     vfast_monitor_pool_status(io); 
+        //     last_stat_ms = now;
+        // }
     }
 }
 

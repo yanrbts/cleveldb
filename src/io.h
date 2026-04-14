@@ -87,6 +87,7 @@ struct vfast_io {
     vfast_task_t       *task_pool;
     atomic_int          pool_idx;
     int                 pool_size;
+    int                 io_ring_depth;   /**< Counter for batching logic */   
 
     on_timer_cb         timer_cb;           /**< Optional timer callback for periodic tasks */  
     void               *timer_arg;          /**< User-defined argument for timer callback */
@@ -97,7 +98,7 @@ struct vfast_io {
  * @brief Initializes the vfast_io context and io_uring subsystem.
  * @return 0 on success, negative error code on failure.
  */
-int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, int pool_size, vfast_ops_t ops);
+int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, int pool_size, int io_ring_depth, vfast_ops_t ops);
 
 /**
  * @brief Starts the infinite event loop (blocking).
