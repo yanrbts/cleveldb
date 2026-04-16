@@ -3,7 +3,8 @@
  * Author: [yanruibing]
  * All rights reserved.
  */
-
+#include <stdio.h>
+#include <ctype.h>
 #include <stdint.h>
 #include <string.h>
 #include <arpa/inet.h>
@@ -41,22 +42,13 @@ static inline uint16_t _calculate_checksum(uint16_t *buf, int len) {
  * 2. For others: Performs in-place AEAD encryption.
  * 3. Safety: Strict boundary checks and error logging included.
  * 
- * @param key          32-byte session key.
+ * @param sec          Pointer to the session context.
  * @param buf          Buffer base (Payload MUST start at buf + VPN_TNL_HLEN).
  * @param payload_len  Length of the raw payload (e.g., IP packet or Control data).
  * @param max_buf_size Total capacity of the allocated buffer.
  * @param type         VFAST message type (DATA, HEARTBEAT, CONTROL, etc.).
  * @param sid          Session ID for routing.
  * @return Total bytes to send over UDP, or -1 on error.
- */
-/**
- * @brief Encapsulates a VFAST packet with optional encryption and strict validation.
- * * Logic:
- * 1. For HELLO: Skips encryption to allow initial handshake.
- * 2. For others: Performs in-place AEAD encryption.
- * 3. Safety: Strict boundary checks and error logging included.
- *
- * @return Total bytes to send (Header + Payload), or -1 on error.
  */
 int vpn_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int payload_len, 
     int max_buf_size, vpn_msg_t type, uint32_t sid) {
@@ -102,16 +94,7 @@ int vpn_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int payload_len,
         return -1;
     }
 
-    // /* 5. Fill Tunnel Header (Standard Wire Format) */
-    // vpn_tunnel_hdr_t *tnl = (vpn_tunnel_hdr_t *)buf;
-    
-    // tnl->version    = VPN_VERSION;
-    // tnl->msg_type   = (uint8_t)type;
-    // tnl->flags      = 0;
-    // tnl->key_id     = (uint8_t)(kid & 0xFF); /* Truncate Key ID to 8 bits for wire format */
-    // /* Ensure SID is in Network Byte Order (0 for HELLO) */
-    // tnl->session_id = (type == VPN_MSG_HELLO) ? 0 : htonl(sid);
-
+    /* 5. Fill Tunnel Header (Standard Wire Format) */
     vpn_fill_header(buf, (uint8_t)type, sid, kid);
 
     return total_len;
@@ -195,8 +178,7 @@ void vpn_fill_header(void *buf, uint8_t type, uint32_t sid, uint32_t kid) {
     hdr->session_id = (type == VPN_MSG_HELLO) ? 0 : htonl(sid);
 }
 
-#include <stdio.h>
-#include <ctype.h>
+
 
 /**
  * @brief Diagnostic tool to inspect the VPN Tunnel Header and raw memory.

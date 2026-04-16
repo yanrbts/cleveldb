@@ -347,10 +347,8 @@ static inline void vfast_handle_rekey_req(vfast_io_t *io, vpn_session_t *s, uint
      * Payload structure: [KeyID (4B)][Raw Key (32B)]
      */
     uint8_t *payload = data + sizeof(vpn_tunnel_hdr_t);
-    
     /* Parse Key ID from the first 4 bytes (Network Byte Order) */
     uint32_t received_kid = ntohl(*(uint32_t *)payload);
-    
     /* Extract the Raw Key after the 4-byte ID */
     uint8_t *new_key_raw = payload + 4;
 

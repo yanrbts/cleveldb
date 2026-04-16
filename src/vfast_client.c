@@ -142,7 +142,6 @@ static inline int client_handle_hello(vfast_io_t *io, uint8_t *data, int len) {
     atomic_store(&ctx->active_key.bytes_processed, 0);
     atomic_store(&ctx->rekey_pending, false);
 
-    client_fsm.key = ctx->active_key.raw;
     client_fsm.sec = ctx;
     /* Convert Virtual IP to string for system configuration */
     char ip_str[INET_ADDRSTRLEN];
@@ -205,7 +204,6 @@ void vfast_handle_new_key(void) {
      * Step 3: Synchronize FSM legacy pointer.
      * Keep the state machine's shortcut pointer in sync with the new buffer's memory.
      */
-    client_fsm.key = next_buf->active_key.raw;
     client_fsm.sec = next_buf;
 
     log_info("REKEY: Atomic transition successful. Active KeyID: %u, FSM pointer synced.", 
@@ -405,7 +403,7 @@ static void* vfast_rekey_mgmt(void *arg) {
         bool should_retry = (pending && (now - last_sent >= retry_interval));
 
         if (should_init || should_retry) {
-            /* * Phase 1: Preparation 
+            /* Phase 1: Preparation 
              * Only the MGMT thread writes to next_key, so no mutex needed.
              */
             if (should_init) {
@@ -419,9 +417,7 @@ static void* vfast_rekey_mgmt(void *arg) {
             /* Phase 2: Transmission */
             vfast_task_t *task = vfast_borrow_task(io);
             if (task) {
-                vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)task->buf;
-                hdr->msg_type = VPN_MSG_REKEY_REQ;
-                hdr->session_id = htonl(client_fsm.sid);
+                vpn_fill_header(task->buf, VPN_MSG_REKEY_REQ, client_fsm.sid, ctx->next_key.id);
 
                 /* Key payload: [ID: 4B][Key: 32B] */
                 uint8_t *payload = task->buf + sizeof(vpn_tunnel_hdr_t);
@@ -437,9 +433,12 @@ static void* vfast_rekey_mgmt(void *arg) {
                 last_sent = now;
                 if (should_retry && retry_interval < 32) retry_interval *= 2;
 
-                log_info("REKEY: %s sent (ID: %u, Thr: %ld/%lld)", 
-                         should_init ? "Initial REQ" : "Retransmit", 
-                         ctx->next_key.id, processed, REKEY_DATA_THRESHOLD);
+                log_info("REKEY (%s) ID: %u, Progress: %.2f%% (%ldB / %lldB)", 
+                    should_init ? "INIT" : "RETRY", 
+                    ctx->next_key.id, 
+                    (double)processed / REKEY_DATA_THRESHOLD * 100.0, 
+                    processed, 
+                    REKEY_DATA_THRESHOLD);
             }
         }
     }
