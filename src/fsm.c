@@ -50,7 +50,7 @@ static void fsm_send_pkt(vfast_io_t *io, uint8_t type) {
         vpn_auth_t *auth = (vpn_auth_t *)(task->buf + VPN_TNL_HLEN);
         
         /* Populate authentication credentials directly into the reserved payload offset */
-        vfast_auth_pack(auth, client_fsm.vip, (uint8_t *)"VFAST_SECRET", 0);
+        vfast_auth_pack(auth, client_fsm.vip, (uint8_t *)"VFAST_SECRET", 0, NULL, 0);
 
         total_len = vpn_pack(NULL,                 /* No key available yet */
                              task->buf,            /* Target buffer */
@@ -64,7 +64,7 @@ static void fsm_send_pkt(vfast_io_t *io, uint8_t type) {
          * Keep-alive packets are encrypted using the negotiated session key to
          * obscure traffic patterns and prevent protocol fingerprinting.
          */
-        total_len = vpn_pack(client_fsm.key,   /* Use active session key */
+        total_len = vpn_pack(client_fsm.sec,   /* Use active session key */
                              task->buf,            /* Target buffer */
                              0,                    /* Keep-alive has 0-byte payload */
                              BUF_SIZE,             /* Buffer capacity */

@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
+#include <pthread.h>
 #include <arpa/inet.h>
 #include <stdatomic.h>
 #include <sys/uio.h>
@@ -27,6 +28,7 @@
 #include "tun.h"
 #include "udp.h"
 #include "io.h"
+#include "key.h"
 #include "vfast.h"
 
 struct vfast_client {
@@ -34,6 +36,9 @@ struct vfast_client {
     vfast_io_t          io;
     udp_conn_t         *udp;       /* UDP transport handle */
     vpn_tun_ctx_t       tun;       /* Virtual network interface */
+    pthread_t           rekey_tid;
+    _Atomic (vfast_sec_ctx_t *) active_ptr;
+    vfast_sec_ctx_t     sec_ctxs[2];
 } vfclient;
 
 /**
@@ -57,6 +62,8 @@ static void client_signal_handler(int sig) {
  */
 static void vfast_cleanup() {
     log_info("Initiating system shutdown and resource cleanup...");
+
+    pthread_join(vfclient.rekey_tid, NULL);
     
     vpn_tun_destroy(&vfclient.tun);
     
@@ -65,6 +72,7 @@ static void vfast_cleanup() {
     }
     
     vpn_option_clean(&vfclient.opt);
+
     log_info("Cleanup complete. Exit.");
 }
 
@@ -81,7 +89,7 @@ static inline int client_handle_data(vfast_io_t *io, uint8_t *data, int len) {
     uint32_t recv_sid = 0;
 
     /* In-place decryption and unpacking using the session master key */
-    uint8_t *payload_ptr = vpn_unpack(vfclient.opt.master_key, data, len, 
+    uint8_t *payload_ptr = vpn_unpack(vfclient.active_ptr, data, len, 
                                       &plain_ip_len, &recv_sid);
 
     if (unlikely(!payload_ptr)) {
@@ -127,6 +135,15 @@ static inline int client_handle_hello(vfast_io_t *io, uint8_t *data, int len) {
     client_fsm.sid = new_sid;
     client_fsm.vip = auth->vip;
 
+    vfast_sec_ctx_t *ctx = atomic_load(&vfclient.active_ptr);
+    memcpy(ctx->active_key.raw, auth->init_key, REKEY_KEY_SIZE);
+    ctx->active_key.id = auth->key_id;
+    ctx->active_key.created_at = time(NULL);
+    atomic_store(&ctx->active_key.bytes_processed, 0);
+    atomic_store(&ctx->rekey_pending, false);
+
+    client_fsm.key = ctx->active_key.raw;
+    client_fsm.sec = ctx;
     /* Convert Virtual IP to string for system configuration */
     char ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &auth->vip, ip_str, sizeof(ip_str));
@@ -145,6 +162,54 @@ static inline int client_handle_hello(vfast_io_t *io, uint8_t *data, int len) {
                   vfclient.tun.name, ip_str);
         return -1;
     }
+}
+
+/**
+ * @brief Commits the newly negotiated session key using an atomic pointer swap.
+ * * This implements a RCU-like (Read-Copy-Update) mechanism. It prepares the 
+ * inactive standby buffer, performs the key promotion (Active -> Previous, 
+ * Next -> Active), and then atomically swaps the global active pointer.
+ * * Note: This function ensures zero-lock synchronization with the data plane.
+ */
+void vfast_handle_new_key(void) {
+    /* Get the currently active context pointer */
+    vfast_sec_ctx_t *curr = atomic_load_explicit(&vfclient.active_ptr, memory_order_acquire);
+    
+    /* Identify the inactive standby buffer (Double Buffering) */
+    vfast_sec_ctx_t *next_buf = (curr == &vfclient.sec_ctxs[0]) ? 
+                                &vfclient.sec_ctxs[1] : &vfclient.sec_ctxs[0];
+
+    /**
+     * Step 1: Prepare the standby buffer.
+     * Copy the current state to maintain session continuity (like session_id).
+     * We can safely use memcpy because next_buf is guaranteed to be inactive.
+     */
+    memcpy(next_buf, curr, sizeof(vfast_sec_ctx_t));
+    
+    /* Move Active Key to Previous, and Promote Next Key to Active */
+    vfast_rekey_commit(next_buf); 
+
+    /**
+     * Step 2: Atomic Pointer Swap.
+     * We use 'memory_order_release' to ensure that all previous memory writes 
+     * (the memcpy and vfast_rekey_commit) are visible to any thread that 
+     * performs an 'acquire' load of this pointer.
+     */
+    atomic_store_explicit(&vfclient.active_ptr, next_buf, memory_order_release);
+
+    /* Step D: ALSO clear the pending flag on the OLD buffer 
+     * (To prevent the mgmt thread from seeing 'true' if it somehow hits the old ptr) */
+    atomic_store(&curr->rekey_pending, false);
+
+    /**
+     * Step 3: Synchronize FSM legacy pointer.
+     * Keep the state machine's shortcut pointer in sync with the new buffer's memory.
+     */
+    client_fsm.key = next_buf->active_key.raw;
+    client_fsm.sec = next_buf;
+
+    log_info("REKEY: Atomic transition successful. Active KeyID: %u, FSM pointer synced.", 
+             next_buf->active_key.id);
 }
 
 /**
@@ -198,6 +263,8 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
 
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
 
+    // vpn_debug_print_hdr(data, len);
+
     /**
      * 2. Heartbeat Watchdog Update
      * Only update the last receive timestamp for valid protocol message types.
@@ -220,6 +287,9 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     case VPN_DPD_REQUEST:
         log_info("Received DPD Request from server. Responding with DPD Response.");
         client_handle_dpd(io, data, src);
+        break;
+    case VPN_MSG_REKEY_ACK:
+        vfast_handle_new_key();
         break;
     default:
         log_warn("Ingress: Unknown message type [0x%02x] received.", hdr->msg_type);
@@ -247,7 +317,11 @@ int client_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     if (unlikely(!vfast_fsm_is_connected())) {
         return 0;
     }
-
+    /* Get the active context instantly via atomic pointer */
+    vfast_sec_ctx_t *ctx = atomic_load(&vfclient.active_ptr);
+    
+    /* 1. Atomic accumulation - O(1) Lock-free operation */
+    atomic_fetch_add(&ctx->active_key.bytes_processed, (long)len);
     /**
      * 2. Direct Packing:
      * Your vpn_pack expects 'buf' to be the start of the whole VFAST packet.
@@ -256,7 +330,7 @@ int client_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     uint8_t *vfast_packet_base = data - VPN_TNL_HLEN;
     
     /* We use BUF_SIZE to prevent overflows during encryption (+40 bytes) */
-    int total_len = vpn_pack(vfclient.opt.master_key, 
+    int total_len = vpn_pack(ctx, 
                              vfast_packet_base, 
                              len, 
                              BUF_SIZE, 
@@ -279,6 +353,99 @@ int client_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     return 0;
 }
 
+static int vfast_init_secctx() {
+    memset(&vfclient.sec_ctxs[0], 0, sizeof(vfast_sec_ctx_t));
+    memset(&vfclient.sec_ctxs[1], 0, sizeof(vfast_sec_ctx_t));
+
+    vfast_rekey_init(&vfclient.sec_ctxs[0]);
+
+    atomic_init(&vfclient.active_ptr, &vfclient.sec_ctxs[0]);
+
+    log_info("Security Manager: Initialized with buffer [0].");
+    return 0;
+}
+
+/**
+ * @brief Rekey Management Thread - 100% Lock-Free Implementation.
+ * Uses atomic pointer swapping to ensure zero contention with the data plane.
+ */
+/**
+ * @brief Rekey Management Thread - Lock-Free Lifecycle Control.
+ * 100% decoupling between control plane and data plane.
+ */
+static void* vfast_rekey_mgmt(void *arg) {
+    vfast_io_t *io = (vfast_io_t *)arg;
+    time_t last_sent = 0;
+    int retry_interval = 2;
+
+    log_info("Rekey Manager: Lock-free monitoring active.");
+
+    while (atomic_load(&io->running)) {
+        /* High-level polling interval: 1s is sufficient for key management */
+        sleep(1);
+
+        if (unlikely(!vfast_fsm_is_connected())) continue;
+
+        /* [Atomic] Load the current pointer used by data plane */
+        vfast_sec_ctx_t *ctx = atomic_load(&vfclient.active_ptr);
+        
+        /* * [Industrial Logic] 
+         * We don't call vfast_rekey_needed() directly because we need 
+         * atomic-safe reading of 'bytes_processed' and 'rekey_pending'.
+         */
+        uint64_t processed = atomic_load(&ctx->active_key.bytes_processed);
+        bool pending   = atomic_load(&ctx->rekey_pending);
+        time_t now     = time(NULL);
+
+        /* Determine if it's time to act */
+        bool threshold_hit = (processed >= REKEY_DATA_THRESHOLD) || 
+                             ((now - ctx->active_key.created_at) >= REKEY_TIMEOUT_SEC);
+        
+        bool should_init  = (!pending && threshold_hit);
+        bool should_retry = (pending && (now - last_sent >= retry_interval));
+
+        if (should_init || should_retry) {
+            /* * Phase 1: Preparation 
+             * Only the MGMT thread writes to next_key, so no mutex needed.
+             */
+            if (should_init) {
+                if (vfast_rekey_prepare_next(ctx) != 0) {
+                    log_error("REKEY: Crypto failure during preparation.");
+                    continue;
+                }
+                retry_interval = 2; // Reset backoff
+            }
+
+            /* Phase 2: Transmission */
+            vfast_task_t *task = vfast_borrow_task(io);
+            if (task) {
+                vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)task->buf;
+                hdr->msg_type = VPN_MSG_REKEY_REQ;
+                hdr->session_id = htonl(client_fsm.sid);
+
+                /* Key payload: [ID: 4B][Key: 32B] */
+                uint8_t *payload = task->buf + sizeof(vpn_tunnel_hdr_t);
+                uint32_t net_kid = htonl(ctx->next_key.id);
+                memcpy(payload, &net_kid, 4);
+                memcpy(payload + 4, ctx->next_key.raw, REKEY_KEY_SIZE);
+
+                /* Async submission to io_uring */
+                vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, task->buf, 
+                                   sizeof(vpn_tunnel_hdr_t) + 4 + REKEY_KEY_SIZE, 
+                                   &client_fsm.dst_addr);
+                
+                last_sent = now;
+                if (should_retry && retry_interval < 32) retry_interval *= 2;
+
+                log_info("REKEY: %s sent (ID: %u, Thr: %ld/%lld)", 
+                         should_init ? "Initial REQ" : "Retransmit", 
+                         ctx->next_key.id, processed, REKEY_DATA_THRESHOLD);
+            }
+        }
+    }
+    return NULL;
+}
+
 /**
  * vfast_init_server - Pipeline and Environment Setup.
  * Initializes memory, kernel interfaces, and warms up the I/O ring.
@@ -286,6 +453,8 @@ int client_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
 static int vfast_init_client() {
     memset(&vfclient.io, 0, sizeof(vfast_io_t));
     atomic_store(&vfclient.io.running, true);
+
+    vfast_init_secctx();
 
     if (vfast_load_key(vfclient.opt.keyfile, vfclient.opt.master_key) < 0) {
         log_error("Failed load key file.");
@@ -396,6 +565,11 @@ int main(int argc, char *argv[]) {
         &vfclient.io.running,
         vfclient.opt.master_key
     );
+
+    if (pthread_create(&vfclient.rekey_tid, NULL, vfast_rekey_mgmt, &vfclient.io) != 0) {
+        log_error("Failed to create rekey thread.");
+        return -1;
+    }
 
     vfast_io_run(&vfclient.io);
 

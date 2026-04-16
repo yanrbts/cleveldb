@@ -8,7 +8,8 @@
 #include "log.h"
 #include "auth.h"
 
-void vfast_auth_pack(vpn_auth_t *auth, uint32_t vip, const uint8_t *token, uint64_t ts) {
+void vfast_auth_pack(vpn_auth_t *auth, uint32_t vip, const uint8_t *token, 
+    uint32_t key_id, const uint8_t *init_key, uint64_t ts) {
     if (!auth) return;
 
     /* Initialize memory to zero to prevent information leakage from stack/heap padding */
@@ -17,10 +18,10 @@ void vfast_auth_pack(vpn_auth_t *auth, uint32_t vip, const uint8_t *token, uint6
     auth->magic = VFAST_MAGIC;
     auth->vip   = vip;
     auth->ts    = (ts != 0) ? ts : (uint64_t)time(NULL);
+    auth->key_id = key_id;
+    if (init_key) memcpy(auth->init_key, init_key, 32);
+    if (token) memcpy(auth->token, token, 12);
 
-    if (token) {
-        memcpy(auth->token, token, 12);
-    }
 }
 
 int vfast_auth_verify(const vpn_auth_t *auth, const uint8_t *expected_token) {

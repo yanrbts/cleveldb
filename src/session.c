@@ -103,6 +103,9 @@ void vpn_session_update(uint32_t v_ip, uint32_t s_id, const struct sockaddr_in *
         if (s) {
             s->virtual_ip = v_ip;
             s->session_id = s_id;
+
+            vfast_rekey_init(&s->sec_ctx); // Initialize security context for this session
+
             HASH_ADD(hh_ip, g_shards[idx].ip_table, virtual_ip, sizeof(uint32_t), s);
             HASH_ADD(hh_sid, g_shards[idx].sid_table, session_id, sizeof(uint32_t), s);
         }
@@ -246,12 +249,36 @@ void vpn_session_delete(uint32_t v_ip) {
                   (v_ip & 0xFF), (v_ip >> 8) & 0xFF, 
                   (v_ip >> 16) & 0xFF, (v_ip >> 24) & 0xFF,
                   s->session_id);
-
+        memset(&s->sec_ctx, 0, sizeof(vfast_sec_ctx_t));
         /* 2. Safe to release memory only after all references are removed */
         zfree(s);
     }
 
     pthread_rwlock_unlock(&g_shards[idx].lock);
+}
+
+bool vpn_lookup_session_by_sid(uint32_t sid, vpn_session_t **outs) {
+    uint32_t idx = vpn_get_shard_idx(sid); 
+    vpn_session_t *s = NULL;
+
+    pthread_rwlock_rdlock(&g_shards[idx].lock);
+    HASH_FIND(hh_sid, g_shards[idx].sid_table, &sid, sizeof(uint32_t), s);
+    pthread_rwlock_unlock(&g_shards[idx].lock);
+    *outs = s;
+
+    return s != NULL;
+}
+
+bool vpn_lookup_session_by_ip(uint32_t vip, vpn_session_t **outs) {
+    uint32_t idx = vpn_get_shard_idx(vip); 
+    vpn_session_t *s = NULL;
+
+    pthread_rwlock_rdlock(&g_shards[idx].lock);
+    HASH_FIND(hh_ip, g_shards[idx].ip_table, &vip, sizeof(uint32_t), s);
+    pthread_rwlock_unlock(&g_shards[idx].lock);
+    *outs = s;
+    
+    return s != NULL;
 }
 
 /**

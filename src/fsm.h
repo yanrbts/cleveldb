@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <netinet/in.h> // Required for sockaddr_in
 #include "io.h"         // Required for vfast_io_t
+#include "key.h"        // Required for vfast_sec_ctx_t
 
 typedef enum {
     ST_IDLE = 0,
@@ -32,6 +33,7 @@ typedef struct {
     vfast_io_t     *io;            /* Unified IO Engine */
     atomic_bool    *running;
     const uint8_t  *key;          /* Pointer to the session key (set after auth) */
+    vfast_sec_ctx_t *sec;         /* Pointer to the security context */
 } vfast_fsm_t;
 
 extern vfast_fsm_t client_fsm;

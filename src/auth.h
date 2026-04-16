@@ -26,6 +26,8 @@ typedef struct {
     uint32_t vip;
     uint8_t  token[16];
     uint64_t ts;
+    uint32_t key_id;
+    uint8_t  init_key[32];
 } __attribute__((packed)) vpn_auth_t;
 
 /**
@@ -33,12 +35,15 @@ typedef struct {
  * @param auth:  Pointer to the destination vpn_auth_t structure.
  * @param vip:   Virtual IP to be encoded.
  * @param token: Pointer to a 16-byte buffer containing the auth token.
+ * @param key_id: The ID of the key to be used for authentication.
+ * @param init_key: Pointer to a 32-byte buffer containing the initial key.
  * @param ts:    Timestamp. If 0, the function will use the current system time.
  *
  * This function guarantees a clean memory state by zero-initializing 
  * the structure before assignment, preventing sensitive data leakage.
  */
-void vfast_auth_pack(vpn_auth_t *auth, uint32_t vip, const uint8_t *token, uint64_t ts);
+void vfast_auth_pack(vpn_auth_t *auth, uint32_t vip, const uint8_t *token, 
+    uint32_t key_id, const uint8_t *init_key, uint64_t ts);
 
 /**
  * vfast_auth_verify - Validates the integrity and authenticity of the payload.

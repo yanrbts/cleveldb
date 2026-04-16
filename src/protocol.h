@@ -50,6 +50,7 @@
 #define __PROTOCOL_H__
 
 #include <stdint.h>
+#include "key.h"
 
 /* Protocol Constants */
 #define VPN_VERSION       1
@@ -57,12 +58,14 @@
 
 /* Message Types */
 typedef enum {
-    VPN_MSG_DATA      = 0x01,
-    VPN_MSG_HELLO     = 0x02,
-    VPN_MSG_KEEPALIVE = 0x03,
-    VPN_MSG_DISCONNECT= 0x04,
-    VPN_DPD_REQUEST   = 0x05, /* Dead Peer Detection Request */
-    VPN_DPD_RESPONSE  = 0x06  /* Dead Peer Detection Response */
+    VPN_MSG_DATA       = 0x01,
+    VPN_MSG_HELLO      = 0x02,
+    VPN_MSG_KEEPALIVE  = 0x03,
+    VPN_MSG_DISCONNECT = 0x04,
+    VPN_DPD_REQUEST    = 0x05,  /* Dead Peer Detection Request */
+    VPN_DPD_RESPONSE   = 0x06,  /* Dead Peer Detection Response */
+    VPN_MSG_REKEY_REQ  = 0x07,  /* Triggered by vfast_rekey_needed */
+    VPN_MSG_REKEY_ACK  = 0x08   /* Confirmation to call vfast_rekey_commit */
 } vpn_msg_t;
 
 /* * Packed Structure for Network Transmission
@@ -71,7 +74,8 @@ typedef enum {
 typedef struct {
     uint8_t  version;      /* Protocol version */
     uint8_t  msg_type;     /* Message type from vfast_msg_t */
-    uint16_t flags;        /* Reserved for future flags (e.g. compression, encryption type) */
+    uint8_t  key_id;       /* Key ID for encryption (0 for HELLO, n for active session key) */
+    uint8_t  flags;        /* Reserved for future flags (e.g. compression, encryption type) */
     uint32_t session_id;   /* Unique session identifier (Network Byte Order) */
 } __attribute__((packed)) vpn_tunnel_hdr_t;
 
@@ -100,7 +104,7 @@ typedef struct {
  * Before: [8B Gap] [Payload(N)]
  * After:  [Header(8B)] [Nonce(24B)] [Cipher(N)] [Tag(16B)]
  */
-int vpn_pack(const uint8_t *key, uint8_t *buf, int payload_len, int max_buf_size, vpn_msg_t type, uint32_t sid);
+int vpn_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int payload_len, int max_buf_size, vpn_msg_t type, uint32_t sid);
 
 /**
  * @brief Decapsulates, authenticates, and decrypts incoming VFAST packets.
@@ -113,7 +117,7 @@ int vpn_pack(const uint8_t *key, uint8_t *buf, int payload_len, int max_buf_size
  * 2. Authentication: Verifies the AEAD Tag. Fails if the key is wrong or data is tampered.
  * 3. Validation: For DATA packets, performs deep inspection of the inner IPv4 header.
  *
- * @param[in]  key          A 32-byte symmetric encryption key.
+ * @param[in]  sec          Security context containing the encryption key.
  * @param[in]  buf          Base address of the received UDP packet.
  * @param[in]  received_len Total bytes received from the network.
  * @param[out] out_ip_len   Pointer to store the decrypted payload length.
@@ -124,6 +128,21 @@ int vpn_pack(const uint8_t *key, uint8_t *buf, int payload_len, int max_buf_size
  *
  * @warning This function modifies the buffer in-place during decryption.
  */
-uint8_t* vpn_unpack(const uint8_t *key, uint8_t *buf, int received_len, int *out_ip_len, uint32_t *out_sid);
+uint8_t* vpn_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int received_len, int *out_ip_len, uint32_t *out_sid);
+
+/**
+ * @brief Encapsulates the tunnel header with protocol-specific metadata.
+ * * In high-performance asynchronous I/O (like io_uring), packets may remain 
+ * in the kernel queue during a rekeying event. Including the 'kid' (Key ID) 
+ * in every header allows the receiver to perform a "Lockless Key Lookup," 
+ * matching the packet to either the 'Active' or 'Previous' key accurately.
+ *
+ * @param buf  Pointer to the start of the transmission buffer.
+ * @param type The message type (e.g., VPN_MSG_DATA, VPN_MSG_KEEPALIVE).
+ * @param sid  The Session ID assigned during the HELLO exchange.
+ * @param kid  The Key ID currently active in the security context.
+ */
+void vpn_fill_header(void *buf, uint8_t type, uint32_t sid, uint32_t kid);
+void vpn_debug_print_hdr(const void *buf, int len);
 
 #endif /* __PROTOCOL_H__ */

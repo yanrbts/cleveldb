@@ -137,6 +137,7 @@ static void vfast_cmd_keygen(void) {
  * 2. Pre-calculated Offsets: Minimizes pointer arithmetic during the hot path.
  * 3. Atomic Stats Integration: (Optional but recommended) for monitoring.
  * @param io    Pointer to the io_uring engine context.
+ * @param s     The session context associated with this request (if any).
  * @param res   Actual bytes received from the CQE.
  * @param buf   Pointer to the specific task's buffer (task->buf).
  * @param src   Source address of the requesting client.
@@ -179,17 +180,33 @@ static bool vfast_auth_request(vfast_io_t *io, int res, uint8_t *buf, struct soc
 
     /* 6. Response Construction: Reuse the same buffer for Egress (Zero-copy) */
     
+    
+
+    vpn_session_t *s = NULL;
+    if (!vpn_lookup_session_by_sid(new_sid, &s)) {
+        log_error("Unexpected error: Session not found after creation for SID[0x%08x]", new_sid);
+        return false;
+    }
+
     /* Update Header Fields */
     hdr->version    = VFAST_VERSION;
     hdr->msg_type   = VPN_MSG_HELLO; 
     hdr->session_id = htonl(new_sid); // Ensure Network Byte Order
     hdr->flags      = 0;
+    hdr->key_id     = 0; 
 
     /* 7. Optimized Packing:
      * Directly pack response data into the task buffer.
      * This avoids: 'vpn_auth_t tmp; vfast_auth_pack(&tmp...); memcpy(dest, &tmp...);'
      */
-    vfast_auth_pack(auth_ptr, assigned_vip, expected_token, 0);
+    vfast_auth_pack(
+        auth_ptr, 
+        assigned_vip, 
+        expected_token, 
+        s->sec_ctx.active_key.id, 
+        s->sec_ctx.active_key.raw,
+        0
+    );
 
     /* 8. Asynchronous Dispatch */
     log_info("Handshake assigned VIP %u.%u.%u.%u [SID: 0x%08x] to %s",
@@ -213,12 +230,15 @@ static bool vfast_auth_request(vfast_io_t *io, int res, uint8_t *buf, struct soc
  * 3. Branch Prediction: Uses likely/unlikely hints to optimize the CPU pipeline 
  * for the "hot path" (successful session lookup).
  * @param io    Pointer to the io_uring engine context.
+ * @param s     The session context associated with this request.
  * @param res   Number of bytes received (cqe->res).
  * @param buf   Pointer to the task buffer (task->buf).
  * @param src   Physical source address of the client.
  * @return true if the keepalive was processed/ACKed, false otherwise.
  */
-static bool vfast_keeplive(vfast_io_t *io, int res, uint8_t *buf, struct sockaddr_in *src) {
+static bool vfast_keeplive(vfast_io_t *io, vpn_session_t *s, uint8_t *buf, int res , struct sockaddr_in *src) {
+    UNUSED(s);
+
     /* 1. Basic Length Validation */
     if (unlikely(res < (int)sizeof(vpn_tunnel_hdr_t))) {
         return false;
@@ -285,22 +305,25 @@ static bool vfast_keeplive(vfast_io_t *io, int res, uint8_t *buf, struct sockadd
  * * This internal helper handles the decryption, validation, and submission 
  * to the virtual network device.
  */
-static inline void vfast_handle_data_msg(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src) {
+static inline void vfast_handle_data_msg(vfast_io_t *io, vpn_session_t *s, uint8_t *data, int len, struct sockaddr_in *src) {
     int plain_len = 0;
     uint32_t recv_sid = 0;
-    // vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
 
     /**
      * CRITICAL: Decrypt and Unpack.
      * vpn_unpack performs in-place decryption and returns a pointer to the 
      * start of the plain IP packet.
      */
-    uint8_t *payload_ptr = vpn_unpack(vfserver.opt.master_key, data, len, 
+    // uint8_t *payload_ptr = vpn_unpack(vfserver.opt.master_key, data, len, 
+    //                                   &plain_len, &recv_sid);
+
+    uint8_t *payload_ptr = vpn_unpack(&s->sec_ctx, data, len, 
                                       &plain_len, &recv_sid);
 
     if (unlikely(!payload_ptr || plain_len <= 0)) {
         log_warn("Ingress: Decryption failed or invalid packet from %s", 
                  inet_ntoa(src->sin_addr));
+        
         atomic_fetch_add(&vfserver.stats.drops, 1);
         return;
     }
@@ -310,6 +333,78 @@ static inline void vfast_handle_data_msg(vfast_io_t *io, uint8_t *data, int len,
      * The kernel will receive a valid, decrypted IPv4/IPv6 packet.
      */
     vfast_submit_write(io, io->tun_fd, OP_TUN_WRITE, payload_ptr, plain_len, NULL);
+}
+
+/**
+ * @brief Handles a Rekey Request from the client (Passive Rekey).
+ * The client has generated a new key and wants the server to switch.
+ */
+static inline void vfast_handle_rekey_req(vfast_io_t *io, vpn_session_t *s, uint8_t *data, int len, struct sockaddr_in *src) {
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
+    
+    /**
+     * 1. Extract Payload with Offset.
+     * Payload structure: [KeyID (4B)][Raw Key (32B)]
+     */
+    uint8_t *payload = data + sizeof(vpn_tunnel_hdr_t);
+    
+    /* Parse Key ID from the first 4 bytes (Network Byte Order) */
+    uint32_t received_kid = ntohl(*(uint32_t *)payload);
+    
+    /* Extract the Raw Key after the 4-byte ID */
+    uint8_t *new_key_raw = payload + 4;
+
+    /**
+     * 2. Security Validation (Industrial Practice).
+     * Ensure the received KeyID is strictly greater than the current one 
+     * to prevent replay or out-of-order rekeying.
+     */
+    if (unlikely(received_kid <= s->sec_ctx.active_key.id)) {
+        log_warn("REKEY: Ignored stale KeyID %u (Current: %u) from SID[0x%08x]", 
+                 received_kid, s->sec_ctx.active_key.id, s->session_id);
+        return;
+    }
+
+    /* 3. Load into 'next' slot */
+    memcpy(s->sec_ctx.next_key.raw, new_key_raw, REKEY_KEY_SIZE);
+    s->sec_ctx.next_key.id = received_kid;
+    s->sec_ctx.next_key.created_at = time(NULL);
+    atomic_store(&s->sec_ctx.next_key.bytes_processed, 0);
+
+    /**
+     * 4. Acknowledge the client (VPN_MSG_REKEY_ACK).
+     * Reuse the buffer to save allocation overhead.
+     */
+    hdr->msg_type = VPN_MSG_REKEY_ACK;
+    /* ACK payload can be empty or echoing the KeyID. Here we echo the request. */
+    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, data, len, src);
+
+    /**
+     * 5. Commit the transition immediately.
+     * Server promotes the key as soon as ACK is sent. 
+     * The 'previous_key' in sec_ctx handles any inflight packets from client 
+     * that haven't received the ACK yet.
+     */
+    vfast_rekey_commit(&s->sec_ctx);
+    
+    log_info("REKEY: Committed for SID[0x%08x]. Active KeyID: %u", 
+             s->session_id, received_kid);
+}
+
+/**
+ * @brief Handles a Rekey Acknowledgment from the client (Active Rekey Response).
+ * The server previously sent a REQ, and the client has confirmed receipt.
+ */
+static inline void vfast_handle_rekey_ack(vpn_session_t *s) {
+    if (unlikely(!s->sec_ctx.rekey_pending)) {
+        log_warn("REKEY: Received unexpected ACK for SID[0x%08x]", s->session_id);
+        return;
+    }
+
+    /* Client is ready, we can now safely rotate keys */
+    vfast_rekey_commit(&s->sec_ctx);
+    
+    log_info("REKEY: Committed for SID[0x%08x] (Server-initiated)", s->session_id);
 }
 
 /**
@@ -328,24 +423,37 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
     /* 1. Map the VPN header to extract session information */
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
 
-    /* 2. Track the peer for return traffic (Simple session sticky) */
-    memcpy(&io->remote_addr, src, sizeof(struct sockaddr_in));
+    // vpn_debug_print_hdr(data, len);
+
+    if (hdr->msg_type == VPN_MSG_HELLO) {
+        return vfast_auth_request(io, len, data, src) ? 0 : -1;
+    }
+
+    uint32_t sid = ntohl(hdr->session_id);
+    vpn_session_t *s = NULL;
+    if (!vpn_lookup_session_by_sid(sid, &s)) {
+        atomic_fetch_add(&vfserver.stats.drops, 1);
+        log_warn("No session found for SID[0x%08x] from %s. Packet dropped.", sid, inet_ntoa(src->sin_addr));
+        return 0;
+    }
     
     /* 3. Dispatch based on message type */
     switch (hdr->msg_type) {
         case VPN_MSG_DATA: 
-            vfast_handle_data_msg(io, data, len, src);
+            vfast_handle_data_msg(io, s, data, len, src);
             break;
         case VPN_MSG_KEEPALIVE:
-            // log_debug("Keepalive received from %s", inet_ntoa(src->sin_addr));
-            vfast_keeplive(io, len, data, src);
-            break;
-        case VPN_MSG_HELLO:
-            vfast_auth_request(io, len, data, src);
+            vfast_keeplive(io, s, data, len, src);
             break;
         case VPN_DPD_RESPONSE:
             log_info("Received DPD Response from %s. Session is alive.", inet_ntoa(src->sin_addr));
             vpn_session_update_by_sid(hdr->session_id, src);
+            break;
+        case VPN_MSG_REKEY_ACK:
+            vfast_handle_rekey_ack(s);
+            break;
+        case VPN_MSG_REKEY_REQ:
+            vfast_handle_rekey_req(io, s, data, len, src);
             break;
         default:
             log_warn("Unknown VPN msg type: 0x%02x", hdr->msg_type);
@@ -388,13 +496,10 @@ static int server_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
     const uint32_t dest_vip = iph->daddr;
 
     /* 4. Session Lookup: Map VIP to client endpoint and session security context */
-    uint32_t real_sid = 0;
-    struct sockaddr_in client_addr;
-    
-    if (unlikely(!vpn_session_lookup_by_ip(dest_vip, &real_sid, &client_addr))) {
-        /* Drop unroutable packets (No active session found for this VIP) */
+    vpn_session_t *s = NULL;
+    if (!vpn_lookup_session_by_ip(dest_vip, &s)) {
         atomic_fetch_add(&vfserver.stats.drops, 1);
-        return 0; 
+        return -1;
     }
 
     /**
@@ -402,12 +507,12 @@ static int server_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
      * The vpn_pack function now writes the header at task_buf_base and encrypts 
      * the payload at 'data' in-situ. This eliminates the need for memcpy.
      */
-    int total_len = vpn_pack(vfserver.opt.master_key, 
+    int total_len = vpn_pack(&s->sec_ctx,  /* Encryption Key */
                              task_buf_base, 
                              len, 
                              BUF_SIZE, 
                              VPN_MSG_DATA, 
-                             real_sid);
+                             s->session_id);
 
     if (likely(total_len > 0)) {
         /**
@@ -416,7 +521,7 @@ static int server_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
          * CRITICAL: The task's 'in_use' flag must NOT be cleared until the 
          * OP_UDP_SEND completion is reaped in vfast_io_run.
          */
-        vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, task_buf_base, total_len, &client_addr);
+        vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, task_buf_base, total_len, &s->remote_addr);
         
         atomic_fetch_add(&vfserver.stats.tx_pkts, 1);
         
