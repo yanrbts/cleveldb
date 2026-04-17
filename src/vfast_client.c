@@ -365,7 +365,7 @@ static int vfast_init_secctx() {
 
     atomic_init(&vfclient.active_ptr, &vfclient.sec_ctxs[0]);
 
-    log_info("Security Manager: Initialized with buffer [0].");
+    log_info("Security Manager: Initialized with sec[0].");
     return 0;
 }
 
