@@ -9,6 +9,10 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h> /* Essential for socket functions */
+#include <net/if.h>     /* Essential for IFNAMSIZ and struct ifreq */
+#include <arpa/inet.h>
 #include <time.h>
 #include "log.h"
 #include "zmalloc.h"
@@ -65,4 +69,29 @@ uint64_t vpn_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+int ip_pton(const char *ip_str, uint32_t *out_ip) {
+    if (!ip_str || !out_ip) return -1;
+    
+    struct in_addr addr;
+    if (inet_pton(AF_INET, ip_str, &addr) != 1) {
+        return -1;
+    }
+    
+    *out_ip = addr.s_addr;
+    return 0;
+}
+
+int ip_ntop(uint32_t ip_bin, char *out_str, size_t size) {
+    if (!out_str || size < INET_ADDRSTRLEN) return -1;
+
+    struct in_addr addr;
+    addr.s_addr = ip_bin;
+
+    if (inet_ntop(AF_INET, &addr, out_str, size) == NULL) {
+        return -1;
+    }
+
+    return 0;
 }

@@ -59,6 +59,79 @@ int vfast_load_key(const char *key_path, uint8_t out_key[CRYPTO_KEY_SIZE]) {
 }
 
 /**
+ * @brief Command: --keygen
+ * Generates an industrial-strength 256-bit entropy key and persists it to disk.
+ * * SECURITY MEASURES:
+ * 1. O_EXCL: Atomic check to prevent accidental overwriting of existing keys.
+ * 2. fchmod: Explicitly forces 0600 (Owner Read/Write only) regardless of umask.
+ * 3. Secure Wipe: Ensures the key is scrubbed from stack memory after use.
+ * 4. Sync: Forces a disk flush before closing to ensure persistence.
+ */
+void vfast_cmd_keygen(void) {
+    uint8_t tmp_key[CRYPTO_KEY_SIZE];
+    const char *key_file = "vfast.key";
+    
+    log_info("[ VFAST ] Initializing high-entropy key generation...");
+
+    /* Phase 1: Entropy Collection
+     * vpn_generate_key must wrap a secure CSPRNG (like getrandom(2) or /dev/urandom) */
+    if (unlikely(vpn_generate_key(tmp_key) != 0)) {
+        log_error("CRITICAL: System failed to provide sufficient entropy.");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Phase 2: Secure File Creation
+     * O_CREAT | O_EXCL ensures atomicity: fails if the file already exists.
+     * S_IRUSR | S_IWUSR sets 0600 permissions. */
+    int fd = open(key_file, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        if (errno == EEXIST) {
+            log_error("DENIED: Key file '%s' already exists. Manual deletion required to rotate.", key_file);
+        } else {
+            log_error("SYSCALL: Failed to open key file for writing: %s", strerror(errno));
+        }
+        goto cleanup_fail;
+    }
+
+    /* Phase 3: Permission Hardening
+     * Overriding umask to guarantee the file is strictly private. */
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        log_error("SECURITY: Failed to enforce restricted permissions on key file.");
+        close(fd);
+        unlink(key_file);
+        goto cleanup_fail;
+    }
+
+    /* Phase 4: Atomic Persistence */
+    ssize_t n = write(fd, tmp_key, CRYPTO_KEY_SIZE);
+    if (n != CRYPTO_KEY_SIZE) {
+        log_error("IO_ERROR: Failed to write full entropy block. Status: %zd/%d", n, CRYPTO_KEY_SIZE);
+        close(fd);
+        unlink(key_file);
+        goto cleanup_fail;
+    }
+
+    /* Force physical disk flush before closing to prevent data loss on power failure */
+    if (fdatasync(fd) != 0) {
+        log_warn("IO_WARN: Could not verify physical disk sync.");
+    }
+
+    close(fd);
+
+    /* Phase 5: Memory Scrubbing
+     * Zero out the key in memory to prevent cold-boot attacks or heap/stack leaks. */
+    vpn_secure_cleanup(tmp_key, CRYPTO_KEY_SIZE);
+    
+    log_info("[ SUCCESS ]: Key generated and locked in '%s' (Mode: 0600).", key_file);
+    log_info("Keep this file offline. Compromise of this file compromises the entire tunnel.");
+    exit(EXIT_SUCCESS);
+
+cleanup_fail:
+    vpn_secure_cleanup(tmp_key, CRYPTO_KEY_SIZE);
+    exit(EXIT_FAILURE);
+}
+
+/**
  * @brief Periodic maintenance orchestrator for session lifecycle management.
  * @details 
  * This function implements the policy layer:

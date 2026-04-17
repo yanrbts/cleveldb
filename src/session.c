@@ -104,7 +104,7 @@ void vpn_session_update(uint32_t v_ip, uint32_t s_id, const struct sockaddr_in *
             s->virtual_ip = v_ip;
             s->session_id = s_id;
 
-            vfast_rekey_init(&s->sec_ctx); // Initialize security context for this session
+            vfast_rekey_init(&s->sec_ctx, s_id); // Initialize security context for this session
 
             HASH_ADD(hh_ip, g_shards[idx].ip_table, virtual_ip, sizeof(uint32_t), s);
             HASH_ADD(hh_sid, g_shards[idx].sid_table, session_id, sizeof(uint32_t), s);
@@ -277,7 +277,7 @@ bool vpn_lookup_session_by_ip(uint32_t vip, vpn_session_t **outs) {
     HASH_FIND(hh_ip, g_shards[idx].ip_table, &vip, sizeof(uint32_t), s);
     pthread_rwlock_unlock(&g_shards[idx].lock);
     *outs = s;
-    
+
     return s != NULL;
 }
 

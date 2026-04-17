@@ -26,9 +26,10 @@ static int vfast_crypto_fill_random(void *buf, size_t len) {
     return 0;
 }
 
-void vfast_rekey_init(vfast_sec_ctx_t *ctx) {
+void vfast_rekey_init(vfast_sec_ctx_t *ctx, uint32_t sid) {
     memset(ctx, 0, sizeof(vfast_sec_ctx_t));
-    
+    ctx->sid = sid;
+
     if (vfast_crypto_fill_random(ctx->active_key.raw, REKEY_KEY_SIZE) == 0) {
         ctx->active_key.id = 1;
         ctx->active_key.created_at = time(NULL);

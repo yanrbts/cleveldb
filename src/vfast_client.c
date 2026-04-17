@@ -39,6 +39,7 @@ struct vfast_client {
     pthread_t           rekey_tid;
     _Atomic (vfast_sec_ctx_t *) active_ptr;
     vfast_sec_ctx_t     sec_ctxs[2];
+    vfast_fsm_t         fsm;
 } vfclient;
 
 /**
@@ -81,7 +82,7 @@ static void vfast_cleanup() {
  */
 static inline int client_handle_data(vfast_io_t *io, uint8_t *data, int len) {
     /* Silently drop data packets if the FSM is not in CONNECTED state */
-    if (unlikely(!vfast_fsm_is_connected())) {
+    if (unlikely(!vfast_fsm_is_connected(&vfclient.fsm))) {
         return 0; 
     }
 
@@ -98,9 +99,9 @@ static inline int client_handle_data(vfast_io_t *io, uint8_t *data, int len) {
     }
 
     /* Verify Session ID to prevent cross-talk or stale session data */
-    if (unlikely(recv_sid != client_fsm.sid)) {
+    if (unlikely(recv_sid != vfclient.fsm.sid)) {
         log_warn("Ingress: SID mismatch (Expected: 0x%08x, Got: 0x%08x)", 
-                 client_fsm.sid, recv_sid);
+                 vfclient.fsm.sid, recv_sid);
         return 0;
     }
 
@@ -117,7 +118,7 @@ static inline int client_handle_hello(vfast_io_t *io, uint8_t *data, int len) {
     UNUSED(len);
 
     /* State Lock: ignore subsequent HELLO if already established */
-    if (vfast_fsm_is_connected()) {
+    if (vfast_fsm_is_connected(&vfclient.fsm)) {
         return 0; 
     }
 
@@ -132,17 +133,18 @@ static inline int client_handle_hello(vfast_io_t *io, uint8_t *data, int len) {
     }
 
     /* Persist session parameters */
-    client_fsm.sid = new_sid;
-    client_fsm.vip = auth->vip;
+    vfclient.fsm.sid = new_sid;
+    vfclient.fsm.vip = auth->vip;
 
     vfast_sec_ctx_t *ctx = atomic_load(&vfclient.active_ptr);
     memcpy(ctx->active_key.raw, auth->init_key, REKEY_KEY_SIZE);
     ctx->active_key.id = auth->key_id;
     ctx->active_key.created_at = time(NULL);
+    ctx->sid = new_sid;
     atomic_store(&ctx->active_key.bytes_processed, 0);
     atomic_store(&ctx->rekey_pending, false);
 
-    client_fsm.sec = ctx;
+    vfclient.fsm.sec = ctx;
     /* Convert Virtual IP to string for system configuration */
     char ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &auth->vip, ip_str, sizeof(ip_str));
@@ -152,9 +154,9 @@ static inline int client_handle_hello(vfast_io_t *io, uint8_t *data, int len) {
      * ST_CONNECTED only if the system call succeeds.
      */
     if (vpn_tun_set_ip(vfclient.tun.name, ip_str, VFAST_BROADCAST) == 0) {
-        atomic_store(&client_fsm.state, ST_CONNECTED);
+        atomic_store(&vfclient.fsm.state, ST_CONNECTED);
         log_info("Tunnel Successfully Established: VIP=%s, SID=0x%08x", 
-                 ip_str, client_fsm.sid);
+                 ip_str, vfclient.fsm.sid);
         return 0;
     } else {
         log_error("FSM: Failed to configure TUN interface %s with IP %s", 
@@ -204,9 +206,9 @@ void vfast_handle_new_key(void) {
      * Step 3: Synchronize FSM legacy pointer.
      * Keep the state machine's shortcut pointer in sync with the new buffer's memory.
      */
-    client_fsm.sec = next_buf;
+    vfclient.fsm.sec = next_buf;
 
-    log_info("REKEY: Atomic transition successful. Active KeyID: %u, FSM pointer synced.", 
+    log_info("REKEY: transition successful. Active KeyID: %u, FSM pointer synced.", 
              next_buf->active_key.id);
 }
 
@@ -272,7 +274,7 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
         hdr->msg_type == VPN_MSG_KEEPALIVE || 
         hdr->msg_type == VPN_MSG_HELLO ||
         hdr->msg_type == VPN_DPD_REQUEST) {
-        vfast_fsm_update();
+        vfast_fsm_update(&vfclient.fsm);
     }
 
     switch (hdr->msg_type) {
@@ -312,7 +314,7 @@ int client_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     UNUSED(arg);
     
     /* 1. Connection Check: Drop packets if not authenticated */
-    if (unlikely(!vfast_fsm_is_connected())) {
+    if (unlikely(!vfast_fsm_is_connected(&vfclient.fsm))) {
         return 0;
     }
     /* Get the active context instantly via atomic pointer */
@@ -333,10 +335,10 @@ int client_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
                              len, 
                              BUF_SIZE, 
                              VPN_MSG_DATA, 
-                             client_fsm.sid);
+                             vfclient.fsm.sid);
 
     if (unlikely(total_len < 0)) {
-        log_error("Failed to pack TUN packet for SID: 0x%08x", client_fsm.sid);
+        log_error("Failed to pack TUN packet for SID: 0x%08x", vfclient.fsm.sid);
         return -1;
     }
 
@@ -346,7 +348,7 @@ int client_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
                        OP_UDP_SEND, 
                        vfast_packet_base, 
                        total_len, 
-                       &client_fsm.dst_addr);
+                       &vfclient.fsm.dst_addr);
 
     return 0;
 }
@@ -355,7 +357,7 @@ static int vfast_init_secctx() {
     memset(&vfclient.sec_ctxs[0], 0, sizeof(vfast_sec_ctx_t));
     memset(&vfclient.sec_ctxs[1], 0, sizeof(vfast_sec_ctx_t));
 
-    vfast_rekey_init(&vfclient.sec_ctxs[0]);
+    vfast_rekey_init(&vfclient.sec_ctxs[0], 0);
 
     atomic_init(&vfclient.active_ptr, &vfclient.sec_ctxs[0]);
 
@@ -366,10 +368,6 @@ static int vfast_init_secctx() {
 /**
  * @brief Rekey Management Thread - 100% Lock-Free Implementation.
  * Uses atomic pointer swapping to ensure zero contention with the data plane.
- */
-/**
- * @brief Rekey Management Thread - Lock-Free Lifecycle Control.
- * 100% decoupling between control plane and data plane.
  */
 static void* vfast_rekey_mgmt(void *arg) {
     vfast_io_t *io = (vfast_io_t *)arg;
@@ -382,12 +380,12 @@ static void* vfast_rekey_mgmt(void *arg) {
         /* High-level polling interval: 1s is sufficient for key management */
         sleep(1);
 
-        if (unlikely(!vfast_fsm_is_connected())) continue;
+        if (unlikely(!vfast_fsm_is_connected(&vfclient.fsm))) continue;
 
         /* [Atomic] Load the current pointer used by data plane */
         vfast_sec_ctx_t *ctx = atomic_load(&vfclient.active_ptr);
         
-        /* * [Industrial Logic] 
+        /* 
          * We don't call vfast_rekey_needed() directly because we need 
          * atomic-safe reading of 'bytes_processed' and 'rekey_pending'.
          */
@@ -417,7 +415,7 @@ static void* vfast_rekey_mgmt(void *arg) {
             /* Phase 2: Transmission */
             vfast_task_t *task = vfast_borrow_task(io);
             if (task) {
-                vpn_fill_header(task->buf, VPN_MSG_REKEY_REQ, client_fsm.sid, ctx->next_key.id);
+                vpn_fill_header(task->buf, VPN_MSG_REKEY_REQ, vfclient.fsm.sid, ctx->next_key.id);
 
                 /* Key payload: [ID: 4B][Key: 32B] */
                 uint8_t *payload = task->buf + sizeof(vpn_tunnel_hdr_t);
@@ -428,7 +426,7 @@ static void* vfast_rekey_mgmt(void *arg) {
                 /* Async submission to io_uring */
                 vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, task->buf, 
                                    sizeof(vpn_tunnel_hdr_t) + 4 + REKEY_KEY_SIZE, 
-                                   &client_fsm.dst_addr);
+                                   &vfclient.fsm.dst_addr);
                 
                 last_sent = now;
                 if (should_retry && retry_interval < 32) retry_interval *= 2;
@@ -558,6 +556,7 @@ int main(int argc, char *argv[]) {
     }
 
     vfast_fsm_init(
+        &vfclient.fsm,
         &vfclient.io,
         vfclient.opt.remote_host, 
         vfclient.opt.remote_port, 
@@ -572,7 +571,7 @@ int main(int argc, char *argv[]) {
 
     vfast_io_run(&vfclient.io);
 
-    vfast_fsm_pthread_join();
+    vfast_fsm_pthread_join(&vfclient.fsm);
     vfast_cleanup();
     return EXIT_SUCCESS;
 }

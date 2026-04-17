@@ -30,12 +30,12 @@ typedef struct {
     vfast_key_t active_key;    /* Current key for encryption/decryption */
     vfast_key_t previous_key;  /* Grace period key for delayed packets */
     vfast_key_t next_key;      /* Negotiated key waiting for activation */
-    uint32_t    session_id;
+    uint32_t    sid;
     atomic_bool rekey_pending;    /* Handshake in progress */
 } vfast_sec_ctx_t;
 
 /* Function prototypes */
-void vfast_rekey_init(vfast_sec_ctx_t *ctx);
+void vfast_rekey_init(vfast_sec_ctx_t *ctx, uint32_t sid);
 bool vfast_rekey_needed(vfast_sec_ctx_t *ctx);
 int vfast_rekey_prepare_next(vfast_sec_ctx_t *ctx);
 void vfast_rekey_commit(vfast_sec_ctx_t *ctx);

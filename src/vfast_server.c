@@ -83,53 +83,6 @@ static void signal_handler(int sig) {
 }
 
 /**
- * @brief Command: --keygen
- * Generates a 256-bit key and saves it to 'vfast.key' with restricted permissions.
- */
-static void vfast_cmd_keygen(void) {
-    uint8_t tmp_key[CRYPTO_KEY_SIZE];
-    const char *key_file = "vfast.key";
-    
-    log_info("[ VFAST ] Generating industrial strength key...\n");
-
-    // 1. 获取系统随机数
-    if (vpn_generate_key(tmp_key) != 0) {
-        log_error("FATAL: Could not gather enough entropy from system.\n");
-        exit(1);
-    }
-
-    // 2. 打开文件。使用 O_EXCL 确保如果文件已存在则报错，防止意外覆盖旧密钥
-    // S_IRUSR | S_IWUSR 设置权限为 0600 (仅所有者可读写)
-    int fd = open(key_file, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
-    if (fd < 0) {
-        if (errno == EEXIST) {
-            log_error("ERROR: '%s' already exists. Refusing to overwrite.\n", key_file);
-        } else {
-            log_error("ERROR: Failed to create key file: %s\n", strerror(errno));
-        }
-        vpn_secure_cleanup(tmp_key, CRYPTO_KEY_SIZE);
-        exit(1);
-    }
-
-    // 3. 将 32 字节二进制密钥写入文件
-    ssize_t n = write(fd, tmp_key, CRYPTO_KEY_SIZE);
-    close(fd);
-
-    if (n != CRYPTO_KEY_SIZE) {
-        log_error("ERROR: Partial write to key file. Disk full?\n");
-        unlink(key_file); // 删除损坏的不完整文件
-        exit(1);
-    }
-
-    // 4. 清理并退出
-    vpn_secure_cleanup(tmp_key, CRYPTO_KEY_SIZE);
-    
-    log_info("[ SUCCESS ]: Key securely saved to '%s' (Permissions: 0600).\n", key_file);
-    log_info("Keep this file safe. Loss of this file means loss of access.\n");
-    exit(0);
-}
-
-/**
  * @brief Processes HELLO packet and submits an asynchronous response.
  * Optimization Highlights:
  * 1. Zero-copy Response Construction: Invokes vfast_auth_pack directly on the 
