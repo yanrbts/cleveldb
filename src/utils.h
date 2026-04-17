@@ -15,5 +15,6 @@
 int vpn_set_nonblocking(int fd);
 const char *vpn_get_absolute_path(char *filename);
 uint64_t vpn_now_ms(void);
-
+int ip_pton(const char *ip_str, uint32_t *out_ip);
+int ip_ntop(uint32_t ip_bin, char *out_str, size_t size);
 #endif

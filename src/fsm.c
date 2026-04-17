@@ -55,7 +55,7 @@ static void fsm_send_pkt(vfast_fsm_t *fsm, uint8_t type) {
                              sizeof(vpn_auth_t),   /* Payload length */
                              BUF_SIZE,             /* Buffer capacity */
                              VPN_MSG_HELLO,        /* Message type */
-                             0);                   /* Session ID (N/A) */
+                             fsm->sid);                   /* Session ID (N/A) */
     } else if (type == VPN_MSG_KEEPALIVE) {
         /**
          * ESTABLISHED PHASE:
@@ -147,6 +147,10 @@ int vfast_fsm_init(vfast_fsm_t *fsm, vfast_io_t *io, const char *sip, uint16_t s
     memset(fsm, 0, sizeof(vfast_fsm_t));
     fsm->io = io;
     fsm->server_port = sport;
+    fsm->sec = NULL; 
+    fsm->sid = 0;
+    fsm->running = running;
+    fsm->key = key;
     strncpy(fsm->server_ip, sip, sizeof(fsm->server_ip) - 1);
     
     /* Pre-calculate sockaddr_in for io_uring performance */
@@ -156,9 +160,7 @@ int vfast_fsm_init(vfast_fsm_t *fsm, vfast_io_t *io, const char *sip, uint16_t s
     
     atomic_store(&fsm->last_rx_time, time(NULL));
     atomic_store(&fsm->state, ST_IDLE);
-    fsm->running = running;
-    fsm->key = key;
-
+    
     return pthread_create(&fsm->thread_id, NULL, fsm_worker, (void *)fsm);
 }
 

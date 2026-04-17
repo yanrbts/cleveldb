@@ -16,7 +16,7 @@
 #include <stdatomic.h>
 
 #define REKEY_KEY_SIZE          32
-#define REKEY_TIMEOUT_SEC       60            /* 1 hour */
+#define REKEY_TIMEOUT_SEC       300            /* 1 hour */
 #define REKEY_DATA_THRESHOLD    (1ULL << 30)    /* 1GB */
 
 typedef struct {

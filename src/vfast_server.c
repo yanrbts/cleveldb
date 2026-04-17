@@ -109,7 +109,7 @@ static bool vfast_auth_request(vfast_io_t *io, int res, uint8_t *buf, struct soc
     }
 
     /* 2. Direct pointer mapping (Zero-copy) */
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
+    // vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
     vpn_auth_t *auth_ptr  = (vpn_auth_t *)(buf + head_size);
 
     /* 3. Authentication: Validate client token using existing logic */
@@ -132,21 +132,20 @@ static bool vfast_auth_request(vfast_io_t *io, int res, uint8_t *buf, struct soc
     vpn_session_update(assigned_vip, new_sid, src);
 
     /* 6. Response Construction: Reuse the same buffer for Egress (Zero-copy) */
-    
-    
-
     vpn_session_t *s = NULL;
     if (!vpn_lookup_session_by_sid(new_sid, &s)) {
         log_error("Unexpected error: Session not found after creation for SID[0x%08x]", new_sid);
         return false;
     }
 
-    /* Update Header Fields */
-    hdr->version    = VFAST_VERSION;
-    hdr->msg_type   = VPN_MSG_HELLO; 
-    hdr->session_id = htonl(new_sid); // Ensure Network Byte Order
-    hdr->flags      = 0;
-    hdr->key_id     = 0; 
+    // /* Update Header Fields */
+    // hdr->version    = VFAST_VERSION;
+    // hdr->msg_type   = VPN_MSG_HELLO; 
+    // hdr->session_id = htonl(new_sid); // Ensure Network Byte Order
+    // hdr->flags      = 0;
+    // hdr->key_id     = s->sec_ctx.active_key.id; // Include Key ID for client reference
+
+    vpn_fill_header(buf, VPN_MSG_HELLO, new_sid, s->sec_ctx.active_key.id);
 
     /* 7. Optimized Packing:
      * Directly pack response data into the task buffer.
@@ -387,6 +386,8 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
         log_warn("No session found for SID[0x%08x] from %s. Packet dropped.", sid, inet_ntoa(src->sin_addr));
         return 0;
     }
+
+    atomic_fetch_add(&s->sec_ctx.active_key.bytes_processed, (long)len);
     
     /* 3. Dispatch based on message type */
     switch (hdr->msg_type) {

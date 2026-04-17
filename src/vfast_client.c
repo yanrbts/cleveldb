@@ -31,12 +31,23 @@
 #include "key.h"
 #include "vfast.h"
 
+typedef struct {
+    time_t   last_sent;
+    int      retry_interval;
+    uint32_t poll_ms;
+} vfast_rekey_mgr_t;
+
+static vfast_rekey_mgr_t g_rekey_mgr = {
+    .last_sent = 0,
+    .retry_interval = 2,
+    .poll_ms = 1000
+};
+
 struct vfast_client {
     vpn_option_t        opt;
     vfast_io_t          io;
     udp_conn_t         *udp;       /* UDP transport handle */
     vpn_tun_ctx_t       tun;       /* Virtual network interface */
-    pthread_t           rekey_tid;
     _Atomic (vfast_sec_ctx_t *) active_ptr;
     vfast_sec_ctx_t     sec_ctxs[2];
     vfast_fsm_t         fsm;
@@ -63,15 +74,11 @@ static void client_signal_handler(int sig) {
  */
 static void vfast_cleanup() {
     log_info("Initiating system shutdown and resource cleanup...");
-
-    pthread_join(vfclient.rekey_tid, NULL);
     
     vpn_tun_destroy(&vfclient.tun);
-    
     if (vfclient.udp) {
         udp_close(vfclient.udp);
     }
-    
     vpn_option_clean(&vfclient.opt);
 
     log_info("Cleanup complete. Exit.");
@@ -133,9 +140,6 @@ static inline int client_handle_hello(vfast_io_t *io, uint8_t *data, int len) {
     }
 
     /* Persist session parameters */
-    vfclient.fsm.sid = new_sid;
-    vfclient.fsm.vip = auth->vip;
-
     vfast_sec_ctx_t *ctx = atomic_load(&vfclient.active_ptr);
     memcpy(ctx->active_key.raw, auth->init_key, REKEY_KEY_SIZE);
     ctx->active_key.id = auth->key_id;
@@ -144,11 +148,13 @@ static inline int client_handle_hello(vfast_io_t *io, uint8_t *data, int len) {
     atomic_store(&ctx->active_key.bytes_processed, 0);
     atomic_store(&ctx->rekey_pending, false);
 
+    vfclient.fsm.sid = new_sid;
+    vfclient.fsm.vip = auth->vip;
     vfclient.fsm.sec = ctx;
+
     /* Convert Virtual IP to string for system configuration */
     char ip_str[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &auth->vip, ip_str, sizeof(ip_str));
-    
+    ip_ntop(auth->vip, ip_str, sizeof(ip_str));
     /**
      * Synchronous Interface Configuration: transition to 
      * ST_CONNECTED only if the system call succeeds.
@@ -263,8 +269,6 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
 
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
 
-    // vpn_debug_print_hdr(data, len);
-
     /**
      * 2. Heartbeat Watchdog Update
      * Only update the last receive timestamp for valid protocol message types.
@@ -366,81 +370,79 @@ static int vfast_init_secctx() {
 }
 
 /**
- * @brief Rekey Management Thread - 100% Lock-Free Implementation.
- * Uses atomic pointer swapping to ensure zero contention with the data plane.
+ * @brief Professional Rekey Decision Engine (Event-driven)
+ * This callback executes within the IO thread context.
  */
-static void* vfast_rekey_mgmt(void *arg) {
-    vfast_io_t *io = (vfast_io_t *)arg;
-    time_t last_sent = 0;
-    int retry_interval = 2;
+static void vfast_rekey_timer_handler(vfast_io_t *io, void *arg) {
+    vfast_rekey_mgr_t *mgr = (vfast_rekey_mgr_t *)arg;
+    
+    /* Security Check: FSM state validation */
+    if (unlikely(!vfast_fsm_is_connected(&vfclient.fsm))) {
+        goto reschedule;
+    }
 
-    log_info("Rekey Manager: Lock-free monitoring active.");
+    /* Load Security Context (Atomic) */
+    vfast_sec_ctx_t *ctx = atomic_load(&vfclient.active_ptr);
+    if (unlikely(!ctx)) return;
 
-    while (atomic_load(&io->running)) {
-        /* High-level polling interval: 1s is sufficient for key management */
-        sleep(1);
+    uint64_t processed = atomic_load(&ctx->active_key.bytes_processed);
+    bool pending       = atomic_load(&ctx->rekey_pending);
+    time_t now         = time(NULL);
 
-        if (unlikely(!vfast_fsm_is_connected(&vfclient.fsm))) continue;
+    /* Evaluation Logic */
+    bool expired = (now - ctx->active_key.created_at >= REKEY_TIMEOUT_SEC);
+    bool full    = (processed >= REKEY_DATA_THRESHOLD);
+    
+    bool should_init   = (!pending && (expired || full));
+    bool should_retry  = (pending && (now - mgr->last_sent >= mgr->retry_interval));
 
-        /* [Atomic] Load the current pointer used by data plane */
-        vfast_sec_ctx_t *ctx = atomic_load(&vfclient.active_ptr);
-        
-        /* 
-         * We don't call vfast_rekey_needed() directly because we need 
-         * atomic-safe reading of 'bytes_processed' and 'rekey_pending'.
-         */
-        uint64_t processed = atomic_load(&ctx->active_key.bytes_processed);
-        bool pending   = atomic_load(&ctx->rekey_pending);
-        time_t now     = time(NULL);
+    if (should_init || should_retry) {
+        if (should_init) {
+            /* Generate new key material if this is a fresh request */
+            if (vfast_rekey_prepare_next(ctx) != 0) {
+                log_error("REKEY: Crypto entropy failure.");
+                goto reschedule;
+            }
+            mgr->retry_interval = 2; /* Reset exponential backoff */
+        }
 
-        /* Determine if it's time to act */
-        bool threshold_hit = (processed >= REKEY_DATA_THRESHOLD) || 
-                             ((now - ctx->active_key.created_at) >= REKEY_TIMEOUT_SEC);
-        
-        bool should_init  = (!pending && threshold_hit);
-        bool should_retry = (pending && (now - last_sent >= retry_interval));
+        /* Buffer Management: Borrow a task object from the IO ring */
+        vfast_task_t *task = vfast_borrow_task(io);
+        if (likely(task)) {
+            /* Header construction using precise sizeof to avoid alignment issues */
+            vpn_fill_header(task->buf, VPN_MSG_REKEY_REQ, vfclient.fsm.sid, ctx->next_key.id);
 
-        if (should_init || should_retry) {
-            /* Phase 1: Preparation 
-             * Only the MGMT thread writes to next_key, so no mutex needed.
-             */
-            if (should_init) {
-                if (vfast_rekey_prepare_next(ctx) != 0) {
-                    log_error("REKEY: Crypto failure during preparation.");
-                    continue;
-                }
-                retry_interval = 2; // Reset backoff
+            /* Payload: [NewKeyID: 4B][RawKey: 32B] */
+            uint8_t *payload = task->buf + sizeof(vpn_tunnel_hdr_t);
+            uint32_t net_kid = htonl(ctx->next_key.id);
+            memcpy(payload, &net_kid, 4);
+            memcpy(payload + 4, ctx->next_key.raw, REKEY_KEY_SIZE);
+
+            /* Dispatch to io_uring SQE */
+            vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, task->buf, 
+                               sizeof(vpn_tunnel_hdr_t) + 4 + REKEY_KEY_SIZE, 
+                               &vfclient.fsm.dst_addr);
+            
+            mgr->last_sent = now;
+
+            /* Exponential Backoff for retries (Max 32s) */
+            if (should_retry && mgr->retry_interval < 32) {
+                mgr->retry_interval *= 2;
             }
 
-            /* Phase 2: Transmission */
-            vfast_task_t *task = vfast_borrow_task(io);
-            if (task) {
-                vpn_fill_header(task->buf, VPN_MSG_REKEY_REQ, vfclient.fsm.sid, ctx->next_key.id);
-
-                /* Key payload: [ID: 4B][Key: 32B] */
-                uint8_t *payload = task->buf + sizeof(vpn_tunnel_hdr_t);
-                uint32_t net_kid = htonl(ctx->next_key.id);
-                memcpy(payload, &net_kid, 4);
-                memcpy(payload + 4, ctx->next_key.raw, REKEY_KEY_SIZE);
-
-                /* Async submission to io_uring */
-                vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, task->buf, 
-                                   sizeof(vpn_tunnel_hdr_t) + 4 + REKEY_KEY_SIZE, 
-                                   &vfclient.fsm.dst_addr);
-                
-                last_sent = now;
-                if (should_retry && retry_interval < 32) retry_interval *= 2;
-
-                log_info("REKEY (%s) ID: %u, Progress: %.2f%% (%ldB / %lldB)", 
-                    should_init ? "INIT" : "RETRY", 
-                    ctx->next_key.id, 
-                    (double)processed / REKEY_DATA_THRESHOLD * 100.0, 
-                    processed, 
-                    REKEY_DATA_THRESHOLD);
-            }
+            log_info("REKEY [%s] ID:%u | Trigger: %s | Progress: %.2f%%", 
+                     should_init ? "INIT" : "RETRY", 
+                     ctx->next_key.id,
+                     expired ? "TIME" : "DATA",
+                     (double)processed / REKEY_DATA_THRESHOLD * 100.0);
         }
     }
-    return NULL;
+
+reschedule:
+    /* Professional design: If the timer is not multishot, 
+     * the infrastructure handles the interval. 
+     * Here we just ensure the manager knows it's still alive. */
+    return;
 }
 
 /**
@@ -487,6 +489,8 @@ static int vfast_init_client() {
         vfclient.opt.io_ring_depth, 
         ops
     );
+
+    vfast_io_set_timer(&vfclient.io, g_rekey_mgr.poll_ms, vfast_rekey_timer_handler, &g_rekey_mgr);
 
     log_info("VFAST Client initialized successfully. Connecting to %s...", vfclient.opt.remote_host);
     return 0;
@@ -563,11 +567,6 @@ int main(int argc, char *argv[]) {
         &vfclient.io.running,
         vfclient.opt.master_key
     );
-
-    if (pthread_create(&vfclient.rekey_tid, NULL, vfast_rekey_mgmt, &vfclient.io) != 0) {
-        log_error("Failed to create rekey thread.");
-        return -1;
-    }
 
     vfast_io_run(&vfclient.io);
 

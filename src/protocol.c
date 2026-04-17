@@ -151,36 +151,6 @@ uint8_t* vpn_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int res, int *out_
 }
 
 /**
- * @brief Encapsulates the tunnel header with protocol-specific metadata.
- * * In high-performance asynchronous I/O (like io_uring), packets may remain 
- * in the kernel queue during a rekeying event. Including the 'kid' (Key ID) 
- * in every header allows the receiver to perform a "Lockless Key Lookup," 
- * matching the packet to either the 'Active' or 'Previous' key accurately.
- *
- * @param buf  Pointer to the start of the transmission buffer.
- * @param type The message type (e.g., VPN_MSG_DATA, VPN_MSG_KEEPALIVE).
- * @param sid  The Session ID assigned during the HELLO exchange.
- * @param kid  The Key ID currently active in the security context.
- */
-void vpn_fill_header(void *buf, uint8_t type, uint32_t sid, uint32_t kid) {
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
-
-    hdr->version  = VPN_VERSION;
-    hdr->msg_type = type;
-
-    /**
-     * Store the truncated Key ID. 
-     * Using (kid & 0xFF) allows the receiver to distinguish between 
-     * consecutive rekeying generations (e.g., Gen 2 vs Gen 3).
-     */
-    hdr->key_id   = (uint8_t)(kid & 0xFF);
-    hdr->flags    = 0;
-    hdr->session_id = (type == VPN_MSG_HELLO) ? 0 : htonl(sid);
-}
-
-
-
-/**
  * @brief Diagnostic tool to inspect the VPN Tunnel Header and raw memory.
  * * Use this to identify alignment shifts or endianness issues.
  */
