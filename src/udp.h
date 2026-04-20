@@ -109,6 +109,13 @@ int udp_set_connect(udp_conn_t *conn, uint32_t dst_ip_n, uint16_t dst_port);
 int udp_reset_connect(udp_conn_t *conn);
 
 /**
+ * @brief Configures Path MTU Discovery (PMTUD) behavior on the UDP socket.
+ * Enabling PMTUD allows the socket to receive ICMP "Fragmentation Needed"
+ * messages, which can be used to dynamically adjust the MTU for optimal performance.   
+ */
+int udp_set_mtu_discovery(udp_conn_t *conn, int enable);
+
+/**
  * @brief Initializes a Link-Layer Raw Socket (AF_PACKET).
  * Creates a raw socket bound to a specific network interface. This allows
  * sending and receiving packets at the Ethernet layer.

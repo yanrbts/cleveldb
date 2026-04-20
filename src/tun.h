@@ -24,7 +24,8 @@ int vpn_tun_set_ip(const char *dev_name, const char *ip_addr, const char *netmas
  * @param mtu Desired MTU value.
  * @return 0 on success, or -errno on failure.
  */
-int vpn_tun_set_mtu(const char *dev_name, int mtu);
+int vpn_tun_set_mtu_by_name(const char *dev_name, int mtu);
+int vfast_tun_set_mtu_by_fd(int tun_fd, int mtu);
 void vpn_tun_disable_ipv6(const char *dev_name);
 
 #endif

@@ -10,13 +10,18 @@
 #include <string.h>
 #include <net/if.h>
 #include <signal.h>
-#include <linux/ip.h>
+// #include <linux/ip.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <linux/errqueue.h>
+#include <netinet/ip_icmp.h>
+#include <netinet/icmp6.h>
+
 #include "utils.h"
 #include "log.h"
 #include "session.h"
 #include "protocol.h"
+#include "tun.h"
 #include "vfast.h"
 
 /**
@@ -197,5 +202,17 @@ void vfast_server_maintenance(vfast_io_t *io, void *data) {
                       node->session_id, inet_ntoa(node->remote_addr.sin_addr), 
                       ntohs(node->remote_addr.sin_port));
         }
+    }
+}
+
+void vfast_path_mtu_updated(uint32_t new_mtu, void *arg) {
+    if (!!arg) return;
+
+    vfast_io_t *io = (vfast_io_t *)arg;
+
+    if (vfast_tun_set_mtu_by_fd(io->tun_fd, new_mtu) != 0) {
+        log_error("Failed to update TUN MTU to %u: %s", new_mtu, strerror(errno));
+    } else {
+        log_info("TUN MTU successfully updated to %u bytes", new_mtu);
     }
 }

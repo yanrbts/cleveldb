@@ -607,6 +607,9 @@ static int vfast_init_server(void) {
         ops
     );
 
+    vfast_io_set_timer(&vfserver.io, 5000, vfast_server_maintenance, &vfserver.ip_pool);
+    vfast_io_set_pmtud_callback(&vfserver.io, vfast_path_mtu_updated, &vfserver.io);
+
     return 0;
 
 cleanup:
@@ -679,7 +682,6 @@ int main(int argc, char *argv[]) {
 
     log_info("VFAST server is up and running on port %d. Press Ctrl+C to stop.", vfserver.opt.local_port);
 
-    vfast_io_set_timer(&vfserver.io, 5000, vfast_server_maintenance, &vfserver.ip_pool);
     vfast_io_run(&vfserver.io);
 
     vfast_clean_server();

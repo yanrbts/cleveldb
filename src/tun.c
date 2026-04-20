@@ -264,7 +264,7 @@ void vpn_tun_destroy(vpn_tun_ctx_t *ctx) {
  * @param mtu Desired MTU value.
  * @return 0 on success, -errno on failure.
  */
-int vpn_tun_set_mtu(const char *dev_name, int mtu) {
+int vpn_tun_set_mtu_by_name(const char *dev_name, int mtu) {
     /* Parameter Validation: RFC 791 requires minimum IPv4 MTU of 68 */
     if (!dev_name || mtu < 68) {
         return -EINVAL;
@@ -295,6 +295,61 @@ int vpn_tun_set_mtu(const char *dev_name, int mtu) {
     close(sockfd);
 
     return result;
+}
+
+/**
+ * @brief Sets the MTU of a TUN/TAP interface using only its file descriptor.
+ * * INDUSTRIAL STANDARDS:
+ * 1. Automatic Name Resolution: Uses TUNGETIFF to fetch the interface name 
+ * directly from the kernel to avoid out-of-sync naming issues.
+ * 2. Socket Management: Opens a temporary dummy socket for the ioctl call
+ * to ensure clean separation from the character device FD.
+ * 3. Validation: Checks for negative MTU values and ensures the FD is valid.
+ * @param tun_fd The open file descriptor for the /dev/net/tun device.
+ * @param mtu The target MTU value (e.g., 1400).
+ * @return 0 on success, -1 on failure with errno set.
+ */
+int vfast_tun_set_mtu_by_fd(int tun_fd, int mtu) {
+    if (tun_fd < 0 || mtu <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+
+    /* 1. Retrieve the interface name associated with the FD.
+     * This is safer than passing the name string as a parameter because
+     * it ensures we are acting on the correct device.
+     */
+    if (ioctl(tun_fd, TUNGETIFF, (void *)&ifr) < 0) {
+        // log_error("TUN_MTU: Failed to get interface name: %s", strerror(errno));
+        return -1;
+    }
+
+    /* 2. Set the desired MTU value in the ifreq structure. */
+    ifr.ifr_mtu = mtu;
+
+    /* 3. We need a temporary socket to perform network interface ioctls.
+     * The tun_fd itself is a character device FD, which does not support
+     * SIOCSIFMTU on all kernel versions. Using a dummy socket is the standard.
+     */
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        return -1;
+    }
+
+    /* 4. Perform the actual 'Set Interface MTU' ioctl. */
+    if (ioctl(sockfd, SIOCSIFMTU, (void *)&ifr) < 0) {
+        int saved_errno = errno;
+        close(sockfd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    close(sockfd);
+    log_info("TUN_MTU: Successfully set %s MTU to %d", ifr.ifr_name, mtu);
+    return 0;
 }
 
 void vpn_tun_disable_ipv6(const char *dev_name) {

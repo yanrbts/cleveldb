@@ -16,6 +16,10 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <arpa/inet.h>
+#include <linux/errqueue.h>
+#include <netinet/ip_icmp.h>
+#include <netinet/icmp6.h>
+
 #include "protocol.h"
 #include "utils.h"
 #include "log.h"
@@ -71,6 +75,85 @@ static vfast_task_t* get_task_from_instance(vfast_io_t *io) {
 }
 
 /**
+ * @brief Professional Path MTU Discovery (PMTUD) Handler
+ * Optimized for memory alignment, dual-stack support, and kernel compliance.
+ */
+void vfast_check_icmp_errors(vfast_io_t *io, int udp_fd) {
+    if (unlikely(!io || udp_fd < 0)) return;
+
+    /* 1. Use a union to guarantee alignment for CMSG macros.
+     * CMSG_SPACE ensures sufficient padding for the structures.
+     */
+    union {
+        struct cmsghdr cm;
+        char buf[CMSG_SPACE(sizeof(struct sock_extended_err)) + 
+                 CMSG_SPACE(sizeof(struct sockaddr_in6))];
+    } cmsg_un;
+
+    struct iovec iov;
+    uint8_t dummy[1];
+    struct msghdr msg;
+    struct sockaddr_in6 target_addr;
+
+    /* Initialize persistent iov */
+    iov.iov_base = dummy;
+    iov.iov_len  = sizeof(dummy);
+
+    /* 2. The loop must reset control buffer lengths 
+     * because recvmsg() modifies msg_controllen on every call.
+     */
+    while (true) {
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_name       = &target_addr;
+        msg.msg_namelen    = sizeof(target_addr);
+        msg.msg_iov        = &iov;
+        msg.msg_iovlen     = 1;
+        msg.msg_control    = cmsg_un.buf;
+        msg.msg_controllen = sizeof(cmsg_un.buf);
+
+        ssize_t res = recvmsg(udp_fd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+        if (res < 0) {
+            /* EAGAIN/EWOULDBLOCK means the error queue is drained */
+            break; 
+        }
+
+        for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            bool is_v4_err = (cmsg->cmsg_level == IPPROTO_IP   && cmsg->cmsg_type == IP_RECVERR);
+            bool is_v6_err = (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_RECVERR);
+
+            if (is_v4_err || is_v6_err) {
+                struct sock_extended_err *ee = (struct sock_extended_err *)CMSG_DATA(cmsg);
+                uint32_t mtu = ee->ee_info;
+
+                /* Validate origin and type for PMTU Discovery */
+                bool is_icmp_mtu = false;
+
+                if (ee->ee_origin == SO_EE_ORIGIN_ICMP) {
+                    if (ee->ee_type == ICMP_DEST_UNREACH && ee->ee_code == ICMP_FRAG_NEEDED)
+                        is_icmp_mtu = true;
+                } else if (ee->ee_origin == SO_EE_ORIGIN_ICMP6) {
+                    if (ee->ee_type == ICMP6_PACKET_TOO_BIG)
+                        is_icmp_mtu = true;
+                } else if (ee->ee_origin == SO_EE_ORIGIN_LOCAL && ee->ee_errno == EMSGSIZE) {
+                    is_icmp_mtu = true;
+                }
+
+                if (is_icmp_mtu && mtu > 0) {
+                    /* Trigger Callback */
+                    if (io->pmtud_cb) {
+                        io->pmtud_cb(mtu, io->pmtud_arg);
+                    }
+
+                    const char *origin = (ee->ee_origin == SO_EE_ORIGIN_LOCAL) ? "LOCAL" : 
+                                         (is_v4_err ? "ICMPv4" : "ICMPv6");
+                    log_info("PMTUD: Path MTU identified as %u bytes via %s", mtu, origin);
+                }
+            }
+        }
+    }
+}
+
+/**
  * @brief Initializes the io_uring instance and registers fixed files.
  */
 int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, int pool_size, int io_ring_depth, vfast_ops_t ops) {
@@ -81,8 +164,19 @@ int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, int pool_size, int io_
     io->io_ring_depth = io_ring_depth;
 
     /* Initialize io_uring with default parameters */
-    io->task_pool = zcalloc(pool_size * sizeof(vfast_task_t));
-    if (!io->task_pool) return -1;
+    // io->task_pool = zcalloc(pool_size * sizeof(vfast_task_t));
+    // if (!io->task_pool) return -1;
+
+    /* MEMORY ALIGNMENT: 
+     * Fixed buffers require page-aligned memory for the kernel to effectively 
+     * pin the physical pages and map them into the async I/O context.
+     * _SC_PAGESIZE ensures the pool starts at a hardware-friendly boundary.
+     */
+    size_t pool_bytes = pool_size * sizeof(vfast_task_t);
+    if (posix_memalign((void**)&io->task_pool, sysconf(_SC_PAGESIZE), pool_bytes) != 0) {
+        return -1;
+    }
+    memset(io->task_pool, 0, pool_bytes);
 
     int ret = io_uring_queue_init(io_ring_depth, &io->ring, 0);
     if (ret < 0) {
@@ -90,7 +184,28 @@ int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, int pool_size, int io_
         return ret;
     }
 
-    /* Optimization: Register file descriptors to skip kernel file table lookups */
+    /* IORING_REGISTER_BUFFERS:
+     * By registering the entire task pool, we perform a one-time translation 
+     * from virtual to physical addresses. This eliminates the per-I/O overhead 
+     * of page mapping and pinning (get_user_pages).
+     * NOTE: This will fail if 'RLIMIT_MEMLOCK' is too low.
+     */
+    struct iovec iov = {
+        .iov_base = io->task_pool,
+        .iov_len  = pool_bytes
+    };
+    ret = io_uring_register_buffers(&io->ring, &iov, 1);
+    if (ret < 0) {
+        /* Fallback: Log warning but continue; fixed-buffer operations 
+         * will fail back to normal buffers or must be handled at the submission level. 
+         */
+        log_warn("io_uring_register_buffers failed: %s (Check MEMLOCK ulimit)", strerror(-ret));
+    }
+
+    /* IORING_REGISTER_FILES:
+     * Registers FDs to bypass the kernel's file table lookup for every I/O.
+     * This reduces lock contention on the process file descriptor table.
+     */
     int fds[2] = { udp_fd, tun_fd };
     ret = io_uring_register_files(&io->ring, fds, 2);
     if (ret < 0) {
@@ -345,6 +460,12 @@ void vfast_io_run(vfast_io_t *io) {
 
         /* --- TICK PROCESSING SECTION --- */
         uint64_t now = vpn_now_ms();
+
+        if (io->pmtud_cb && (now - io->last_pmtud_check_ms >= 1000)) {
+            vfast_check_icmp_errors(io, io->udp_fd);
+            io->last_pmtud_check_ms = now;
+        }
+
         if (io->timer_cb && io->timer_interval_ms > 0) {
             if (now - last_tick_ms >= io->timer_interval_ms) {
                 /* Execute injected business logic (e.g., Session Maintenance) */
@@ -466,5 +587,21 @@ void vfast_io_set_timer(vfast_io_t *io, uint32_t ms, on_timer_cb cb, void *arg) 
         log_info("IO: Timer registered at %u ms interval.", ms);
     } else {
         log_info("IO: Timer disabled.");
+    }
+}
+
+void vfast_io_set_pmtud_callback(vfast_io_t *io, on_pmtud_cb cb, void *arg) {
+    if (unlikely(!io)) {
+        return;
+    }
+
+    io->pmtud_cb = cb;
+    io->pmtud_arg = arg;
+    io->last_pmtud_check_ms = 0; /* Reset the last check timestamp */
+
+    if (cb) {
+        log_info("IO: PMTUD callback registered.");
+    } else {
+        log_info("IO: PMTUD callback disabled.");
     }
 }

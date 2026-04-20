@@ -15,6 +15,7 @@
 #include <sys/ioctl.h>      // For ioctl()
 #include <linux/if_packet.h>
 
+#include "utils.h"
 #include "log.h"
 #include "udp.h"
 
@@ -305,4 +306,63 @@ int udp_set_connect(udp_conn_t *conn, uint32_t dst_ip_n, uint16_t dst_port) {
 int udp_reset_connect(udp_conn_t *conn) {
     struct sockaddr_in unspec = { .sin_family = AF_UNSPEC };
     return connect(conn->fd, (const struct sockaddr *)&unspec, sizeof(unspec));
+}
+
+/**
+ * @brief Configures Path MTU Discovery and Error Queue for a UDP socket.
+ * * SECURITY & PERFORMANCE NOTES:
+ * 1. Uses IP_PMTUDISC_DO to strictly forbid fragmentation, forcing the stack 
+ * to report EMSGSIZE and capture ICMP "Fragmentation Needed" messages.
+ * 2. Dual-stack aware: Attempts to set both IPv4 and IPv6 options if applicable.
+ * 3. IP_RECVERR is essential for out-of-band error handling via MSG_ERRQUEUE.
+ *
+ * @param conn Pointer to the UDP connection structure.
+ * @param enable Boolean flag to toggle PMTUD.
+ * @return 0 on success, -1 on failure.
+ */
+int udp_set_mtu_discovery(udp_conn_t *conn, int enable) {
+    if (unlikely(!conn || conn->fd < 0)) return -1;
+
+    /* IP_PMTUDISC_DO: Set the DF (Don't Fragment) bit. 
+     * If the packet exceeds the MTU of any hop, the router drops it and 
+     * sends back an ICMP 'Datagram Too Big' message.
+     */
+    int mtu_disc = enable ? IP_PMTUDISC_DO : IP_PMTUDISC_DONT;
+    int err_on = enable ? 1 : 0;
+
+    /* Handle IPv4 PMTUD */
+    if (setsockopt(conn->fd, IPPROTO_IP, IP_MTU_DISCOVER, &mtu_disc, sizeof(mtu_disc)) < 0) {
+        /* We log as warning because some legacy kernels might restrict this */
+        log_warn("PMTUD: Failed to set IPv4 IP_MTU_DISCOVER: %s", strerror(errno));
+    }
+
+    /* Enable IPv4 extended error reporting */
+    if (setsockopt(conn->fd, IPPROTO_IP, IP_RECVERR, &err_on, sizeof(err_on)) < 0) {
+        log_error("PMTUD: Failed to enable IPv4 IP_RECVERR: %s", strerror(errno));
+        return -1;
+    }
+
+    /* Handle IPv6 PMTUD (RFC 8201)
+     * IPv6 does not support in-network fragmentation; PMTUD is mandatory.
+     * We set IPV6_MTU_DISCOVER to ensure consistent behavior across stacks.
+     */
+    int mtu_disc_v6 = enable ? IPV6_PMTUDISC_DO : IPV6_PMTUDISC_DONT;
+    
+    /* Attempt to set IPv6 options - ignore failure if socket is IPv4-only */
+    if (setsockopt(conn->fd, IPPROTO_IPV6, IPV6_MTU_DISCOVER, &mtu_disc_v6, sizeof(mtu_disc_v6)) < 0) {
+        if (errno != ENOPROTOOPT) {
+            log_debug("PMTUD: IPv6 MTU discovery not set (expected for IPv4 sockets).");
+        }
+    }
+
+    if (setsockopt(conn->fd, IPPROTO_IPV6, IPV6_RECVERR, &err_on, sizeof(err_on)) < 0) {
+        if (errno != ENOPROTOOPT) {
+            log_debug("PMTUD: IPv6 error queue not set.");
+        }
+    }
+
+    log_info("UDP_MTU: Discovery mechanism [%s] on port %u (IPv4/IPv6 Dual-Aware)", 
+             enable ? "STRICT_DO" : "OFF", conn->port);
+             
+    return 0;
 }

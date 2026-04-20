@@ -46,6 +46,7 @@ enum {
  */
 typedef int (*on_data_cb)(vfast_io_t *io, uint8_t *buf, int len, struct sockaddr_in *addr, void *arg);
 typedef void (*on_timer_cb)(vfast_io_t *io, void *arg);
+typedef void (*on_pmtud_cb)(uint32_t new_mtu, void *arg);
 
 /**
  * @brief Dispatch table for network event handling.
@@ -92,6 +93,10 @@ struct vfast_io {
     on_timer_cb         timer_cb;           /**< Optional timer callback for periodic tasks */  
     void               *timer_arg;          /**< User-defined argument for timer callback */
     uint32_t            timer_interval_ms;  /**< Timer interval in milliseconds */
+
+    on_pmtud_cb         pmtud_cb;          /**< Optional callback for PMTUD events */
+    void               *pmtud_arg;     
+    uint32_t            last_pmtud_check_ms;
 };
 
 /**
@@ -164,5 +169,17 @@ vfast_task_t* vfast_borrow_task(vfast_io_t *io);
  * @param arg      User-defined context passed back to the callback.
  */
 void vfast_io_set_timer(vfast_io_t *io, uint32_t ms, on_timer_cb cb, void *arg);
+
+/**
+ * @brief Configures a callback for Path MTU Discovery (PMTUD) events.
+ * @details 
+ * This allows the I/O engine to notify the business logic layer of changes in 
+ * the effective MTU, enabling dynamic adjustments to packet sizes or triggering
+ * session renegotiation as needed.
+ * @param io   Pointer to the initialized vfast_io_t context.
+ * @param cb   The callback function to execute when a PMTUD event is detected.
+ * @param arg  User-defined context passed back to the callback.
+ */
+void vfast_io_set_pmtud_callback(vfast_io_t *io, on_pmtud_cb cb, void *arg);
 
 #endif /* VFAST_CORE_H */

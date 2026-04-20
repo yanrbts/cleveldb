@@ -491,6 +491,7 @@ static int vfast_init_client() {
     );
 
     vfast_io_set_timer(&vfclient.io, g_rekey_mgr.poll_ms, vfast_rekey_timer_handler, &g_rekey_mgr);
+    vfast_io_set_pmtud_callback(&vfclient.io, vfast_path_mtu_updated, &vfclient.io);
 
     log_info("VFAST Client initialized successfully. Connecting to %s...", vfclient.opt.remote_host);
     return 0;
