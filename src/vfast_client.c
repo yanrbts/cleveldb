@@ -51,7 +51,23 @@ struct vfast_client {
     _Atomic (vfast_sec_ctx_t *) active_ptr;
     vfast_sec_ctx_t     sec_ctxs[2];
     vfast_fsm_t         fsm;
+    atomic_uint_fast32_t next_seq; /* Local counter for outbound packets */
 } vfclient;
+
+
+/**
+ * @brief Thread-safe sequence generator for the client.
+ * In the client-side, we use the global context's counter.
+ * @return uint32_t Next sequence in Network Byte Order.
+ */
+static uint32_t vfast_get_next_sequence(void) {
+    /* Atomically increment the global counter. 
+     * memory_order_relaxed is sufficient as it's just a counter. */
+    uint32_t seq = atomic_fetch_add_explicit(&vfclient.next_seq, 1, memory_order_relaxed);
+    
+    /* Convert to Network Byte Order (Big Endian) for wire transmission */
+    return htonl(seq);
+}
 
 /**
  * client_signal_handler - Graceful shutdown trigger.
@@ -267,6 +283,8 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
         return -1;
     }
 
+    vpn_inbound_process(vfast_data_to_task(data));
+
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
 
     /**
@@ -345,6 +363,12 @@ int client_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
         log_error("Failed to pack TUN packet for SID: 0x%08x", vfclient.fsm.sid);
         return -1;
     }
+
+    /* 2. Get next sequence from our global client context */
+    uint32_t seq = vfast_get_next_sequence();
+    /* 3. Apply the 'Onion' layers (Padding -> Obfs -> Mimicry) */
+    /* This function is the one we optimized earlier */
+    vpn_outbound_process(vfast_data_to_task(vfast_packet_base), seq);
 
     /* 3. Submit Asynchronous UDP Send via io_uring */
     vfast_submit_write(io, 

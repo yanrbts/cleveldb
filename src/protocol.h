@@ -51,6 +51,7 @@
 
 #include <stdint.h>
 #include "key.h"
+#include "io.h"
 
 /* Protocol Constants */
 #define VPN_VERSION       1
@@ -77,6 +78,10 @@ typedef struct {
     uint8_t  key_id;       /* Key ID for encryption (0 for HELLO, n for active session key) */
     uint8_t  flags;        /* Reserved for future flags (e.g. compression, encryption type) */
     uint32_t session_id;   /* Unique session identifier (Network Byte Order) */
+
+    uint8_t  padding_len;  /* Length of padding bytes */
+    uint8_t  reserved[3];  /* keep 4-byte alignment */
+    uint32_t seq_num;
 } __attribute__((packed)) vpn_tunnel_hdr_t;
 
 #define VPN_TNL_HLEN sizeof(vpn_tunnel_hdr_t)
@@ -157,6 +162,33 @@ static inline void vpn_fill_header(void *buf, uint8_t type, uint32_t sid, uint32
     hdr->flags = 0;
     hdr->session_id = htonl(sid);
 }
+
+/**
+ * @brief Applies random padding to the packet to obfuscate traffic patterns.
+ * This function adds a random amount of padding (up to max_pad) to the end
+ * of the payload. The padding length is stored in the header for proper removal.
+ * Note: The caller must ensure that the total packet size (Header + Payload + Padding)
+ * does not exceed the maximum buffer size or MTU.
+ * @param task    The task structure containing the buffer and current payload length.
+ * @param max_pad The maximum number of padding bytes to add (e.g., 0-255).
+ */
+void vpn_apply_padding(vfast_task_t *task, uint8_t max_pad);
+
+/**
+ * @brief Removes padding from the decrypted packet based on the header information.
+ * This function reads the padding length from the header and adjusts the payload length accordingly.
+ * It is critical to call this function before processing the decrypted payload to ensure that
+ * only the actual data is handled, and the padding bytes are ignored.
+ * @param task The task structure containing the buffer and current payload length.
+ */
+void vpn_remove_padding(vfast_task_t *task);
+
+void vpn_apply_obfs(vfast_task_t *task);
+void vpn_remove_obfs(vfast_task_t *task);
+
+void vpn_outbound_process(vfast_task_t *task, uint32_t seq);
+void vpn_inbound_process(vfast_task_t *task);
+
 void vpn_debug_print_hdr(const void *buf, int len);
 
 #endif /* __PROTOCOL_H__ */

@@ -138,13 +138,7 @@ static bool vfast_auth_request(vfast_io_t *io, int res, uint8_t *buf, struct soc
         return false;
     }
 
-    // /* Update Header Fields */
-    // hdr->version    = VFAST_VERSION;
-    // hdr->msg_type   = VPN_MSG_HELLO; 
-    // hdr->session_id = htonl(new_sid); // Ensure Network Byte Order
-    // hdr->flags      = 0;
-    // hdr->key_id     = s->sec_ctx.active_key.id; // Include Key ID for client reference
-
+    /* Update Header Fields */
     vpn_fill_header(buf, VPN_MSG_HELLO, new_sid, s->sec_ctx.active_key.id);
 
     /* 7. Optimized Packing:
@@ -369,6 +363,7 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
         atomic_fetch_add(&vfserver.stats.drops, 1);
         return -1;
     }
+    vpn_inbound_process(vfast_data_to_task(data));
 
     /* 1. Map the VPN header to extract session information */
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
@@ -453,6 +448,10 @@ static int server_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
         atomic_fetch_add(&vfserver.stats.drops, 1);
         return -1;
     }
+
+    // 1. Get thread-safe sequence
+    uint32_t seq = vpn_get_srv_next_sequence(s);
+    vpn_outbound_process(vfast_data_to_task(task_buf_base), seq);
 
     /**
      * 5. In-place AEAD Encryption & Packet Packing.

@@ -19,6 +19,7 @@ typedef struct {
     uint32_t session_id;            /* Unique ID: For UDP -> TUN lookup/validation */
     uint32_t virtual_ip;            /* Key: Network Byte Order */
     struct sockaddr_in remote_addr; /* Value: Client Physical Addr */
+    atomic_uint_fast32_t next_seq;
     vfast_sec_ctx_t sec_ctx;        /* Security context for this session */
     time_t last_seen;
     UT_hash_handle hh_ip;           /* handle for virtual_ip-based lookup */
@@ -55,5 +56,15 @@ bool vpn_lookup_session_by_ip(uint32_t vip, vpn_session_t **outs);
  */
 int vpn_session_get_expired(vpn_expired_node_t *list, int max_count, 
                              int probe_sec, int dead_sec);
+/**
+ * @brief Generates the next sequence number for a specific session.
+ * * Uses atomic operations to ensure thread-safety without mutex overhead.
+ * * Sequence numbers are critical for:
+ * 1. Anti-Replay: Preventing attackers from re-sending captured valid packets.
+ * 2. Obfuscation: Providing a rolling seed for XOR masking.
+ * @param session Pointer to the active user session.
+ * @return uint32_t The next available sequence number in Network Byte Order.
+ */
+uint32_t vpn_get_srv_next_sequence(vpn_session_t *session);
 
 #endif /* __SESSION_H__ */
