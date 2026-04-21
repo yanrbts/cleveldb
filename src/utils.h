@@ -7,6 +7,7 @@
 #define __UTILS_H__
 
 #include <stdint.h>
+#include <stdatomic.h>
 
 #define UNUSED(x)       (void)(x)
 #define likely(x)       __builtin_expect(!!(x), 1)
@@ -17,4 +18,6 @@ const char *vpn_get_absolute_path(char *filename);
 uint64_t vpn_now_ms(void);
 int ip_pton(const char *ip_str, uint32_t *out_ip);
 int ip_ntop(uint32_t ip_bin, char *out_str, size_t size);
+uint32_t vpn_get_next_sequence(atomic_uint_fast32_t *nextsq);
+
 #endif

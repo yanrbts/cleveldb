@@ -54,8 +54,9 @@
 #include "io.h"
 
 /* Protocol Constants */
-#define VPN_VERSION       1
-#define VPN_MTU_DEFAULT   1400  /* Standard MTU for tunnel interfaces */
+#define VPN_VERSION             1
+#define VPN_MTU_DEFAULT         1400  /* Standard MTU for tunnel interfaces */
+#define VPN_HDR_FLAG_PADDING    0x01
 
 /* Message Types */
 typedef enum {
@@ -172,22 +173,41 @@ static inline void vpn_fill_header(void *buf, uint8_t type, uint32_t sid, uint32
  * @param task    The task structure containing the buffer and current payload length.
  * @param max_pad The maximum number of padding bytes to add (e.g., 0-255).
  */
-void vpn_apply_padding(vfast_task_t *task, uint8_t max_pad);
+int vpn_apply_padding(uint8_t *buf, int raw_len, uint8_t max_pad);
 
 /**
- * @brief Removes padding from the decrypted packet based on the header information.
- * This function reads the padding length from the header and adjusts the payload length accordingly.
- * It is critical to call this function before processing the decrypted payload to ensure that
- * only the actual data is handled, and the padding bytes are ignored.
- * @param task The task structure containing the buffer and current payload length.
+ * @brief Strips trailing noise and restores the original IP packet length.
+ * DESIGN PRINCIPLE:
+ * This function operates on a raw memory buffer to maintain maximum portability.
+ * It must be called AFTER successful decryption but BEFORE routing to the TUN device.
+ * @param buf     Pointer to the decrypted VFAST packet (including header).
+ * @param p_len   Pointer to the current packet length. This value will be 
+ * updated (decremented) if padding is removed.
+ * @return int    Returns 0 on success, -1 if the packet is malformed.
  */
-void vpn_remove_padding(vfast_task_t *task);
+int vpn_remove_padding(uint8_t *buf, size_t *p_len);
 
-void vpn_apply_obfs(vfast_task_t *task);
-void vpn_remove_obfs(vfast_task_t *task);
+/**
+ * @brief Obfuscates the tunnel header to prevent protocol fingerprinting.
+ * Rationale: AEAD payloads are already high-entropy (random-looking). 
+ * The vulnerability lies in the static header fields (SID, Version, Flags). 
+ * This function masks the header using a rolling key derived from the 
+ * Sequence Number, ensuring every packet header is unique.
+ * @param buf      Pointer to the start of the VFAST packet (task->buf).
+ * @param wire_len The total length of the packet to be transmitted.
+ */
+void vpn_apply_header_obfs(uint8_t *buf, size_t wire_len);
 
-void vpn_outbound_process(vfast_task_t *task, uint32_t seq);
-void vpn_inbound_process(vfast_task_t *task);
+/**
+ * @brief Restores the tunnel header by reversing the XOR mask.
+ * This MUST be the very first function called upon receiving a UDP packet.
+ * It restores the SessionID and other metadata so the server can identify 
+ * the user and retrieve the correct decryption keys.
+ * @param buf      Pointer to the received raw UDP payload (task->buf).
+ * @param wire_len Total bytes received from the socket.
+ */
+void vpn_remove_header_obfs(uint8_t *buf, size_t wire_len);
+
 
 void vpn_debug_print_hdr(const void *buf, int len);
 

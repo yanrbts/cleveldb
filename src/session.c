@@ -364,27 +364,3 @@ int vpn_session_get_expired(vpn_expired_node_t *list, int max_count,
     }
     return count;
 }
-
-/**
- * @brief Generates the next sequence number for a specific session.
- * * Uses atomic operations to ensure thread-safety without mutex overhead.
- * * Sequence numbers are critical for:
- * 1. Anti-Replay: Preventing attackers from re-sending captured valid packets.
- * 2. Obfuscation: Providing a rolling seed for XOR masking.
- * @param session Pointer to the active user session.
- * @return uint32_t The next available sequence number in Network Byte Order.
- */
-uint32_t vpn_get_srv_next_sequence(vpn_session_t *session) {
-    if (!session) return 0;
-
-    /* atomic_fetch_add returns the value BEFORE the addition.
-     * memory_order_relaxed is sufficient here as seq_num doesn't 
-     * guard other memory accesses (no happens-before requirement).
-     */
-    uint32_t seq = atomic_fetch_add_explicit(&session->next_seq, 1, memory_order_relaxed);
-    
-    /* Return in Network Byte Order (Big Endian) to ensure consistency 
-     * across different CPU architectures.
-     */
-    return htonl(seq);
-}

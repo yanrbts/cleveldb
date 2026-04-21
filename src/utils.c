@@ -95,3 +95,24 @@ int ip_ntop(uint32_t ip_bin, char *out_str, size_t size) {
 
     return 0;
 }
+
+/**
+ * @brief Thread-safe sequence generator.
+ * Optimized for high-concurrency IO workers.
+ */
+uint32_t vpn_get_next_sequence(atomic_uint_fast32_t *nextsq) {
+    if (unlikely(!nextsq)) return 0;
+
+    /**
+     * atomic_fetch_add is a CPU-level atomic instruction (e.g., LOCK XADD on x86).
+     * memory_order_relaxed:
+     * We only care about the atomicity of the counter itself. 
+     * Since this seq_num doesn't act as a memory barrier for other data 
+     * structures, relaxed ordering offers the best performance by avoiding 
+     * unnecessary CPU cache flushes.
+     */
+    uint32_t seq = atomic_fetch_add_explicit(nextsq, 1, memory_order_relaxed);
+    
+    /* Ensure big-endian format for wire transmission */
+    return htonl(seq);
+}

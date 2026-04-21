@@ -34,6 +34,7 @@ typedef struct {
     atomic_bool    *running;
     const uint8_t  *key;          /* Pointer to the session key (set after auth) */
     vfast_sec_ctx_t *sec;         /* Pointer to the security context */
+    atomic_uint_fast32_t next_seq;
 } vfast_fsm_t;
 
 /* Signature updated to accept vfast_io_t */

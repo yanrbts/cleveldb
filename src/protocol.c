@@ -166,172 +166,207 @@ static inline uint32_t vpn_fast_rand(uint32_t *seed) {
 }
 
 /**
- * @brief Appends random noise to the packet to obfuscate traffic length patterns.
- * This counters Traffic Analysis attacks where firewalls identify protocols based 
- * on packet size sequences (e.g., handshake vs. keepalive signatures).
- * @param task The task structure containing the buffer and iovec length.
- * @param max_pad Maximum number of bytes to append.
+ * @brief Appends high-entropy padding to eliminate packet size signatures.
+ * * This function implements "Inner Padding" (pre-encryption). By placing 
+ * the padding inside the AEAD-protected payload, the noise becomes 
+ * cryptographically indistinguishable from the actual IP packet, 
+ * effectively countering Traffic Analysis (VBR-to-CBR mitigation).
+ * @param buf    Pointer to the I/O task container.
+ * @param raw_len The size of the L3 IP packet read from the TUN device.
+ * @param max_pad The upper bound for random padding (to control overhead).
+ * @return int    The updated payload length (raw_len + padding_len).
  */
-void vpn_apply_padding(vfast_task_t *task, uint8_t max_pad) {
-    if (!task || task->iov.iov_len < sizeof(vpn_tunnel_hdr_t)) return;
+int vpn_apply_padding(uint8_t *buf, int raw_len, uint8_t max_pad) {
+    /* Fast path for invalid inputs */
+    if (unlikely(!buf || raw_len <= 0)) {
+        return raw_len;
+    }
 
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)task->buf;
-    /* Thread-local storage ensures lock-free random generation for high-concurrency IO */
-    static __thread uint32_t seed = 0x12345678; 
+    /* 1. Locate the encapsulation header at the buffer base */
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
+    
+    /* Use thread-local seed to avoid cache contention in multi-threaded I/O */
+    static __thread uint32_t local_seed = 0x5EED5EED; 
 
-    size_t curr_len = task->iov.iov_len;
-    int spare = BUF_SIZE - curr_len;
-    if (spare <= 0) return;
+    /* 2. Calculate current occupancy: Header (HLEN) + L3 Payload (raw_len) */
+    const size_t consumed = VPN_TNL_HLEN + raw_len;
+    
+    /**
+     * 3. Capacity Guard: 
+     * We must ensure space for: Header + Payload + Padding + AEAD Auth Tag.
+     * 32 bytes is a safe margin for most AEAD tags (e.g., Poly1305/GCM Tag).
+     */
+    const int spare = (int)BUF_SIZE - (int)consumed - 32;
+    if (unlikely(spare <= 0)) {
+        hdr->padding_len = 0;
+        return raw_len;
+    }
 
-    /* Determine padding length without exceeding buffer capacity or user-defined limit */
-    uint8_t p_len = (uint8_t)(vpn_fast_rand(&seed) % (spare > max_pad ? max_pad : spare));
-    if (p_len == 0) return;
+    /* 4. Determine padding size: random value between 1 and min(max_pad, spare) */
+    uint8_t p_len = (uint8_t)(vpn_fast_rand(&local_seed) % 
+                    (spare > max_pad ? max_pad : spare));
+    
+    if (p_len == 0) {
+        hdr->padding_len = 0;
+        return raw_len;
+    }
 
-    /* Fill the padding area with noise. Using 32-bit batches for faster memory writes. */
-    uint8_t *p_ptr = (uint8_t *)task->buf + curr_len;
-    uint32_t noise = vpn_fast_rand(&seed);
+    /**
+     * 5. Entropy Generation & Write:
+     * We fill the trailing buffer space with high-entropy noise.
+     * Optimization: Refresh entropy in 32-bit blocks but write byte-wise 
+     * to handle unaligned padding lengths without complex tail-logic.
+     */
+    uint8_t *p_ptr = (uint8_t *)buf + consumed;
+    uint32_t noise_block = 0;
+
     for (int i = 0; i < p_len; i++) {
-        if ((i & 3) == 0) noise = vpn_fast_rand(&seed); // Refresh entropy every 4 bytes
-        p_ptr[i] = (uint8_t)(noise >> ((i & 3) << 3));
-    }
-
-    hdr->padding_len = p_len;
-    hdr->flags |= 0x01; // Set PADDING_PRESENT flag
-    task->iov.iov_len = curr_len + p_len;
-}
-
-/**
- * @brief Removes appended noise from the packet and restores original payload length.
- * Includes strict boundary checks to prevent memory corruption or integer underflow
- * from malformed or malicious packets.
- */
-void vpn_remove_padding(vfast_task_t *task) {
-    if (!task || task->iov.iov_len < sizeof(vpn_tunnel_hdr_t)) return;
-
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)task->buf;
-    if (hdr->flags & 0x01) {
-        uint8_t p_len = hdr->padding_len;
-        /* Critical Safety Check: Ensure the reported padding doesn't exceed received data */
-        if (task->iov.iov_len >= (size_t)p_len + sizeof(vpn_tunnel_hdr_t)) {
-            task->iov.iov_len -= p_len;
+        if ((i & 3) == 0) {
+            noise_block = vpn_fast_rand(&local_seed);
         }
-        hdr->flags &= ~0x01; // Clear flag after processing
+        p_ptr[i] = (uint8_t)(noise_block >> ((i & 3) << 3));
     }
+
+    /* 6. Commit Metadata to Header */
+    hdr->padding_len = p_len;
+    hdr->flags |= VPN_HDR_FLAG_PADDING; /* 0x01: Signal padding presence to peer */
+
+    return raw_len + p_len;
 }
 
 /**
- * @brief Obfuscates the payload using a symmetric XOR mask to remove binary signatures.
- * Uses 64-bit word-sized operations to maximize throughput on modern CPUs.
- * The mask is derived from session_id and seq_num to ensure each packet has a unique 
- * binary representation, even if the plaintext is identical.
+ * @brief Strips trailing noise and restores the original IP packet length.
+ * DESIGN PRINCIPLE:
+ * This function operates on a raw memory buffer to maintain maximum portability.
+ * It must be called AFTER successful decryption but BEFORE routing to the TUN device.
+ * @param buf     Pointer to the decrypted VFAST packet (including header).
+ * @param p_len   Pointer to the current packet length. This value will be 
+ * updated (decremented) if padding is removed.
+ * @return int    Returns 0 on success, -1 if the packet is malformed.
  */
-void vpn_apply_obfs(vfast_task_t *task) {
-    if (!task || task->iov.iov_len <= sizeof(vpn_tunnel_hdr_t)) return;
-
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)task->buf;
-    
-    /* Construct 64-bit mask by duplicating the 32-bit derived key */
-    uint64_t mask32 = (uint32_t)(hdr->session_id ^ hdr->seq_num);
-    uint64_t mask64 = (mask32 << 32) | mask32;
-
-    uint8_t *payload = (uint8_t *)task->buf + sizeof(vpn_tunnel_hdr_t);
-    size_t len = task->iov.iov_len - sizeof(vpn_tunnel_hdr_t);
-
-    /* Phase 1: High-speed 8-byte block XOR processing */
-    uint64_t *p64 = (uint64_t *)payload;
-    size_t blocks = len / 8;
-    for (size_t i = 0; i < blocks; i++) {
-        p64[i] ^= mask64;
+int vpn_remove_padding(uint8_t *buf, size_t *p_len) {
+    /* 1. Basic sanity check */
+    if (unlikely(!buf || !p_len || *p_len < VPN_TNL_HLEN)) {
+        return -1;
     }
 
-    /* Phase 2: Process trailing bytes (1-7 bytes) to ensure complete obfuscation */
-    for (size_t i = blocks * 8; i < len; i++) {
-        payload[i] ^= (uint8_t)(mask64 >> ((i & 7) << 3));
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
+
+    /* 2. Check if the PADDING_PRESENT flag (0x01) is active */
+    if (hdr->flags & VPN_HDR_FLAG_PADDING) {
+        uint8_t padding_val = hdr->padding_len;
+
+        /**
+         * 3. Boundary & Underflow Protection:
+         * We ensure that the data actually received is enough to cover the 
+         * header and the claimed padding. This is a critical security check 
+         * against length-truncation attacks.
+         */
+        if (likely(*p_len >= (size_t)padding_val + VPN_TNL_HLEN)) {
+            /* Update the external length variable */
+            *p_len -= padding_val;
+            
+            /* 4. Cleanup: Clear the flag to signify the packet is now 'clean' */
+            hdr->flags &= ~VPN_HDR_FLAG_PADDING;
+        } else {
+            /**
+             * 5. Anomaly Handling:
+             * If padding_len claims to be more than the packet itself, 
+             * it's either a corrupted packet or a malicious attempt 
+             * to cause a buffer underflow.
+             */
+            return -1; 
+        }
     }
 
-    hdr->flags |= 0x02; // Set OBFS_ACTIVE flag
+    return 0;
 }
 
 /**
- * @brief Reverses the XOR obfuscation to restore the original encrypted/plain payload.
- * Since XOR is its own inverse, the logic follows vpn_apply_obfs identically.
+ * @brief Obfuscates the tunnel header to prevent protocol fingerprinting.
+ * Rationale: AEAD payloads are already high-entropy (random-looking). 
+ * The vulnerability lies in the static header fields (SID, Version, Flags). 
+ * This function masks the header using a rolling key derived from the 
+ * Sequence Number, ensuring every packet header is unique.
+ * @param buf      Pointer to the start of the VFAST packet (task->buf).
+ * @param wire_len The total length of the packet to be transmitted.
  */
-void vfast_remove_obfs(vfast_task_t *task) {
-    if (!task || task->iov.iov_len <= sizeof(vpn_tunnel_hdr_t)) return;
-
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)task->buf;
-    if (!(hdr->flags & 0x02)) return;
-
-    /* Regenerate identical mask to reverse the transformation */
-    uint64_t mask32 = (uint32_t)(hdr->session_id ^ hdr->seq_num);
-    uint64_t mask64 = (mask32 << 32) | mask32;
-
-    uint8_t *payload = (uint8_t *)task->buf + sizeof(vpn_tunnel_hdr_t);
-    size_t len = task->iov.iov_len - sizeof(vpn_tunnel_hdr_t);
-
-    uint64_t *p64 = (uint64_t *)payload;
-    size_t blocks = len / 8;
-    for (size_t i = 0; i < blocks; i++) {
-        p64[i] ^= mask64;
+void vpn_apply_header_obfs(uint8_t *buf, size_t wire_len) {
+    if (unlikely(!buf || wire_len < VPN_TNL_HLEN)) {
+        return;
     }
 
-    for (size_t i = blocks * 8; i < len; i++) {
-        payload[i] ^= (uint8_t)(mask64 >> ((i & 7) << 3));
-    }
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
+
+    /**
+     * 1. Key Derivation:
+     * We use the Network-Byte-Order Sequence Number as the entropy source.
+     * The mask is generated by mixing the Seq with a fixed protocol salt.
+     */
+    uint32_t rolling_seq = hdr->seq_num; // Already in Network Byte Order
+    uint32_t obfs_key = rolling_seq ^ 0xDEADBEEF; // Static salt for protocol unique-ness
+
+    /**
+     * 2. Targeted Masking:
+     * We do NOT mask the SeqNum itself (the peer needs it to de-obfuscate).
+     * We mask the SessionID and the Version/Flags byte.
+     */
+    hdr->session_id ^= obfs_key;
     
-    hdr->flags &= ~0x02; // Clear flag after de-obfuscation
+    uint32_t head_block;
+    memcpy(&head_block, buf, sizeof(uint32_t));
+    head_block ^= (obfs_key << 8) | (obfs_key >> 24);
+    memcpy(buf, &head_block, sizeof(uint32_t));
+    /**
+     * 3. Metadata Update:
+     * Signal to the peer that this header is masked.
+     * Note: In a true "stealth" mode, we don't set a flag; the peer 
+     * simply tries to de-obfuscate by default.
+     */
+    // hdr->flags |= VPN_HDR_FLAG_OBFS; // Optional: 0x02
 }
 
 /**
- * @brief Prepares a packet for transmission by applying multi-layer obfuscation.
- * Execution Order: 
- * 1. Encryption (assumed done) 
- * 2. Padding (randomizes size)
- * 3. Obfuscation (XOR masking)
- * 4. Mimicry (header camouflage)
- * @param task The task object to be processed.
- * @param seq The sequence number for the current packet.
+ * @brief Restores the tunnel header by reversing the XOR mask.
+ * * This MUST be the very first function called upon receiving a UDP packet.
+ * It restores the SessionID and other metadata so the server can identify 
+ * the user and retrieve the correct decryption keys.
+ * @param buf      Pointer to the received raw UDP payload (task->buf).
+ * @param wire_len Total bytes received from the socket.
  */
-void vpn_outbound_process(vfast_task_t *task, uint32_t seq) {
-    if (!task) return;
+void vpn_remove_header_obfs(uint8_t *buf, size_t wire_len) {
+    /* 1. Basic sanity check: ensure we have at least a full header */
+    if (unlikely(!buf || wire_len < VPN_TNL_HLEN)) {
+        return;
+    }
+
+    /* Use a temporary pointer for structured access */
+    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
+
+    /**
+     * 2. Key Extraction:
+     * The Sequence Number was left in plaintext by the sender.
+     * We use it now to re-generate the exact same mask used during encryption.
+     */
+    uint32_t rolling_seq = hdr->seq_num; 
+    uint32_t obfs_key = rolling_seq ^ 0xDEADBEEF; 
+
+    /**
+     * 3. Mask Reversal:
+     * XOR is its own inverse ( (A ^ B) ^ B = A ).
+     * We follow the exact same bitwise operations as vpn_apply_header_obfs.
+     */
     
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)task->buf;
-    
-    /* 1. Set the sequence number first as it's the entropy source for OBFS */
-    hdr->seq_num = seq;
+    /* Restore the first 4 bytes (Version, MsgType, Flags, PaddingLen) */
+    uint32_t head_block;
+    memcpy(&head_block, buf, sizeof(uint32_t));
+    head_block ^= (obfs_key << 8) | (obfs_key >> 24);
+    memcpy(buf, &head_block, sizeof(uint32_t));
 
-    /* 2. Layer 1: Apply random padding (Target: Traffic Analysis / Packet Size Fingerprinting) */
-    vpn_apply_padding(task, 64);
+    /* Restore the SessionID (4 bytes) */
+    hdr->session_id ^= obfs_key;
 
-    /* 3. Layer 2: Apply XOR obfuscation (Target: Entropy Analysis / Binary Pattern Matching) */
-    vpn_apply_obfs(task);
-
-    /* 4. Layer 3: Apply Protocol Mimicry (Target: Deep Packet Inspection / Protocol Filtering) */
-    /* 0x43 is the first byte of a QUIC Short Header, making it look like HTTP/3 traffic */
-    // hdr->version = 0x43; 
-}
-
-/**
- * @brief Restores a received packet to its original state for business logic processing.
- * Execution Order (Strict Reverse):
- * 1. Mimicry Removal (restore version)
- * 2. Obfuscation Removal (reverse XOR)
- * 3. Padding Removal (trim trailing noise)
- * 4. Decryption (to be done after)
- */
-void vpn_inbound_process(vfast_task_t *task) {
-    if (!task || task->iov.iov_len < sizeof(vpn_tunnel_hdr_t)) return;
-
-    /* 1. Layer 3: Restore the real protocol version (e.g., 0x01) */
-    /* This must be done before logic checks or obfs removal if version is part of the mask */
-    // vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)task->buf;
-    // hdr->version = 0x01; 
-
-    /* 2. Layer 2: Reverse XOR obfuscation based on the flags */
-    vfast_remove_obfs(task);
-
-    /* 3. Layer 1: Trim random padding to restore original payload length */
-    vpn_remove_padding(task);
+    /* Now hdr->session_id and hdr->flags are back to their original values */
 }
 
 /**

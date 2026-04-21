@@ -434,7 +434,7 @@ void vfast_io_run(vfast_io_t *io) {
 
     atomic_store(&io->running, true);
     uint64_t last_tick_ms = vpn_now_ms();
-    uint64_t last_stat_ms = 0;
+    // uint64_t last_stat_ms = 0;
 
     /* Initial Pipeline Warm-up */
     for (int i = 0; i < 16; i++) {
