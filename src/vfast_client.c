@@ -417,19 +417,22 @@ static void vfast_rekey_timer_handler(vfast_io_t *io, void *arg) {
         /* Buffer Management: Borrow a task object from the IO ring */
         vfast_task_t *task = vfast_borrow_task(io);
         if (likely(task)) {
-            /* Header construction using precise sizeof to avoid alignment issues */
-            vpn_fill_header(task->buf, VPN_MSG_REKEY_REQ, vfclient.fsm.sid, ctx->next_key.id);
-
             /* Payload: [NewKeyID: 4B][RawKey: 32B] */
             uint8_t *payload = task->buf + sizeof(vpn_tunnel_hdr_t);
             uint32_t net_kid = htonl(ctx->next_key.id);
             memcpy(payload, &net_kid, 4);
             memcpy(payload + 4, ctx->next_key.raw, REKEY_KEY_SIZE);
 
-            /* Dispatch to io_uring SQE */
-            vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, task->buf, 
-                               sizeof(vpn_tunnel_hdr_t) + 4 + REKEY_KEY_SIZE, 
-                               &vfclient.fsm.dst_addr);
+            int total_len = vpn_pack(vfclient.active_ptr,               /* Use active session key */
+                             task->buf,                                 /* Target buffer */
+                             VPN_TNL_HLEN + 4 + REKEY_KEY_SIZE,         /* Keep-alive has 0-byte payload */
+                             BUF_SIZE,                                  /* Buffer capacity */
+                             VPN_MSG_REKEY_REQ,                         /* Message type */
+                             vfclient.fsm.sid);                         /* Current Session ID */
+
+            vfast_submit_write(io, io->udp_fd, 
+                               OP_UDP_SEND, task->buf, 
+                               total_len, &vfclient.fsm.dst_addr);
             
             mgr->last_sent = now;
 

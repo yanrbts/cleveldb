@@ -283,6 +283,26 @@ static inline void vfast_handle_data_msg(vfast_io_t *io, vpn_session_t *s, uint8
  * The client has generated a new key and wants the server to switch.
  */
 static inline void vfast_handle_rekey_req(vfast_io_t *io, vpn_session_t *s, uint8_t *data, int len, struct sockaddr_in *src) {
+    if (unlikely(!data || !io || !s)) return;
+
+    int plain_len = 0;
+    uint32_t recv_sid = 0;
+
+    /**
+     * CRITICAL: Decrypt and Unpack.
+     * vpn_unpack performs in-place decryption and returns a pointer to the 
+     * start of the plain IP packet.
+     */
+    uint8_t *payload_ptr = vpn_unpack(&s->sec_ctx, data, len, 
+                                      &plain_len, &recv_sid);
+    if (unlikely(!payload_ptr || plain_len <= 0)) {
+        log_warn("Ingress: Decryption failed or invalid packet from %s", 
+                 inet_ntoa(src->sin_addr));
+        
+        atomic_fetch_add(&vfserver.stats.drops, 1);
+        return;
+    }
+
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
     
     /**
