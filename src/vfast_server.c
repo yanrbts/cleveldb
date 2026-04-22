@@ -349,7 +349,6 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
         if (!vpn_lookup_session_by_sid(sid, &s)) {
             atomic_fetch_add(&vfserver.stats.drops, 1);
             log_warn("No session found for SID[0x%08x] from %s. Packet dropped.", sid, inet_ntoa(src->sin_addr));
-            return -1;
         }
     }
 
