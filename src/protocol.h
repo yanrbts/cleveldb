@@ -127,14 +127,13 @@ int vpn_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int payload_len, int max_
  * @param[in]  buf          Base address of the received UDP packet.
  * @param[in]  received_len Total bytes received from the network.
  * @param[out] out_ip_len   Pointer to store the decrypted payload length.
- * @param[out] out_sid      Pointer to store the extracted Session ID (Host Order).
  *
  * @return Pointer to the decrypted plaintext (at buf + VPN_TNL_HLEN) on success; 
  * NULL if decryption fails, version mismatches, or IP header is malformed.
  *
  * @warning This function modifies the buffer in-place during decryption.
  */
-uint8_t* vpn_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int received_len, int *out_ip_len, uint32_t *out_sid);
+uint8_t* vpn_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int received_len, int *out_ip_len);
 
 /**
  * @brief Encapsulates the tunnel header with protocol-specific metadata.

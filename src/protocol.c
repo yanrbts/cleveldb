@@ -94,13 +94,12 @@ int vpn_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int plen,
  * Restores the original IP packet from the masked UDP stream.
  * * @return Pointer to decrypted payload, or NULL on integrity/format failure.
  */
-uint8_t* vpn_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int res, 
-                    int *out_plen, uint32_t *out_sid) {
+uint8_t* vpn_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int res, int *out_plen) {
     
     if (unlikely(!buf || res < (int)sizeof(vpn_tunnel_hdr_t))) return NULL;
 
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
-    if (out_sid) *out_sid = ntohl(hdr->session_id);
+    // if (out_sid) *out_sid = ntohl(hdr->session_id);
 
     uint8_t *ptr = buf + sizeof(vpn_tunnel_hdr_t);
     size_t rlen = (size_t)(res - sizeof(vpn_tunnel_hdr_t));

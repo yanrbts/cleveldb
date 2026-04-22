@@ -214,6 +214,11 @@ static inline void client_handle_dpd(vfast_io_t *io, uint8_t *data, struct socka
     /* 1. Use the macro to find the original task context */
     vfast_task_t *task = vfast_data_to_task(data);
     uint32_t sid = vfclient.fsm.sid;
+
+    uint8_t dummy[16];
+    for (int i = 0; i < 16; i++) {
+        dummy[i] = (uint8_t)(rand() & 0xFF); 
+    }
     /**
      * 2. Security Pipeline Integration
      * A DPD response usually carries no payload (plen = 0).
@@ -223,7 +228,7 @@ static inline void client_handle_dpd(vfast_io_t *io, uint8_t *data, struct socka
      * - Apply random padding (1-32 bytes) to erase fixed-size fingerprints.
      * - XOR-obfuscate the header.
      */
-    int tlen = vpn_pack(vfclient.active_ptr, task->buf, 0, 
+    int tlen = vpn_pack(vfclient.active_ptr, task->buf, (int)sizeof(dummy), 
                         BUF_SIZE, VPN_DPD_RESPONSE, sid);
 
     if (unlikely(tlen <= 0)) {
@@ -275,6 +280,7 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     /* Direct mapping to inspect the header */
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
 
+    sid = ntohl(hdr->session_id);
     /**
      * 3. PHASE 2: Conditional Unpack
      * If it's a HELLO packet, we MUST pass NULL for the security context 
@@ -282,12 +288,7 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
      */
     vfast_sec_ctx_t *sec = (hdr->msg_type == VPN_MSG_HELLO) ? NULL : vfclient.active_ptr;
     
-    payload = vpn_unpack(sec, data, len, &plen, &sid);
-    
-    // if (unlikely(!payload)) {
-    //     log_warn("Ingress: Unpack failed for msg_type 0x%02x", hdr->msg_type);
-    //     return -1;
-    // }
+    payload = vpn_unpack(sec, data, len, &plen);
 
     /**
      * 2. Heartbeat Watchdog Update

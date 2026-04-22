@@ -352,7 +352,7 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
         }
     }
 
-    payload = vpn_unpack(s ? &s->sec_ctx : NULL, data, len, &plen, &sid);
+    payload = vpn_unpack(s ? &s->sec_ctx : NULL, data, len, &plen);
     if (unlikely(!payload)) {
         log_warn("Ingress: Decryption failed or invalid packet from %s", 
                  inet_ntoa(src->sin_addr));
