@@ -9,7 +9,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define VFAST_MAGIC 0x54534146 /* "FAST" in Little-Endian */
+#define VFAST_MAGIC 0x56465354 /* "VFAST" in Little-Endian */
+#define VFAST_TOKEN "VFAST_SECRET"
 
 /**
  * struct vfast_auth_t - Wire-format authentication and control payload.

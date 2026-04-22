@@ -37,117 +37,96 @@ static inline uint16_t _calculate_checksum(uint16_t *buf, int len) {
 }
 
 /**
- * @brief Industrial-grade encapsulation with mandatory AEAD encryption.
- * 1. For HELLO: Skips encryption to allow initial handshake.
- * 2. For others: Performs in-place AEAD encryption.
- * 3. Safety: Strict boundary checks and error logging included.
- * 
- * @param sec          Pointer to the session context.
- * @param buf          Buffer base (Payload MUST start at buf + VPN_TNL_HLEN).
- * @param payload_len  Length of the raw payload (e.g., IP packet or Control data).
- * @param max_buf_size Total capacity of the allocated buffer.
- * @param type         VFAST message type (DATA, HEARTBEAT, CONTROL, etc.).
- * @param sid          Session ID for routing.
- * @return Total bytes to send over UDP, or -1 on error.
+ * @brief Industrial Encapsulation: [Padding] -> [Branching Encryption] -> [Obfuscation]
+ * Pipeline ensures all packets, including plain-text control messages, are masked.
+ * * @param sec      Session security context.
+ * @param buf      Buffer base (Header starts at buf, Payload at buf + HLEN).
+ * @param plen     Length of the raw L3/Control payload.
+ * @param max_size Capacity of the buffer to prevent overflows.
+ * @param type     VFAST message type (DATA, HELLO, KEEPALIVE, etc.).
+ * @param sid      Session ID for routing.
+ * @return Total bytes for wire transmission, or -1 on error.
  */
-int vpn_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int payload_len, 
-    int max_buf_size, vpn_msg_t type, uint32_t sid) {
-    /* 1. Basic Pointer Check */
-    if (unlikely(!buf || (!sec && type != VPN_MSG_HELLO))) 
-        return -1;
-
-    /* 2. Locate Payload: Assumes zero-copy placement at offset 8 */
-    uint8_t *payload_ptr = buf + VPN_TNL_HLEN;
-    size_t crypto_out_len = 0;
-    uint32_t kid = 0; /* Default Key ID for HELLO (no encryption) */
+int vpn_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int plen, 
+             int max_size, vpn_msg_t type, uint32_t sid) {
     
+    if (unlikely(!buf)) return -1;
 
-    /* 3. Encryption Logic Branching with Strict Validation */
+    uint8_t *ptr = buf + VPN_TNL_HLEN;
+    size_t out_len = 0;
+    uint32_t kid = 0; 
+
+    /* 1. Mandatory Padding: Add noise to hide packet size signatures */
+    int i_plen = vpn_apply_padding(buf, plen, 32);
+
+    /**
+     * 2. Encryption Branching: 
+     * HELLO and KEEPALIVE bypass AEAD to maintain handshake availability.
+     */
     if (type == VPN_MSG_HELLO || type == VPN_MSG_KEEPALIVE) {
-        /**
-         * HANDSHAKE PHASE:
-         * No session key is available. Payload remains plain-text.
-         */
-        crypto_out_len = (size_t)payload_len;
+        out_len = (size_t)i_plen;
     } else {
+        if (unlikely(!sec)) return -1;
+        
         const uint8_t *key = vfast_rekey_get_key(sec);
         kid = vfast_rekey_get_key_id(sec);
-        /**
-         * ESTABLISHED PHASE:
-         * Encrypt in-place. Requires a valid session key.
-         */
-        if (unlikely(!key)) {
-            log_error("Encryption failed: Missing session key for SID: 0x%08x", sid);
-            return -1;
-        }
 
-        if (unlikely(vpn_encrypt(key, payload_ptr, (size_t)payload_len, payload_ptr, &crypto_out_len) != 0)) {
-            log_error("Encryption failed for SID: 0x%08x, Type: %d", sid, type);
+        if (unlikely(!key || vpn_encrypt(key, ptr, (size_t)i_plen, ptr, &out_len) != 0)) {
+            log_error("Cipher error | SID: 0x%08x", sid);
             return -1;
         }
     }
 
-    /* 4. Final Safety Check: Header + (Encrypted or Plain) Payload vs Capacity */
-    const int total_len = VPN_TNL_HLEN + (int)crypto_out_len;
-    if (unlikely(total_len > max_buf_size)) {
-        log_error("Buffer overflow: needed %d, capacity %d (SID: 0x%08x)", total_len, max_buf_size, sid);
-        return -1;
-    }
-
-    /* 5. Fill Tunnel Header (Standard Wire Format) */
+    /* 3. Header Construction & Boundary Validation */
     vpn_fill_header(buf, (uint8_t)type, sid, kid);
 
-    return total_len;
+    int tlen = VPN_TNL_HLEN + (int)out_len;
+    if (unlikely(tlen > max_size)) return -1;
+
+    /* 4. Mandatory Obfuscation: Mask header to bypass DPI pattern matching */
+    vpn_apply_header_obfs(buf, (size_t)tlen);
+
+    return tlen;
 }
 
 /**
- * @brief Decapsulates VFAST header and decrypts payload in-place.
- * @return Pointer to the decrypted plain IP packet, or NULL on failure.
+ * @brief Decapsulation: [De-obfuscate] -> [Branching Decryption] -> [Unpadding]
+ * Restores the original IP packet from the masked UDP stream.
+ * * @return Pointer to decrypted payload, or NULL on integrity/format failure.
  */
-uint8_t* vpn_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int res, int *out_plain_len, uint32_t *out_sid) {
-    /* 1. Basic sanity check for header size and context validity */
-    if (unlikely(!sec || !buf || res < (int)sizeof(vpn_tunnel_hdr_t))) {
-        return NULL;
-    }
+uint8_t* vpn_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int res, 
+                    int *out_plen, uint32_t *out_sid) {
+    
+    if (unlikely(!buf || res < (int)sizeof(vpn_tunnel_hdr_t))) return NULL;
 
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
+    if (out_sid) *out_sid = ntohl(hdr->session_id);
+
+    uint8_t *ptr = buf + sizeof(vpn_tunnel_hdr_t);
+    size_t rlen = (size_t)(res - sizeof(vpn_tunnel_hdr_t));
+    size_t dlen = 0;
 
     /**
-     * 2. Key Selection Logic.
-     * Attempt to find a matching key (Active or Previous) based on the 8-bit Key ID.
-     * This is critical for handling packets still in the io_uring queue during rekeying.
+     * 2. Decryption Branching: Matches the logic in vpn_pack.
      */
-    const uint8_t *key = vfast_rekey_get_decrypt_key(sec, hdr->key_id);
-    if (unlikely(!key)) {
-        /* No valid key found for the generation ID provided in the header */
-        return NULL;
+    if (hdr->msg_type == VPN_MSG_HELLO || hdr->msg_type == VPN_MSG_KEEPALIVE) {
+        dlen = rlen;
+    } else {
+        if (unlikely(!sec)) return NULL;
+        const uint8_t *key = vfast_rekey_get_decrypt_key(sec, hdr->key_id);
+        
+        if (unlikely(!key || vpn_decrypt(key, ptr, rlen, ptr, &dlen) != 0)) {
+            return NULL; /* Auth failure or decryption error */
+        }
     }
 
-    /* 3. Metadata Extraction */
-    if (out_sid) {
-        *out_sid = ntohl(hdr->session_id);
-    }
+    /* 3. Mandatory Unpadding: Restore exact length regardless of encryption state */
+    size_t tlen = dlen + sizeof(vpn_tunnel_hdr_t);
+    if (unlikely(vpn_remove_padding(buf, &tlen) != 0)) return NULL;
 
-    /**
-     * 4. Ciphertext Decryption.
-     * Decrypt the payload in-place. The ciphertext starts immediately after the header.
-     * Note: vpn_decrypt must handle AEAD tag verification internally.
-     */
-    uint8_t *ciphertext_ptr = buf + sizeof(vpn_tunnel_hdr_t);
-    size_t ciphertext_len   = (size_t)(res - sizeof(vpn_tunnel_hdr_t));
-    size_t plain_len = 0;
+    if (out_plen) *out_plen = (int)(tlen - sizeof(vpn_tunnel_hdr_t));
 
-    if (unlikely(vpn_decrypt(key, ciphertext_ptr, ciphertext_len, ciphertext_ptr, &plain_len) != 0)) {
-        /* Decryption failed: possible tampering, corruption, or wrong key */
-        return NULL;
-    }
-
-    /* 5. Final Output Assignment */
-    if (out_plain_len) {
-        *out_plain_len = (int)plain_len;
-    }
-
-    return ciphertext_ptr; /* Return the start of the decrypted IP packet */
+    return ptr;
 }
 
 /**

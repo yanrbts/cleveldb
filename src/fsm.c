@@ -48,7 +48,7 @@ static void fsm_send_pkt(vfast_fsm_t *fsm, uint8_t type) {
         vpn_auth_t *auth = (vpn_auth_t *)(task->buf + VPN_TNL_HLEN);
         
         /* Populate authentication credentials directly into the reserved payload offset */
-        vfast_auth_pack(auth, fsm->vip, (uint8_t *)"VFAST_SECRET", 0, NULL, 0);
+        vfast_auth_pack(auth, fsm->vip, (uint8_t *)VFAST_TOKEN, 0, NULL, 0);
 
         total_len = vpn_pack(NULL,                 /* No key available yet */
                              task->buf,            /* Target buffer */
@@ -97,7 +97,7 @@ static void fsm_send_pkt(vfast_fsm_t *fsm, uint8_t type) {
 static void *fsm_worker(void *arg) {
     (void)arg;
     vfast_fsm_t *fsm = (vfast_fsm_t *)arg;
-    log_info("FSM: Unified io_uring background worker initiated.");
+    log_info("FSM: Unified background worker initiated.");
 
     while (likely(atomic_load(fsm->running))) {
         time_t now = time(NULL);

@@ -96,72 +96,67 @@ static void signal_handler(int sig) {
  * @param src   Source address of the requesting client.
  * @return true if the request was handled successfully, false otherwise.
  */
-static bool vfast_auth_request(vfast_io_t *io, int res, uint8_t *buf, struct sockaddr_in *src) {
-    /* 1. Pre-calculate response length and boundary check */
-    const int auth_size = (int)sizeof(vpn_auth_t);
-    const int head_size = (int)sizeof(vpn_tunnel_hdr_t);
-    const int resp_len  = head_size + auth_size;
-
-    /* Validate input length: must accommodate both header and auth payload */
-    if (unlikely(res < resp_len)) {
-        log_warn("Dropped malformed HELLO packet (size %d) from %s", res, inet_ntoa(src->sin_addr));
+static bool vfast_handle_hello(vfast_io_t *io, uint8_t *payload, int plen, struct sockaddr_in *src) {
+    if (unlikely(plen < (int)sizeof(vpn_auth_t))) {
+        log_warn("Malformed HELLO from %s", inet_ntoa(src->sin_addr));
         return false;
     }
 
-    /* 2. Direct pointer mapping (Zero-copy) */
-    // vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
-    vpn_auth_t *auth_ptr  = (vpn_auth_t *)(buf + head_size);
+    /* 2. Zero-copy mapping of the auth structure */
+    vpn_auth_t *auth = (vpn_auth_t *)payload;
 
-    /* 3. Authentication: Validate client token using existing logic */
-    const uint8_t *expected_token = (const uint8_t *)"VFAST_SECRET"; 
-    int ret = vfast_auth_verify(auth_ptr, expected_token);
-    if (ret != 0) {
-        log_warn("Authentication failed for client: %s %d", inet_ntoa(src->sin_addr), ret);
+    /* 3. Authentication: Validate client token */
+    const uint8_t *secret = (const uint8_t *)VFAST_TOKEN;
+    if (vfast_auth_verify(auth, secret) != 0) {
+        log_warn("Auth failed: %s", inet_ntoa(src->sin_addr));
         return false;
     }
 
     /* 4. IPAM: Allocate Virtual IP from the global address pool */
-    uint32_t assigned_vip = vpn_ip_pool_alloc(&vfserver.ip_pool);
-    if (unlikely(assigned_vip == 0)) {
+    uint32_t vip = vpn_ip_pool_alloc(&vfserver.ip_pool);
+    if (unlikely(vip == 0)) {
         log_error("Resource exhaustion: IP Pool is empty. Rejecting %s", inet_ntoa(src->sin_addr));
         return false;
     }
-
     /* 5. Session Management: Generate SID and link VIP to physical address */
-    uint32_t new_sid = vpn_generate_sid(assigned_vip);
-    vpn_session_update(assigned_vip, new_sid, src);
+    uint32_t sid = vpn_generate_sid(vip);
+    vpn_session_update(vip, sid, src);
 
     /* 6. Response Construction: Reuse the same buffer for Egress (Zero-copy) */
     vpn_session_t *s = NULL;
-    if (!vpn_lookup_session_by_sid(new_sid, &s)) {
-        log_error("Unexpected error: Session not found after creation for SID[0x%08x]", new_sid);
+    if (!vpn_lookup_session_by_sid(sid, &s)) {
+        log_error("Unexpected error: Session not found after creation for SID[0x%08x]", sid);
         return false;
     }
 
-    /* Update Header Fields */
-    vpn_fill_header(buf, VPN_MSG_HELLO, new_sid, s->sec_ctx.active_key.id);
-
-    /* 7. Optimized Packing:
-     * Directly pack response data into the task buffer.
-     * This avoids: 'vpn_auth_t tmp; vfast_auth_pack(&tmp...); memcpy(dest, &tmp...);'
+    /**
+     * 6. Response Construction: Use vpn_pack for the full pipeline.
+     * We need to find the base buffer. Assuming payload = buf + VPN_TNL_HLEN.
      */
-    vfast_auth_pack(
-        auth_ptr, 
-        assigned_vip, 
-        expected_token, 
-        s->sec_ctx.active_key.id, 
-        s->sec_ctx.active_key.raw,
-        0
-    );
+    uint8_t *base_buf = payload - VPN_TNL_HLEN;
+
+    /* Pack response data into the payload area */
+    vfast_auth_pack(auth, vip, secret, s->sec_ctx.active_key.id, 
+                    s->sec_ctx.active_key.raw, 0);
+
+    /**
+     * 7. The Security Pipeline: [Padding] -> [Header] -> [Obfuscation]
+     * We call vpn_pack with type HELLO. This handles:
+     * - Random padding (to hide handshake size)
+     * - Header filling (SID/KID)
+     * - Header obfuscation (XOR masking)
+     */
+    int tlen = vpn_pack(NULL, base_buf, (int)sizeof(vpn_auth_t), 
+                             BUF_SIZE, VPN_MSG_HELLO, sid);
+
+    if (unlikely(tlen < 0)) return false;
 
     /* 8. Asynchronous Dispatch */
-    log_info("Handshake assigned VIP %u.%u.%u.%u [SID: 0x%08x] to %s",
-             (assigned_vip & 0xFF), (assigned_vip >> 8) & 0xFF,
-             (assigned_vip >> 16) & 0xFF, (assigned_vip >> 24) & 0xFF, 
-             new_sid, inet_ntoa(src->sin_addr));
+    log_info("Handshake Success | VIP: %u.%u.%u.%u | SID: 0x%08x | To: %s",
+             (vip & 0xFF), (vip >> 8) & 0xFF, (vip >> 16) & 0xFF, (vip >> 24) & 0xFF, 
+             sid, inet_ntoa(src->sin_addr));
 
-    /* Submit the buffer back to the network via io_uring */
-    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, buf, resp_len, src);
+    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, base_buf, tlen, src);
 
     return true;
 }
@@ -182,68 +177,64 @@ static bool vfast_auth_request(vfast_io_t *io, int res, uint8_t *buf, struct soc
  * @param src   Physical source address of the client.
  * @return true if the keepalive was processed/ACKed, false otherwise.
  */
-static bool vfast_keeplive(vfast_io_t *io, vpn_session_t *s, uint8_t *buf, int res , struct sockaddr_in *src) {
-    UNUSED(s);
-
+static bool vfast_keeplive(vfast_io_t *io, vpn_session_t *s, uint8_t *payload, int plen, struct sockaddr_in *src) {
+    UNUSED(plen);
     /* 1. Basic Length Validation */
-    if (unlikely(res < (int)sizeof(vpn_tunnel_hdr_t))) {
+    if (unlikely(!s)) {
         return false;
     }
 
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
-    uint32_t hsid = ntohl(hdr->session_id);
-    uint32_t v_ip;
-    struct sockaddr_in old_addr;
-
-    /* 2. Session Validation: Fast lookup in the session table */
-    if (likely(vpn_session_lookup_by_sid(hsid, &v_ip, &old_addr))) {
+    /* 2. NAT Roaming Detection
+     * Compare current source address with the known session endpoint.
+     * If they differ, the client has likely switched networks or ports.
+     */
+    if (unlikely(s->remote_addr.sin_addr.s_addr != src->sin_addr.s_addr || 
+                 s->remote_addr.sin_port != src->sin_port)) {
         
-        /* 3. Handle NAT Roaming / Endpoint Change
-         * If the client's source IP or Port has changed, we log the event 
-         * and update the session mapping to ensure downlink traffic finds them.
-         */
-        if (unlikely(old_addr.sin_addr.s_addr != src->sin_addr.s_addr || 
-                     old_addr.sin_port != src->sin_port)) {
-            
-            char ip_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &src->sin_addr, ip_str, sizeof(ip_str));
-            log_info("ROAM: SID[0x%08x] migrated from %s:%d to %s:%d", 
-                     hsid, 
-                     inet_ntoa(old_addr.sin_addr), ntohs(old_addr.sin_port),
-                     ip_str, ntohs(src->sin_port));
-        }
+        char old_ip[INET_ADDRSTRLEN], new_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &s->remote_addr.sin_addr, old_ip, sizeof(old_ip));
+        inet_ntop(AF_INET, &src->sin_addr, new_ip, sizeof(new_ip));
 
-        /* 4. Refresh Session: Update 'last_seen' timestamp and endpoint */
-        vpn_session_update(v_ip, hsid, src);
+        log_info("ROAM: SID[0x%08x] migrated from %s:%d to %s:%d", 
+                 s->session_id, old_ip, ntohs(s->remote_addr.sin_port),
+                 new_ip, ntohs(src->sin_port));
+    }
 
-        /* 5. Response Construction (Zero-copy Echo)
-         * We reuse the header and update the payload with current server state.
-         * Note: We assume the packet contains a vpn_auth_t payload for heartbeat.
-         */
-        if (res >= (int)(sizeof(vpn_tunnel_hdr_t) + sizeof(vpn_auth_t))) {
-            vpn_auth_t *payload = (vpn_auth_t *)(buf + sizeof(vpn_tunnel_hdr_t));
-            
-            /* Update heartbeat metadata */
-            payload->ts  = (uint64_t)time(NULL);
-            payload->vip = v_ip; 
-            payload->magic = htonl(0x56465354); // "VFST"
-        }
+    /* 3. Session Refresh: Update VIP-SID mapping and 'last_seen' timestamp */
+    vpn_session_update(s->virtual_ip, s->session_id, src);
 
-        /* 6. Submit Asynchronous ACK via io_uring
-         * By sending back the same length 'res', we ensure protocol consistency.
-         */
-        vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, buf, res, src);
-        
-        return true;
+    /* 4. Response Construction (In-place)
+     * Update the heartbeat structure with current server-side metadata.
+     */
+    vpn_auth_t *res = (vpn_auth_t *)payload;
+    uint64_t ts = (uint64_t)time(NULL);
+    vfast_auth_pack(res, s->virtual_ip, (uint8_t *)VFAST_TOKEN, 
+                    s->sec_ctx.active_key.id, NULL, ts);
 
-    } else {
-        /* Session has likely expired or the client is unauthorized */
-        log_warn("KEEPALIVE REJECTED: Session 0x%08x not found for %s", 
-                 hsid, inet_ntoa(src->sin_addr));
-        
-        /* Future expansion: Submit a VPN_MSG_DISCONNECT to force client re-auth */
+    /**
+     * 5. Egress Pipeline: [Padding] -> [Header Fill] -> [Obfuscation]
+     * We use vpn_pack to re-seal the packet. 
+     * Even if KEEPALIVE is plain-text, vpn_pack will:
+     * - Apply random padding (hiding the fixed heartbeat size).
+     * - XOR the header (masking SID and MsgType).
+     */
+    uint8_t *base_buf = payload - VPN_TNL_HLEN;
+    
+    /* We use sizeof(vpn_auth_t) to ensure the ACK contains fresh metadata */
+    int tlen = vpn_pack(&s->sec_ctx, base_buf, (int)sizeof(vpn_auth_t), 
+                             BUF_SIZE, VPN_MSG_KEEPALIVE, s->session_id);
+
+    if (unlikely(tlen < 0)) {
+        log_error("Failed to pack keepalive ACK for SID: 0x%08x", s->session_id);
         return false;
     }
+
+    /* 6. Asynchronous Submission
+     * Hand the re-masked packet back to the network stack via io_uring.
+     */
+    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, base_buf, tlen, src);
+    
+    return true;
 }
 
 /**
@@ -251,105 +242,66 @@ static bool vfast_keeplive(vfast_io_t *io, vpn_session_t *s, uint8_t *buf, int r
  * * This internal helper handles the decryption, validation, and submission 
  * to the virtual network device.
  */
-static inline void vfast_handle_data_msg(vfast_io_t *io, vpn_session_t *s, uint8_t *data, int len, struct sockaddr_in *src) {
-    int plain_len = 0;
-    uint32_t recv_sid = 0;
+static inline void vfast_handle_data(vfast_io_t *io, vpn_session_t *s, uint8_t *payload, int plen, struct sockaddr_in *src) {
+    UNUSED(s);
+    UNUSED(src);
 
-    /**
-     * CRITICAL: Decrypt and Unpack.
-     * vpn_unpack performs in-place decryption and returns a pointer to the 
-     * start of the plain IP packet.
-     */
-    uint8_t *payload_ptr = vpn_unpack(&s->sec_ctx, data, len, 
-                                      &plain_len, &recv_sid);
-
-    if (unlikely(!payload_ptr || plain_len <= 0)) {
-        log_warn("Ingress: Decryption failed or invalid packet from %s", 
-                 inet_ntoa(src->sin_addr));
-        
-        atomic_fetch_add(&vfserver.stats.drops, 1);
-        return;
-    }
-
-    /**
-     * Submit to TUN.
-     * The kernel will receive a valid, decrypted IPv4/IPv6 packet.
-     */
-    vfast_submit_write(io, io->tun_fd, OP_TUN_WRITE, payload_ptr, plain_len, NULL);
+    vfast_submit_write(io, io->tun_fd, OP_TUN_WRITE, payload, plen, NULL);
 }
 
 /**
- * @brief Handles a Rekey Request from the client (Passive Rekey).
- * The client has generated a new key and wants the server to switch.
+ * @brief Handles Rekey Request: [Verify KID] -> [Load Next Key] -> [ACK] -> [Commit]
+ * @param payload Decrypted/Unpadded payload from vpn_unpack.
+ * @param plen    Length of the decrypted payload.
  */
-static inline void vfast_handle_rekey_req(vfast_io_t *io, vpn_session_t *s, uint8_t *data, int len, struct sockaddr_in *src) {
-    if (unlikely(!data || !io || !s)) return;
+static inline void vfast_handle_rekey_req(vfast_io_t *io, vpn_session_t *s, 
+                                          uint8_t *payload, int plen, struct sockaddr_in *src) {
+    /* 1. Validation: Payload should contain [KeyID (4B)][Raw Key (32B)] */
+    const int req_size = 4 + REKEY_KEY_SIZE;
+    if (unlikely(!payload || plen < req_size || !s)) return;
 
-    int plain_len = 0;
-    uint32_t recv_sid = 0;
+    /* 2. Parse Key ID and Raw Key from the decrypted payload */
+    uint32_t r_kid = ntohl(*(uint32_t *)payload);
+    uint8_t *r_key = payload + 4;
 
-    /**
-     * CRITICAL: Decrypt and Unpack.
-     * vpn_unpack performs in-place decryption and returns a pointer to the 
-     * start of the plain IP packet.
-     */
-    uint8_t *payload_ptr = vpn_unpack(&s->sec_ctx, data, len, 
-                                      &plain_len, &recv_sid);
-    if (unlikely(!payload_ptr || plain_len <= 0)) {
-        log_warn("Ingress: Decryption failed or invalid packet from %s", 
-                 inet_ntoa(src->sin_addr));
-        
-        atomic_fetch_add(&vfserver.stats.drops, 1);
+    /* 3. Security Validation: Ensure monotonic increase of Key ID */
+    if (unlikely(r_kid <= s->sec_ctx.active_key.id)) {
+        log_warn("REKEY: Stale KeyID %u (Current: %u) from SID[0x%08x]", 
+                 r_kid, s->sec_ctx.active_key.id, s->session_id);
         return;
     }
 
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
-    
-    /**
-     * 1. Extract Payload with Offset.
-     * Payload structure: [KeyID (4B)][Raw Key (32B)]
-     */
-    uint8_t *payload = data + sizeof(vpn_tunnel_hdr_t);
-    /* Parse Key ID from the first 4 bytes (Network Byte Order) */
-    uint32_t received_kid = ntohl(*(uint32_t *)payload);
-    /* Extract the Raw Key after the 4-byte ID */
-    uint8_t *new_key_raw = payload + 4;
-
-    /**
-     * 2. Security Validation (Industrial Practice).
-     * Ensure the received KeyID is strictly greater than the current one 
-     * to prevent replay or out-of-order rekeying.
-     */
-    if (unlikely(received_kid <= s->sec_ctx.active_key.id)) {
-        log_warn("REKEY: Ignored stale KeyID %u (Current: %u) from SID[0x%08x]", 
-                 received_kid, s->sec_ctx.active_key.id, s->session_id);
-        return;
-    }
-
-    /* 3. Load into 'next' slot */
-    memcpy(s->sec_ctx.next_key.raw, new_key_raw, REKEY_KEY_SIZE);
-    s->sec_ctx.next_key.id = received_kid;
+    /* 4. Stage the next key into the security context */
+    memcpy(s->sec_ctx.next_key.raw, r_key, REKEY_KEY_SIZE);
+    s->sec_ctx.next_key.id = r_kid;
     s->sec_ctx.next_key.created_at = time(NULL);
     atomic_store(&s->sec_ctx.next_key.bytes_processed, 0);
 
     /**
-     * 4. Acknowledge the client (VPN_MSG_REKEY_ACK).
-     * Reuse the buffer to save allocation overhead.
+     * 5. Acknowledge the client (VPN_MSG_REKEY_ACK)
+     * We reuse the incoming buffer area for the response.
+     * The ACK payload echoes the received KeyID to confirm receipt.
      */
-    hdr->msg_type = VPN_MSG_REKEY_ACK;
-    /* ACK payload can be empty or echoing the KeyID. Here we echo the request. */
-    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, data, len, src);
+    uint8_t *base_buf = payload - VPN_TNL_HLEN;
+    
+    /* Prepare ACK payload: just the 4-byte KeyID */
+    *(uint32_t *)payload = htonl(r_kid);
+
+    /* Security Pipeline: Padding + Obfuscation for the ACK */
+    int flen = vpn_pack(&s->sec_ctx, base_buf, 4, BUF_SIZE, VPN_MSG_REKEY_ACK, s->session_id);
+
+    if (likely(flen > 0)) {
+        vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, base_buf, flen, src);
+    }
 
     /**
-     * 5. Commit the transition immediately.
-     * Server promotes the key as soon as ACK is sent. 
-     * The 'previous_key' in sec_ctx handles any inflight packets from client 
-     * that haven't received the ACK yet.
+     * 6. Transition Commitment
+     * Promote 'next_key' to 'active_key'. The previous key is kept in a 
+     * grace-period slot to handle late-arriving packets from the client.
      */
     vfast_rekey_commit(&s->sec_ctx);
     
-    log_info("REKEY: Committed for SID[0x%08x]. Active KeyID: %u", 
-             s->session_id, received_kid);
+    log_info("REKEY: Switched to KeyID %u for SID 0x%08x", r_kid, s->session_id);
 }
 
 /**
@@ -381,42 +333,56 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
         return -1;
     }
 
+    uint32_t sid = 0;
+    int plen = 0;
+    vpn_session_t *s = NULL;
+    uint8_t *payload = NULL;
+
+    /* Handled manually at the entrance for total control. */
+    vpn_remove_header_obfs(data, (size_t)len);
+
     /* 1. Map the VPN header to extract session information */
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
 
-    // vpn_debug_print_hdr(data, len);
-
-    if (hdr->msg_type == VPN_MSG_HELLO) {
-        return vfast_auth_request(io, len, data, src) ? 0 : -1;
+    sid = ntohl(hdr->session_id);
+    if (sid != 0) {
+        if (!vpn_lookup_session_by_sid(sid, &s)) {
+            atomic_fetch_add(&vfserver.stats.drops, 1);
+            log_warn("No session found for SID[0x%08x] from %s. Packet dropped.", sid, inet_ntoa(src->sin_addr));
+            return -1;
+        }
     }
 
-    uint32_t sid = ntohl(hdr->session_id);
-    vpn_session_t *s = NULL;
-    if (!vpn_lookup_session_by_sid(sid, &s)) {
+    payload = vpn_unpack(s ? &s->sec_ctx : NULL, data, len, &plen, &sid);
+    if (unlikely(!payload)) {
+        log_warn("Ingress: Decryption failed or invalid packet from %s", 
+                 inet_ntoa(src->sin_addr));
         atomic_fetch_add(&vfserver.stats.drops, 1);
-        log_warn("No session found for SID[0x%08x] from %s. Packet dropped.", sid, inet_ntoa(src->sin_addr));
-        return 0;
+        return -1;
     }
 
-    atomic_fetch_add(&s->sec_ctx.active_key.bytes_processed, (long)len);
+    if (s) atomic_fetch_add(&s->sec_ctx.active_key.bytes_processed, (long)len);
     
     /* 3. Dispatch based on message type */
     switch (hdr->msg_type) {
         case VPN_MSG_DATA: 
-            vfast_handle_data_msg(io, s, data, len, src);
+            vfast_handle_data(io, s, payload, plen, src);
+            break;
+        case VPN_MSG_HELLO:
+            vfast_handle_hello(io, payload, plen, src);
             break;
         case VPN_MSG_KEEPALIVE:
-            vfast_keeplive(io, s, data, len, src);
+            vfast_keeplive(io, s, payload, plen, src);
             break;
         case VPN_DPD_RESPONSE:
             log_info("Received DPD Response from %s. Session is alive.", inet_ntoa(src->sin_addr));
-            vpn_session_update_by_sid(hdr->session_id, src);
+            vpn_session_update_by_sid(ntohl(hdr->session_id), src);
             break;
         case VPN_MSG_REKEY_ACK:
             vfast_handle_rekey_ack(s);
             break;
         case VPN_MSG_REKEY_REQ:
-            vfast_handle_rekey_req(io, s, data, len, src);
+            vfast_handle_rekey_req(io, s, payload, plen, src);
             break;
         default:
             log_warn("Unknown VPN msg type: 0x%02x", hdr->msg_type);

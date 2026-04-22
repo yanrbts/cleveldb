@@ -150,7 +150,6 @@ void vfast_server_maintenance(vfast_io_t *io, void *data) {
     if (unlikely(!io || !data)) return;
 
     vpn_ip_pool_t *ipp = (vpn_ip_pool_t *)data;
-    /* Snapshot list of sessions requiring attention */
     vpn_expired_node_t expired_list[64];
     const int PROBE_SEC = 15;
     const int DEAD_SEC  = 30;
@@ -189,18 +188,32 @@ void vfast_server_maintenance(vfast_io_t *io, void *data) {
                 continue; 
             }
 
-            /* Overlay the protocol header onto the task's pre-allocated buffer */
-            vpn_tunnel_hdr_t *hb = (vpn_tunnel_hdr_t *)task->buf;
-            hb->msg_type = VPN_DPD_REQUEST;
-            hb->session_id = htonl(node->session_id);
+            /**
+             * 2. Security Pipeline Integration
+             * Even DPD probes must be masked.
+             * Since DPD usually has no payload, we pass plen = 0.
+             */
+            vpn_session_t *s = NULL;
+            /* We need the session context to get the security keys for packing */
+            if (unlikely(!vpn_lookup_session_by_sid(node->session_id, &s))) {
+                continue;
+            }
 
-            /* Submit asynchronous UDP sendto via io_uring */
-            vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, (uint8_t *)hb, 
-                               sizeof(*hb), &node->remote_addr);
-            
-            log_debug("DPD: Sent probe to session 0x%08x at %s:%d", 
-                      node->session_id, inet_ntoa(node->remote_addr.sin_addr), 
-                      ntohs(node->remote_addr.sin_port));
+            /**
+             * 3. Apply [Padding] -> [Header Fill] -> [Obfuscation]
+             * vpn_pack will turn this 0-byte payload into a 
+             * randomized, masked packet.
+             */
+            int tlen = vpn_pack(&s->sec_ctx, task->buf, 0, 
+                                BUF_SIZE, VPN_DPD_REQUEST, node->session_id);
+
+            if (likely(tlen > 0)) {
+                /* 4. Asynchronous Dispatch via io_uring */
+                vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, task->buf, 
+                                   tlen, &node->remote_addr);
+                
+                log_debug("DPD: Sent masked probe to SID[0x%08x]", node->session_id);
+            }
         }
     }
 }

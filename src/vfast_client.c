@@ -87,68 +87,52 @@ static void vfast_cleanup() {
 /**
  * @brief Handles incoming encrypted data packets (VPN_MSG_DATA).
  */
-static inline int client_handle_data(vfast_io_t *io, uint8_t *data, int len) {
+static inline int client_handle_data(vfast_io_t *io, uint8_t *payload, int plen) {
     /* Silently drop data packets if the FSM is not in CONNECTED state */
     if (unlikely(!vfast_fsm_is_connected(&vfclient.fsm))) {
         return 0; 
     }
-
-    int plain_ip_len = 0;
-    uint32_t recv_sid = 0;
-
-    /* In-place decryption and unpacking using the session master key */
-    uint8_t *payload_ptr = vpn_unpack(vfclient.active_ptr, data, len, 
-                                      &plain_ip_len, &recv_sid);
-
-    if (unlikely(!payload_ptr)) {
-        log_warn("Ingress: Decryption failed or MAC mismatch.");
-        return -1;
-    }
-
-    /* Verify Session ID to prevent cross-talk or stale session data */
-    if (unlikely(recv_sid != vfclient.fsm.sid)) {
-        log_warn("Ingress: SID mismatch (Expected: 0x%08x, Got: 0x%08x)", 
-                 vfclient.fsm.sid, recv_sid);
-        return 0;
-    }
-
     /* Forward decrypted IP packet to TUN device via asynchronous io_uring write */
-    vfast_submit_write(io, io->tun_fd, OP_TUN_WRITE, payload_ptr, plain_ip_len, NULL);
+    vfast_submit_write(io, io->tun_fd, OP_TUN_WRITE, payload, plen, NULL);
     return 0;
 }
 
 /**
  * @brief Handles handshake responses (VPN_MSG_HELLO) from the server.
  */
-static inline int client_handle_hello(vfast_io_t *io, uint8_t *data, int len) {
+static inline int client_handle_hello(vfast_io_t *io, uint32_t sid, uint8_t *payload, int plen) {
     UNUSED(io);
-    UNUSED(len);
 
     /* State Lock: ignore subsequent HELLO if already established */
     if (vfast_fsm_is_connected(&vfclient.fsm)) {
         return 0; 
     }
 
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
-    vpn_auth_t *auth = (vpn_auth_t *)(data + sizeof(vpn_tunnel_hdr_t));
-    
-    /* Validate Session ID provided by the server */
-    uint32_t new_sid = ntohl(hdr->session_id);
-    if (unlikely(new_sid == 0)) {
-        log_error("Ingress: Server returned an invalid Session ID (0)");
+    /* 2. Boundary and Integrity Validation */
+    if (unlikely(!payload || plen < (int)sizeof(vpn_auth_t))) {
+        log_error("Ingress: HELLO payload too small or null (len: %d)", plen);
         return -1;
     }
 
+    if (unlikely(sid == 0)) {
+        log_error("Ingress: Server assigned a NULL SID (0x00000000)");
+        return -1;
+    }
+
+    vpn_auth_t *auth = (vpn_auth_t *)payload;
+    
     /* Persist session parameters */
     vfast_sec_ctx_t *ctx = atomic_load(&vfclient.active_ptr);
     memcpy(ctx->active_key.raw, auth->init_key, REKEY_KEY_SIZE);
-    ctx->active_key.id = auth->key_id;
+    ctx->active_key.id = ntohl(auth->key_id);
     ctx->active_key.created_at = time(NULL);
-    ctx->sid = new_sid;
+    ctx->sid = sid;
+
+    /* Reset stats and state machine flags */
     atomic_store(&ctx->active_key.bytes_processed, 0);
     atomic_store(&ctx->rekey_pending, false);
 
-    vfclient.fsm.sid = new_sid;
+    vfclient.fsm.sid = sid;
     vfclient.fsm.vip = auth->vip;
     vfclient.fsm.sec = ctx;
 
@@ -229,18 +213,31 @@ static inline void client_handle_dpd(vfast_io_t *io, uint8_t *data, struct socka
 
     /* 1. Use the macro to find the original task context */
     vfast_task_t *task = vfast_data_to_task(data);
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)task->buf;
+    uint32_t sid = vfclient.fsm.sid;
+    /**
+     * 2. Security Pipeline Integration
+     * A DPD response usually carries no payload (plen = 0).
+     * vpn_pack will:
+     * - Wipe the old header.
+     * - Fill a new header with VPN_DPD_RESPONSE and current SID.
+     * - Apply random padding (1-32 bytes) to erase fixed-size fingerprints.
+     * - XOR-obfuscate the header.
+     */
+    int tlen = vpn_pack(vfclient.active_ptr, task->buf, 0, 
+                        BUF_SIZE, VPN_DPD_RESPONSE, sid);
 
-    /* 2. Modify header for response */
-    hdr->msg_type = VPN_DPD_RESPONSE;
+    if (unlikely(tlen <= 0)) {
+        log_error("DPD: Failed to pack DPD response for SID 0x%08x", sid);
+        return;
+    }
 
     /**
-     * 3. Send back only the header.
-     * The task->in_use remains true because this is an OP_UDP_SEND.
-     * It will be set to false in the main io_run loop's completion handling.
+     * 3. Asynchronous Dispatch via io_uring
+     * The task remains 'in_use' until the CQE is reaped in the main loop.
      */
-    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, 
-                      task->buf, (int)sizeof(vpn_tunnel_hdr_t), src);
+    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, task->buf, tlen, src);
+
+    log_debug("DPD: Sent masked DPD response (len: %d) to server", tlen);
 }
 
 /**
@@ -258,34 +255,52 @@ static inline void client_handle_dpd(vfast_io_t *io, uint8_t *data, struct socka
  * @return 0 on success, -1 on protocol/validation error.
  */
 int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
-    UNUSED(src);
     UNUSED(arg);
 
+    uint32_t sid = 0;
+    int plen = 0;
+    uint8_t *payload = NULL;
+
     /* 1. Preliminary Boundary Check */
-    if (unlikely(len < (int)sizeof(vpn_tunnel_hdr_t))) {
+    if (unlikely(len < (int)VPN_TNL_HLEN)) {
         log_warn("Ingress: Packet dropped (too short: %d bytes)", len);
         return -1;
     }
 
+    /* 2. PHASE 1: Mandatory De-obfuscation (Peel the shell)
+     * Every packet from the modified server is XOR-masked.
+     */
+    vpn_remove_header_obfs(data, (size_t)len);
+
+    /* Direct mapping to inspect the header */
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
+
+    /**
+     * 3. PHASE 2: Conditional Unpack
+     * If it's a HELLO packet, we MUST pass NULL for the security context 
+     * because the session isn't fully established or re-keyed yet.
+     */
+    vfast_sec_ctx_t *sec = (hdr->msg_type == VPN_MSG_HELLO) ? NULL : vfclient.active_ptr;
+    
+    payload = vpn_unpack(sec, data, len, &plen, &sid);
+    
+    // if (unlikely(!payload)) {
+    //     log_warn("Ingress: Unpack failed for msg_type 0x%02x", hdr->msg_type);
+    //     return -1;
+    // }
 
     /**
      * 2. Heartbeat Watchdog Update
      * Only update the last receive timestamp for valid protocol message types.
      * This prevents Dead Peer Detection (DPD) from being spoofed by garbage traffic.
      */
-    if (hdr->msg_type == VPN_MSG_DATA || 
-        hdr->msg_type == VPN_MSG_KEEPALIVE || 
-        hdr->msg_type == VPN_MSG_HELLO ||
-        hdr->msg_type == VPN_DPD_REQUEST) {
-        vfast_fsm_update(&vfclient.fsm);
-    }
+    vfast_fsm_update(&vfclient.fsm);
 
     switch (hdr->msg_type) {
     case VPN_MSG_DATA:
-        return client_handle_data(io, data, len);
+        return client_handle_data(io, payload, plen);
     case VPN_MSG_HELLO:
-        return client_handle_hello(io, data, len);
+        return client_handle_hello(io, sid, payload, plen);
     case VPN_MSG_KEEPALIVE:
         break;
     case VPN_DPD_REQUEST:
@@ -305,7 +320,7 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
 
 /**
  * @brief Processes plain IP packets from TUN, encrypts/packs them, and sends to Server.
- * * Path: TUN (Plain) -> vpn_pack (Encrypt + Header) -> UDP (Ciphertext)
+ * Path: TUN (Plain) -> vpn_pack (Encrypt + Header) -> UDP (Ciphertext)
  * @param io    The io_uring engine context.
  * @param data  The pointer to the plain IP packet (already at task->buf + VPN_TNL_HLEN).
  * @param len   The length of the plain IP packet.

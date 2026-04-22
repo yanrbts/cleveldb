@@ -3,8 +3,11 @@
  * Author: [yanruibing]
  * All rights reserved.
  */
+
 #include <string.h>
 #include <time.h>
+#include <arpa/inet.h>
+
 #include "log.h"
 #include "auth.h"
 
@@ -15,20 +18,20 @@ void vfast_auth_pack(vpn_auth_t *auth, uint32_t vip, const uint8_t *token,
     /* Initialize memory to zero to prevent information leakage from stack/heap padding */
     memset(auth, 0, sizeof(vpn_auth_t));
 
-    auth->magic = VFAST_MAGIC;
+    auth->magic = htonl(VFAST_MAGIC);
     auth->vip   = vip;
-    auth->ts    = (ts != 0) ? ts : (uint64_t)time(NULL);
-    auth->key_id = key_id;
+    uint64_t final_ts = (ts != 0) ? ts : (uint64_t)time(NULL);
+    auth->ts = htobe64(final_ts);
+    auth->key_id = htonl(key_id);
     if (init_key) memcpy(auth->init_key, init_key, 32);
     if (token) memcpy(auth->token, token, 12);
-
 }
 
 int vfast_auth_verify(const vpn_auth_t *auth, const uint8_t *expected_token) {
     if (!auth) return -1;
 
     /* Check magic first to quickly drop irrelevant network noise */
-    if (auth->magic != VFAST_MAGIC) {
+    if (ntohl(auth->magic) != VFAST_MAGIC) {
         return -2;
     }
 
