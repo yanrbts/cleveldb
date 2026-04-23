@@ -75,11 +75,11 @@ static void client_signal_handler(int sig) {
 static void vfast_cleanup() {
     log_info("Initiating system shutdown and resource cleanup...");
     
-    vpn_tun_destroy(&vfclient.tun);
+    vf_tun_destroy(&vfclient.tun);
     if (vfclient.udp) {
         udp_close(vfclient.udp);
     }
-    vpn_option_clean(&vfclient.opt);
+    vf_option_clean(&vfclient.opt);
 
     log_info("Cleanup complete. Exit.");
 }
@@ -89,7 +89,7 @@ static void vfast_cleanup() {
  */
 static inline int client_handle_data(vfast_io_t *io, uint8_t *payload, int plen) {
     /* Silently drop data packets if the FSM is not in CONNECTED state */
-    if (unlikely(!vfast_fsm_is_connected(&vfclient.fsm))) {
+    if (unlikely(!vf_fsm_is_connected(&vfclient.fsm))) {
         return 0; 
     }
     /* Forward decrypted IP packet to TUN device via asynchronous io_uring write */
@@ -104,7 +104,7 @@ static inline int client_handle_hello(vfast_io_t *io, uint32_t sid, uint8_t *pay
     UNUSED(io);
 
     /* State Lock: ignore subsequent HELLO if already established */
-    if (vfast_fsm_is_connected(&vfclient.fsm)) {
+    if (vf_fsm_is_connected(&vfclient.fsm)) {
         return 0; 
     }
 
@@ -143,7 +143,7 @@ static inline int client_handle_hello(vfast_io_t *io, uint32_t sid, uint8_t *pay
      * Synchronous Interface Configuration: transition to 
      * ST_CONNECTED only if the system call succeeds.
      */
-    if (vpn_tun_set_ip(vfclient.tun.name, ip_str, VFAST_BROADCAST) == 0) {
+    if (vf_tun_set_ip(vfclient.tun.name, ip_str, VFAST_BROADCAST) == 0) {
         atomic_store(&vfclient.fsm.state, ST_CONNECTED);
         log_info("Tunnel Successfully Established: VIP=%s, SID=0x%08x", 
                  ip_str, vfclient.fsm.sid);
@@ -178,12 +178,12 @@ void vfast_handle_new_key(void) {
     memcpy(next_buf, curr, sizeof(vfast_sec_ctx_t));
     
     /* Move Active Key to Previous, and Promote Next Key to Active */
-    vfast_rekey_commit(next_buf); 
+    vf_rekey_commit(next_buf); 
 
     /**
      * Step 2: Atomic Pointer Swap.
      * We use 'memory_order_release' to ensure that all previous memory writes 
-     * (the memcpy and vfast_rekey_commit) are visible to any thread that 
+     * (the memcpy and vf_rekey_commit) are visible to any thread that 
      * performs an 'acquire' load of this pointer.
      */
     atomic_store_explicit(&vfclient.active_ptr, next_buf, memory_order_release);
@@ -222,13 +222,13 @@ static inline void client_handle_dpd(vfast_io_t *io, uint8_t *data, struct socka
     /**
      * 2. Security Pipeline Integration
      * A DPD response usually carries no payload (plen = 0).
-     * vpn_pack will:
+     * vf_pack will:
      * - Wipe the old header.
      * - Fill a new header with VPN_DPD_RESPONSE and current SID.
      * - Apply random padding (1-32 bytes) to erase fixed-size fingerprints.
      * - XOR-obfuscate the header.
      */
-    int tlen = vpn_pack(vfclient.active_ptr, task->buf, (int)sizeof(dummy), 
+    int tlen = vf_pack(vfclient.active_ptr, task->buf, (int)sizeof(dummy), 
                         BUF_SIZE, VPN_DPD_RESPONSE, sid);
 
     if (unlikely(tlen <= 0)) {
@@ -275,7 +275,7 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     /* 2. PHASE 1: Mandatory De-obfuscation (Peel the shell)
      * Every packet from the modified server is XOR-masked.
      */
-    vpn_remove_header_obfs(data, (size_t)len);
+    vf_remove_header_obfs(data, (size_t)len);
 
     /* Direct mapping to inspect the header */
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
@@ -288,14 +288,14 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
      */
     vfast_sec_ctx_t *sec = (hdr->msg_type == VPN_MSG_HELLO) ? NULL : vfclient.active_ptr;
     
-    payload = vpn_unpack(sec, data, len, &plen);
+    payload = vf_unpack(sec, data, len, &plen);
 
     /**
      * 2. Heartbeat Watchdog Update
      * Only update the last receive timestamp for valid protocol message types.
      * This prevents Dead Peer Detection (DPD) from being spoofed by garbage traffic.
      */
-    vfast_fsm_update(&vfclient.fsm);
+    vf_fsm_update(&vfclient.fsm);
 
     switch (hdr->msg_type) {
     case VPN_MSG_DATA:
@@ -321,7 +321,7 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
 
 /**
  * @brief Processes plain IP packets from TUN, encrypts/packs them, and sends to Server.
- * Path: TUN (Plain) -> vpn_pack (Encrypt + Header) -> UDP (Ciphertext)
+ * Path: TUN (Plain) -> vf_pack (Encrypt + Header) -> UDP (Ciphertext)
  * @param io    The io_uring engine context.
  * @param data  The pointer to the plain IP packet (already at task->buf + VPN_TNL_HLEN).
  * @param len   The length of the plain IP packet.
@@ -334,7 +334,7 @@ int client_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     UNUSED(arg);
     
     /* 1. Connection Check: Drop packets if not authenticated */
-    if (unlikely(!vfast_fsm_is_connected(&vfclient.fsm))) {
+    if (unlikely(!vf_fsm_is_connected(&vfclient.fsm))) {
         return 0;
     }
     /* Get the active context instantly via atomic pointer */
@@ -344,15 +344,15 @@ int client_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     atomic_fetch_add(&ctx->active_key.bytes_processed, (long)len);
     /**
      * 2. Direct Packing:
-     * Your vpn_pack expects 'buf' to be the start of the whole VFAST packet.
+     * Your vf_pack expects 'buf' to be the start of the whole VFAST packet.
      * Since 'data' starts at (task->buf + VPN_TNL_HLEN), we pass (data - VPN_TNL_HLEN).
      */
     uint8_t *vfast_packet_base = data - VPN_TNL_HLEN;
 
-    // int payload_len = vpn_apply_padding(vfast_packet_base, len, 32);
+    // int payload_len = vf_apply_padding(vfast_packet_base, len, 32);
     
     /* We use BUF_SIZE to prevent overflows during encryption (+40 bytes) */
-    int total_len = vpn_pack(ctx, 
+    int total_len = vf_pack(ctx, 
                              vfast_packet_base, 
                              len, 
                              BUF_SIZE, 
@@ -365,10 +365,10 @@ int client_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     }
 
     /* 2. Get next sequence from our global client context */
-    // uint32_t seq = vpn_get_next_sequence(&vfclient.fsm.next_seq);
+    // uint32_t seq = vf_get_next_sequence(&vfclient.fsm.next_seq);
     /* 3. HEADER OBFS (Post-encryption) */
     /* This makes the Header look like random noise */
-    // vpn_apply_header_obfs(vfast_packet_base, total_len);
+    // vf_apply_header_obfs(vfast_packet_base, total_len);
 
     /* 3. Submit Asynchronous UDP Send via io_uring */
     vfast_submit_write(io, 
@@ -385,7 +385,7 @@ static int vfast_init_secctx() {
     memset(&vfclient.sec_ctxs[0], 0, sizeof(vfast_sec_ctx_t));
     memset(&vfclient.sec_ctxs[1], 0, sizeof(vfast_sec_ctx_t));
 
-    vfast_rekey_init(&vfclient.sec_ctxs[0], 0);
+    vf_rekey_init(&vfclient.sec_ctxs[0], 0);
 
     atomic_init(&vfclient.active_ptr, &vfclient.sec_ctxs[0]);
 
@@ -401,7 +401,7 @@ static void vfast_rekey_timer_handler(vfast_io_t *io, void *arg) {
     vfast_rekey_mgr_t *mgr = (vfast_rekey_mgr_t *)arg;
     
     /* Security Check: FSM state validation */
-    if (unlikely(!vfast_fsm_is_connected(&vfclient.fsm))) {
+    if (unlikely(!vf_fsm_is_connected(&vfclient.fsm))) {
         goto reschedule;
     }
 
@@ -423,7 +423,7 @@ static void vfast_rekey_timer_handler(vfast_io_t *io, void *arg) {
     if (should_init || should_retry) {
         if (should_init) {
             /* Generate new key material if this is a fresh request */
-            if (vfast_rekey_prepare_next(ctx) != 0) {
+            if (vf_rekey_prepare_next(ctx) != 0) {
                 log_error("REKEY: Crypto entropy failure.");
                 goto reschedule;
             }
@@ -439,7 +439,7 @@ static void vfast_rekey_timer_handler(vfast_io_t *io, void *arg) {
             memcpy(payload, &net_kid, 4);
             memcpy(payload + 4, ctx->next_key.raw, REKEY_KEY_SIZE);
 
-            int total_len = vpn_pack(vfclient.active_ptr,               /* Use active session key */
+            int total_len = vf_pack(vfclient.active_ptr,               /* Use active session key */
                              task->buf,                                 /* Target buffer */
                              VPN_TNL_HLEN + 4 + REKEY_KEY_SIZE,         /* Keep-alive has 0-byte payload */
                              BUF_SIZE,                                  /* Buffer capacity */
@@ -492,9 +492,9 @@ static int vfast_init_client() {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
 
-    if (vpn_tun_init(&vfclient.tun, vfclient.opt.tun_name, 0) < 0) return -1;
-    vpn_tun_disable_ipv6(vfclient.opt.tun_name);
-    vpn_tun_set_status(vfclient.tun.name, vfclient.opt.mtu, 1);
+    if (vf_tun_init(&vfclient.tun, vfclient.opt.tun_name, 0) < 0) return -1;
+    vf_tun_disable_ipv6(vfclient.opt.tun_name);
+    vf_tun_set_status(vfclient.tun.name, vfclient.opt.mtu, 1);
     
     vfclient.udp = udp_init_listener(5887, vfclient.opt.udp_backlog);
     if (!vfclient.udp) {
@@ -554,7 +554,7 @@ int main(int argc, char *argv[]) {
      * that depend on the timezone.*/
     tzset();
 
-    vpn_option_init(&vfclient.opt);
+    vf_option_init(&vfclient.opt);
 
     if (argc >= 2) {
         j = 1;
@@ -569,7 +569,7 @@ int main(int argc, char *argv[]) {
         /* First argument is the config file name? */
         if (argv[j][0] != '-' || argv[j][1] != '-') {
             configfile = argv[j];
-            if ((tp = (char*)vpn_get_absolute_path(configfile)) != NULL) {
+            if ((tp = (char*)vf_get_absolute_path(configfile)) != NULL) {
                 zfree(vfclient.opt.cfile);
                 vfclient.opt.cfile = tp;
             } else {
@@ -578,7 +578,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    vpn_option_conf(&vfclient.opt, vfclient.opt.cfile);
+    vf_option_conf(&vfclient.opt, vfclient.opt.cfile);
     
     /* System Bootstrap */
     if (vfast_init_client() < 0) {
@@ -587,7 +587,7 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    vfast_fsm_init(
+    vf_fsm_init(
         &vfclient.fsm,
         &vfclient.io,
         vfclient.opt.remote_host, 
@@ -598,7 +598,7 @@ int main(int argc, char *argv[]) {
 
     vfast_io_run(&vfclient.io);
 
-    vfast_fsm_pthread_join(&vfclient.fsm);
+    vf_fsm_pthread_join(&vfclient.fsm);
     vfast_cleanup();
     return EXIT_SUCCESS;
 }

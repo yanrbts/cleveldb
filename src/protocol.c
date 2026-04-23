@@ -39,7 +39,7 @@ static inline uint16_t _calculate_checksum(uint16_t *buf, int len) {
 /**
  * @brief Industrial Encapsulation: [Padding] -> [Branching Encryption] -> [Obfuscation]
  * Pipeline ensures all packets, including plain-text control messages, are masked.
- * * @param sec      Session security context.
+ * @param sec      Session security context.
  * @param buf      Buffer base (Header starts at buf, Payload at buf + HLEN).
  * @param plen     Length of the raw L3/Control payload.
  * @param max_size Capacity of the buffer to prevent overflows.
@@ -47,7 +47,7 @@ static inline uint16_t _calculate_checksum(uint16_t *buf, int len) {
  * @param sid      Session ID for routing.
  * @return Total bytes for wire transmission, or -1 on error.
  */
-int vpn_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int plen, 
+int vf_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int plen, 
              int max_size, vpn_msg_t type, uint32_t sid) {
     
     if (unlikely(!buf)) return -1;
@@ -57,7 +57,7 @@ int vpn_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int plen,
     uint32_t kid = 0; 
 
     /* 1. Mandatory Padding: Add noise to hide packet size signatures */
-    int i_plen = vpn_apply_padding(buf, plen, 32);
+    int i_plen = vf_apply_padding(buf, plen, 32);
 
     /**
      * 2. Encryption Branching: 
@@ -68,23 +68,23 @@ int vpn_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int plen,
     } else {
         if (unlikely(!sec)) return -1;
         
-        const uint8_t *key = vfast_rekey_get_key(sec);
-        kid = vfast_rekey_get_key_id(sec);
+        const uint8_t *key = vf_rekey_get_key(sec);
+        kid = vf_rekey_get_keyid(sec);
 
-        if (unlikely(!key || vpn_encrypt(key, ptr, (size_t)i_plen, ptr, &out_len) != 0)) {
+        if (unlikely(!key || vf_encrypt(key, ptr, (size_t)i_plen, ptr, &out_len) != 0)) {
             log_error("Cipher error | SID: 0x%08x", sid);
             return -1;
         }
     }
 
     /* 3. Header Construction & Boundary Validation */
-    vpn_fill_header(buf, (uint8_t)type, sid, kid);
+    vf_fill_header(buf, (uint8_t)type, sid, kid);
 
     int tlen = VPN_TNL_HLEN + (int)out_len;
     if (unlikely(tlen > max_size)) return -1;
 
     /* 4. Mandatory Obfuscation: Mask header to bypass DPI pattern matching */
-    vpn_apply_header_obfs(buf, (size_t)tlen);
+    vf_apply_header_obfs(buf, (size_t)tlen);
 
     return tlen;
 }
@@ -94,7 +94,7 @@ int vpn_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int plen,
  * Restores the original IP packet from the masked UDP stream.
  * * @return Pointer to decrypted payload, or NULL on integrity/format failure.
  */
-uint8_t* vpn_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int res, int *out_plen) {
+uint8_t* vf_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int res, int *out_plen) {
     
     if (unlikely(!buf || res < (int)sizeof(vpn_tunnel_hdr_t))) return NULL;
 
@@ -106,22 +106,22 @@ uint8_t* vpn_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int res, int *out_
     size_t dlen = 0;
 
     /**
-     * 2. Decryption Branching: Matches the logic in vpn_pack.
+     * 2. Decryption Branching: Matches the logic in vf_pack.
      */
     if (hdr->msg_type == VPN_MSG_HELLO || hdr->msg_type == VPN_MSG_KEEPALIVE) {
         dlen = rlen;
     } else {
         if (unlikely(!sec)) return NULL;
-        const uint8_t *key = vfast_rekey_get_decrypt_key(sec, hdr->key_id);
+        const uint8_t *key = vf_rekey_get_decrypt_key(sec, hdr->key_id);
         
-        if (unlikely(!key || vpn_decrypt(key, ptr, rlen, ptr, &dlen) != 0)) {
+        if (unlikely(!key || vf_decrypt(key, ptr, rlen, ptr, &dlen) != 0)) {
             return NULL; /* Auth failure or decryption error */
         }
     }
 
     /* 3. Mandatory Unpadding: Restore exact length regardless of encryption state */
     size_t tlen = dlen + sizeof(vpn_tunnel_hdr_t);
-    if (unlikely(vpn_remove_padding(buf, &tlen) != 0)) return NULL;
+    if (unlikely(vf_remove_padding(buf, &tlen) != 0)) return NULL;
 
     if (out_plen) *out_plen = (int)(tlen - sizeof(vpn_tunnel_hdr_t));
 
@@ -154,7 +154,7 @@ static inline uint32_t vpn_fast_rand(uint32_t *seed) {
  * @param max_pad The upper bound for random padding (to control overhead).
  * @return int    The updated payload length (raw_len + padding_len).
  */
-int vpn_apply_padding(uint8_t *buf, int raw_len, uint8_t max_pad) {
+int vf_apply_padding(uint8_t *buf, int raw_len, uint8_t max_pad) {
     /* Fast path for invalid inputs */
     if (unlikely(!buf || raw_len <= 0)) {
         return raw_len;
@@ -222,7 +222,7 @@ int vpn_apply_padding(uint8_t *buf, int raw_len, uint8_t max_pad) {
  * updated (decremented) if padding is removed.
  * @return int    Returns 0 on success, -1 if the packet is malformed.
  */
-int vpn_remove_padding(uint8_t *buf, size_t *p_len) {
+int vf_remove_padding(uint8_t *buf, size_t *p_len) {
     /* 1. Basic sanity check */
     if (unlikely(!buf || !p_len || *p_len < VPN_TNL_HLEN)) {
         return -1;
@@ -269,7 +269,7 @@ int vpn_remove_padding(uint8_t *buf, size_t *p_len) {
  * @param buf      Pointer to the start of the VFAST packet (task->buf).
  * @param wire_len The total length of the packet to be transmitted.
  */
-void vpn_apply_header_obfs(uint8_t *buf, size_t wire_len) {
+void vf_apply_header_obfs(uint8_t *buf, size_t wire_len) {
     if (unlikely(!buf || wire_len < VPN_TNL_HLEN)) {
         return;
     }
@@ -312,7 +312,7 @@ void vpn_apply_header_obfs(uint8_t *buf, size_t wire_len) {
  * @param buf      Pointer to the received raw UDP payload (task->buf).
  * @param wire_len Total bytes received from the socket.
  */
-void vpn_remove_header_obfs(uint8_t *buf, size_t wire_len) {
+void vf_remove_header_obfs(uint8_t *buf, size_t wire_len) {
     /* 1. Basic sanity check: ensure we have at least a full header */
     if (unlikely(!buf || wire_len < VPN_TNL_HLEN)) {
         return;
@@ -332,7 +332,7 @@ void vpn_remove_header_obfs(uint8_t *buf, size_t wire_len) {
     /**
      * 3. Mask Reversal:
      * XOR is its own inverse ( (A ^ B) ^ B = A ).
-     * We follow the exact same bitwise operations as vpn_apply_header_obfs.
+     * We follow the exact same bitwise operations as vf_apply_header_obfs.
      */
     
     /* Restore the first 4 bytes (Version, MsgType, Flags, PaddingLen) */

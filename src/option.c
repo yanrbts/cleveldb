@@ -55,7 +55,7 @@ static inline bool is_valid_ipv4(const char *ip) {
 /**
  * @brief Initializes the vpn_option_t structure using predefined macros.
  */
-void vpn_option_init(vpn_option_t *opt) {
+void vf_option_init(vpn_option_t *opt) {
     if (!opt) return;
 
     /* Common */
@@ -84,7 +84,7 @@ void vpn_option_init(vpn_option_t *opt) {
     opt->local_port    = VPN_OPT_LOCAL_PORT;
 }
 
-void vpn_option_conf(vpn_option_t *opt, const char *cfile) {
+void vf_option_conf(vpn_option_t *opt, const char *cfile) {
     FILE *fp;
     FILE *logfp;
     char *err = NULL;
@@ -249,7 +249,7 @@ loaderr:
     exit(1);
 }
 
-void vpn_option_clean(vpn_option_t *opt) {
+void vf_option_clean(vpn_option_t *opt) {
     if (!opt) return;
 
     if (opt->logfile) zfree(opt->logfile);

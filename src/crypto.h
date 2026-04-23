@@ -25,7 +25,7 @@
  * @param out_len Pointer to store the resulting total packet size.
  * @return int 0 on success.
  */
-int vpn_encrypt(const uint8_t key[CRYPTO_KEY_SIZE], 
+int vf_encrypt(const uint8_t key[CRYPTO_KEY_SIZE], 
                 const uint8_t *plain, size_t len, 
                 uint8_t *out_packet, size_t *out_len);
 
@@ -38,7 +38,7 @@ int vpn_encrypt(const uint8_t key[CRYPTO_KEY_SIZE],
  * @param out_len Pointer to store the decrypted data length.
  * @return int 0 on success, -1 on invalid length, -2 on authentication failure.
  */
-int vpn_decrypt(const uint8_t key[CRYPTO_KEY_SIZE], 
+int vf_decrypt(const uint8_t key[CRYPTO_KEY_SIZE], 
                 const uint8_t *packet, size_t packet_len, 
                 uint8_t *out_plain, size_t *out_len);
 
@@ -49,12 +49,12 @@ int vpn_decrypt(const uint8_t key[CRYPTO_KEY_SIZE],
  * @param out_key 32-byte buffer for the key.
  * @return int 0 on success, -1 on failure.
  */
-int vpn_generate_key(uint8_t out_key[CRYPTO_KEY_SIZE]);
+int vf_generate_key(uint8_t out_key[CRYPTO_KEY_SIZE]);
 
 /**
  * @brief Securely erases sensitive data.
  * Call this in your session cleanup logic.
  */
-void vpn_secure_cleanup(uint8_t *key, size_t size);
+void vf_secure_cleanup(uint8_t *key, size_t size);
 
 #endif

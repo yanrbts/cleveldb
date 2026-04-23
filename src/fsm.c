@@ -42,15 +42,15 @@ static void fsm_send_pkt(vfast_fsm_t *fsm, uint8_t type) {
     if (type == VPN_MSG_HELLO) {
         /**
          * HANDSHAKE PHASE:
-         * At this stage, no session key is negotiated. vpn_pack will skip 
+         * At this stage, no session key is negotiated. vf_pack will skip 
          * encryption and perform plain-text encapsulation.
          */
         vpn_auth_t *auth = (vpn_auth_t *)(task->buf + VPN_TNL_HLEN);
         
         /* Populate authentication credentials directly into the reserved payload offset */
-        vfast_auth_pack(auth, fsm->vip, (uint8_t *)VFAST_TOKEN, 0, NULL, 0);
+        vf_auth_pack(auth, fsm->vip, (uint8_t *)VFAST_TOKEN, 0, NULL, 0);
 
-        total_len = vpn_pack(NULL,                 /* No key available yet */
+        total_len = vf_pack(NULL,                 /* No key available yet */
                              task->buf,            /* Target buffer */
                              sizeof(vpn_auth_t),   /* Payload length */
                              BUF_SIZE,             /* Buffer capacity */
@@ -62,7 +62,7 @@ static void fsm_send_pkt(vfast_fsm_t *fsm, uint8_t type) {
          * Keep-alive packets are encrypted using the negotiated session key to
          * obscure traffic patterns and prevent protocol fingerprinting.
          */
-        total_len = vpn_pack(fsm->sec,   /* Use active session key */
+        total_len = vf_pack(fsm->sec,   /* Use active session key */
                              task->buf,            /* Target buffer */
                              0,                    /* Keep-alive has 0-byte payload */
                              BUF_SIZE,             /* Buffer capacity */
@@ -141,7 +141,7 @@ static void *fsm_worker(void *arg) {
 /**
  * @brief Initializes the FSM with io_uring support.
  */
-int vfast_fsm_init(vfast_fsm_t *fsm, vfast_io_t *io, const char *sip, uint16_t sport, atomic_bool *running, const uint8_t *key) {
+int vf_fsm_init(vfast_fsm_t *fsm, vfast_io_t *io, const char *sip, uint16_t sport, atomic_bool *running, const uint8_t *key) {
     if (!io || !sip) return -1;
 
     memset(fsm, 0, sizeof(vfast_fsm_t));
@@ -165,19 +165,19 @@ int vfast_fsm_init(vfast_fsm_t *fsm, vfast_io_t *io, const char *sip, uint16_t s
 }
 
 /* Remaining functions vfast_fsm_update_rx, etc., stay unchanged */
-void vfast_fsm_update(vfast_fsm_t *fsm) { 
+void vf_fsm_update(vfast_fsm_t *fsm) { 
     atomic_store(&fsm->last_rx_time, time(NULL));
 }
 
-int vfast_fsm_is_connected(vfast_fsm_t *fsm) { 
+int vf_fsm_is_connected(vfast_fsm_t *fsm) { 
     return atomic_load(&fsm->state) == ST_CONNECTED; 
 }
 
-void vfast_fsm_force_reconnect(vfast_fsm_t *fsm) {
+void vf_fsm_force_reconnect(vfast_fsm_t *fsm) {
     atomic_store(&fsm->state, ST_IDLE);
     atomic_store(&fsm->sid, 0); 
 }
 
-void vfast_fsm_pthread_join(vfast_fsm_t *fsm) {
+void vf_fsm_pthread_join(vfast_fsm_t *fsm) {
     pthread_join(fsm->thread_id, NULL);
 }

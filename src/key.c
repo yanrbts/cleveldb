@@ -26,7 +26,7 @@ static int vfast_crypto_fill_random(void *buf, size_t len) {
     return 0;
 }
 
-void vfast_rekey_init(vfast_sec_ctx_t *ctx, uint32_t sid) {
+void vf_rekey_init(vfast_sec_ctx_t *ctx, uint32_t sid) {
     memset(ctx, 0, sizeof(vfast_sec_ctx_t));
     ctx->sid = sid;
 
@@ -41,7 +41,7 @@ void vfast_rekey_init(vfast_sec_ctx_t *ctx, uint32_t sid) {
 /**
  * Check if the active key has expired based on time or throughput.
  */
-bool vfast_rekey_needed(vfast_sec_ctx_t *ctx) {
+bool vf_rekey_needed(vfast_sec_ctx_t *ctx) {
     if (ctx->rekey_pending) return false;
 
     time_t now = time(NULL);
@@ -55,7 +55,7 @@ bool vfast_rekey_needed(vfast_sec_ctx_t *ctx) {
  * Phase 1: Generate a new key and mark the session as 'rekeying'.
  * This key should be sent to the peer via the control plane.
  */
-int vfast_rekey_prepare_next(vfast_sec_ctx_t *ctx) {
+int vf_rekey_prepare_next(vfast_sec_ctx_t *ctx) {
     memset(&ctx->next_key, 0, sizeof(vfast_key_t));
     
     if (vfast_crypto_fill_random(ctx->next_key.raw, REKEY_KEY_SIZE) != 0) {
@@ -73,7 +73,7 @@ int vfast_rekey_prepare_next(vfast_sec_ctx_t *ctx) {
  * Phase 2: Smooth Transition (The "Double Buffering" trick)
  * Move Active -> Previous, and Next -> Active.
  */
-void vfast_rekey_commit(vfast_sec_ctx_t *ctx) {
+void vf_rekey_commit(vfast_sec_ctx_t *ctx) {
     /* Store current active key as previous to handle out-of-order packets */
     memcpy(&ctx->previous_key, &ctx->active_key, sizeof(vfast_key_t));
 

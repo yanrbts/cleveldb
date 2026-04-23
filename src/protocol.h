@@ -66,8 +66,8 @@ typedef enum {
     VPN_MSG_DISCONNECT = 0x04,
     VPN_DPD_REQUEST    = 0x05,  /* Dead Peer Detection Request */
     VPN_DPD_RESPONSE   = 0x06,  /* Dead Peer Detection Response */
-    VPN_MSG_REKEY_REQ  = 0x07,  /* Triggered by vfast_rekey_needed */
-    VPN_MSG_REKEY_ACK  = 0x08   /* Confirmation to call vfast_rekey_commit */
+    VPN_MSG_REKEY_REQ  = 0x07,  /* Triggered by vf_rekey_needed */
+    VPN_MSG_REKEY_ACK  = 0x08   /* Confirmation to call vf_rekey_commit */
 } vpn_msg_t;
 
 /* * Packed Structure for Network Transmission
@@ -110,7 +110,7 @@ typedef struct {
  * Before: [8B Gap] [Payload(N)]
  * After:  [Header(8B)] [Nonce(24B)] [Cipher(N)] [Tag(16B)]
  */
-int vpn_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int payload_len, int max_buf_size, vpn_msg_t type, uint32_t sid);
+int vf_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int payload_len, int max_buf_size, vpn_msg_t type, uint32_t sid);
 
 /**
  * @brief Decapsulates, authenticates, and decrypts incoming VFAST packets.
@@ -133,7 +133,7 @@ int vpn_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int payload_len, int max_
  *
  * @warning This function modifies the buffer in-place during decryption.
  */
-uint8_t* vpn_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int received_len, int *out_ip_len);
+uint8_t* vf_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int received_len, int *out_ip_len);
 
 /**
  * @brief Encapsulates the tunnel header with protocol-specific metadata.
@@ -147,7 +147,7 @@ uint8_t* vpn_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int received_len, 
  * @param sid  The Session ID assigned during the HELLO exchange.
  * @param kid  The Key ID currently active in the security context.
  */
-static inline void vpn_fill_header(void *buf, uint8_t type, uint32_t sid, uint32_t kid) {
+static inline void vf_fill_header(void *buf, uint8_t type, uint32_t sid, uint32_t kid) {
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
 
     hdr->version  = VPN_VERSION;
@@ -172,7 +172,7 @@ static inline void vpn_fill_header(void *buf, uint8_t type, uint32_t sid, uint32
  * @param task    The task structure containing the buffer and current payload length.
  * @param max_pad The maximum number of padding bytes to add (e.g., 0-255).
  */
-int vpn_apply_padding(uint8_t *buf, int raw_len, uint8_t max_pad);
+int vf_apply_padding(uint8_t *buf, int raw_len, uint8_t max_pad);
 
 /**
  * @brief Strips trailing noise and restores the original IP packet length.
@@ -184,7 +184,7 @@ int vpn_apply_padding(uint8_t *buf, int raw_len, uint8_t max_pad);
  * updated (decremented) if padding is removed.
  * @return int    Returns 0 on success, -1 if the packet is malformed.
  */
-int vpn_remove_padding(uint8_t *buf, size_t *p_len);
+int vf_remove_padding(uint8_t *buf, size_t *p_len);
 
 /**
  * @brief Obfuscates the tunnel header to prevent protocol fingerprinting.
@@ -195,7 +195,7 @@ int vpn_remove_padding(uint8_t *buf, size_t *p_len);
  * @param buf      Pointer to the start of the VFAST packet (task->buf).
  * @param wire_len The total length of the packet to be transmitted.
  */
-void vpn_apply_header_obfs(uint8_t *buf, size_t wire_len);
+void vf_apply_header_obfs(uint8_t *buf, size_t wire_len);
 
 /**
  * @brief Restores the tunnel header by reversing the XOR mask.
@@ -205,7 +205,7 @@ void vpn_apply_header_obfs(uint8_t *buf, size_t wire_len);
  * @param buf      Pointer to the received raw UDP payload (task->buf).
  * @param wire_len Total bytes received from the socket.
  */
-void vpn_remove_header_obfs(uint8_t *buf, size_t wire_len);
+void vf_remove_header_obfs(uint8_t *buf, size_t wire_len);
 
 
 void vpn_debug_print_hdr(const void *buf, int len);

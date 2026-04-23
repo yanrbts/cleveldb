@@ -55,7 +55,7 @@ int vfast_load_key(const char *key_path, uint8_t out_key[CRYPTO_KEY_SIZE]) {
     if (bytes_read != CRYPTO_KEY_SIZE) {
         log_error("Key file '%s' is corrupted (Size: %zd, Expected: %d)", 
                   key_path, bytes_read, CRYPTO_KEY_SIZE);
-        vpn_secure_cleanup(out_key, CRYPTO_KEY_SIZE);
+        vf_secure_cleanup(out_key, CRYPTO_KEY_SIZE);
         return -1;
     }
 
@@ -79,8 +79,8 @@ void vfast_cmd_keygen(void) {
     log_info("[ VFAST ] Initializing high-entropy key generation...");
 
     /* Phase 1: Entropy Collection
-     * vpn_generate_key must wrap a secure CSPRNG (like getrandom(2) or /dev/urandom) */
-    if (unlikely(vpn_generate_key(tmp_key) != 0)) {
+     * vf_generate_key must wrap a secure CSPRNG (like getrandom(2) or /dev/urandom) */
+    if (unlikely(vf_generate_key(tmp_key) != 0)) {
         log_error("CRITICAL: System failed to provide sufficient entropy.");
         exit(EXIT_FAILURE);
     }
@@ -125,14 +125,14 @@ void vfast_cmd_keygen(void) {
 
     /* Phase 5: Memory Scrubbing
      * Zero out the key in memory to prevent cold-boot attacks or heap/stack leaks. */
-    vpn_secure_cleanup(tmp_key, CRYPTO_KEY_SIZE);
+    vf_secure_cleanup(tmp_key, CRYPTO_KEY_SIZE);
     
     log_info("[ SUCCESS ]: Key generated and locked in '%s' (Mode: 0600).", key_file);
     log_info("Keep this file offline. Compromise of this file compromises the entire tunnel.");
     exit(EXIT_SUCCESS);
 
 cleanup_fail:
-    vpn_secure_cleanup(tmp_key, CRYPTO_KEY_SIZE);
+    vf_secure_cleanup(tmp_key, CRYPTO_KEY_SIZE);
     exit(EXIT_FAILURE);
 }
 
@@ -159,7 +159,7 @@ void vfast_server_maintenance(vfast_io_t *io, void *data) {
      * Fetch a batch of session metadata that exceeds inactivity thresholds.
      * The session module remains "clean" as it only performs read-only scanning here.
      */
-    int count = vpn_session_get_expired(expired_list, 64, PROBE_SEC, DEAD_SEC);
+    int count = vf_ss_get_expired(expired_list, 64, PROBE_SEC, DEAD_SEC);
     if (count <= 0) return;
 
     /**
@@ -175,11 +175,9 @@ void vfast_server_maintenance(vfast_io_t *io, void *data) {
                      node->session_id, node->virtual_ip);
             
             /* Physical deletion from session internal sharded tables */
-            // vpn_session_delete_by_sid(node->session_id);
-            vpn_session_delete(node->virtual_ip);
-            
+            vf_ss_delete(node->virtual_ip);
             /* Release the virtual IP back to the pool for reuse */
-            vpn_ip_pool_free(ipp, node->virtual_ip);
+            vf_ip_pool_free(ipp, node->virtual_ip);
         } else {
             /* Strategy B: Active Probing (Keep-alive) */
             vfast_task_t *task = vfast_borrow_task(io);
@@ -195,16 +193,16 @@ void vfast_server_maintenance(vfast_io_t *io, void *data) {
              */
             vpn_session_t *s = NULL;
             /* We need the session context to get the security keys for packing */
-            if (unlikely(!vpn_lookup_session_by_sid(node->session_id, &s))) {
+            if (unlikely(!vf_ss_lookup_by_sid(node->session_id, &s))) {
                 continue;
             }
 
             /**
              * 3. Apply [Padding] -> [Header Fill] -> [Obfuscation]
-             * vpn_pack will turn this 0-byte payload into a 
+             * vf_pack will turn this 0-byte payload into a 
              * randomized, masked packet.
              */
-            int tlen = vpn_pack(&s->sec_ctx, task->buf, 0, 
+            int tlen = vf_pack(&s->sec_ctx, task->buf, 0, 
                                 BUF_SIZE, VPN_DPD_REQUEST, node->session_id);
 
             if (likely(tlen > 0)) {
@@ -223,7 +221,7 @@ void vfast_path_mtu_updated(uint32_t new_mtu, void *arg) {
 
     vfast_io_t *io = (vfast_io_t *)arg;
 
-    if (vfast_tun_set_mtu_by_fd(io->tun_fd, new_mtu) != 0) {
+    if (vf_tun_set_mtu_by_fd(io->tun_fd, new_mtu) != 0) {
         log_error("Failed to update TUN MTU to %u: %s", new_mtu, strerror(errno));
     } else {
         log_info("TUN MTU successfully updated to %u bytes", new_mtu);

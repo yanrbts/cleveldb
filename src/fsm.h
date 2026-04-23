@@ -38,10 +38,10 @@ typedef struct {
 } vfast_fsm_t;
 
 /* Signature updated to accept vfast_io_t */
-int vfast_fsm_init(vfast_fsm_t *fsm, vfast_io_t *io, const char *sip, uint16_t sport, atomic_bool *running, const uint8_t *key);
-void vfast_fsm_update(vfast_fsm_t *fsm);
-int vfast_fsm_is_connected(vfast_fsm_t *fsm);
-void vfast_fsm_force_reconnect(vfast_fsm_t *fsm);
-void vfast_fsm_pthread_join(vfast_fsm_t *fsm);
+int vf_fsm_init(vfast_fsm_t *fsm, vfast_io_t *io, const char *sip, uint16_t sport, atomic_bool *running, const uint8_t *key);
+void vf_fsm_update(vfast_fsm_t *fsm);
+int vf_fsm_is_connected(vfast_fsm_t *fsm);
+void vf_fsm_force_reconnect(vfast_fsm_t *fsm);
+void vf_fsm_pthread_join(vfast_fsm_t *fsm);
 
 #endif

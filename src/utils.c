@@ -18,7 +18,7 @@
 #include "zmalloc.h"
 #include "utils.h"
 
-int vpn_set_nonblocking(int fd) {
+int vf_set_nonblocking(int fd) {
     if (fd < 0) return -EINVAL;
 
     int flags = fcntl(fd, F_GETFL, 0);
@@ -40,7 +40,7 @@ int vpn_set_nonblocking(int fd) {
  * The function does not try to normalize everything, but only the obvious
  * case of one or more "../" appearning at the start of "filename"
  * relative path. */
-const char *vpn_get_absolute_path(char *filename) {
+const char *vf_get_absolute_path(char *filename) {
     char *ptr = NULL;
     char absolute_path[PATH_MAX];
     struct stat st;
@@ -65,7 +65,7 @@ const char *vpn_get_absolute_path(char *filename) {
 }
 
 /* Internal helper to get monotonic time in milliseconds */
-uint64_t vpn_now_ms(void) {
+uint64_t vf_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
@@ -100,7 +100,7 @@ int ip_ntop(uint32_t ip_bin, char *out_str, size_t size) {
  * @brief Thread-safe sequence generator.
  * Optimized for high-concurrency IO workers.
  */
-uint32_t vpn_get_next_sequence(atomic_uint_fast32_t *nextsq) {
+uint32_t vf_get_next_sequence(atomic_uint_fast32_t *nextsq) {
     if (unlikely(!nextsq)) return 0;
 
     /**

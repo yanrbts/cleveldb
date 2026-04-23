@@ -40,7 +40,7 @@ static inline uint32_t vpn_get_shard_idx(uint32_t ip) {
  *
  * Return: A 32-bit cryptographically random SessionID aligned to the IP's shard.
  */
-uint32_t vpn_generate_sid(uint32_t v_ip) {
+uint32_t vf_ss_generate_sid(uint32_t v_ip) {
     /* Calculate the target shard index based on the Virtual IP */
     uint32_t target_idx = vpn_get_shard_idx(v_ip);
     uint32_t raw_rand;
@@ -76,7 +76,7 @@ uint32_t vpn_generate_sid(uint32_t v_ip) {
     return sid;
 }
 
-int vpn_session_init(void) {
+int vf_ss_init(void) {
     for (int i = 0; i < VPN_SESSION_SHARD_COUNT; i++) {
         g_shards[i].ip_table = NULL;
         g_shards[i].sid_table = NULL;
@@ -89,7 +89,7 @@ int vpn_session_init(void) {
     return 0;
 }
 
-void vpn_session_update(uint32_t v_ip, uint32_t s_id, const struct sockaddr_in *addr) {
+void vf_ss_update(uint32_t v_ip, uint32_t s_id, const struct sockaddr_in *addr) {
     if (!addr) return;
 
     uint32_t idx = vpn_get_shard_idx(v_ip);
@@ -104,7 +104,7 @@ void vpn_session_update(uint32_t v_ip, uint32_t s_id, const struct sockaddr_in *
             s->virtual_ip = v_ip;
             s->session_id = s_id;
 
-            vfast_rekey_init(&s->sec_ctx, s_id); // Initialize security context for this session
+            vf_rekey_init(&s->sec_ctx, s_id); // Initialize security context for this session
 
             HASH_ADD(hh_ip, g_shards[idx].ip_table, virtual_ip, sizeof(uint32_t), s);
             HASH_ADD(hh_sid, g_shards[idx].sid_table, session_id, sizeof(uint32_t), s);
@@ -126,7 +126,7 @@ void vpn_session_update(uint32_t v_ip, uint32_t s_id, const struct sockaddr_in *
 }
 
 /**
- * vpn_session_update_by_sid - Rapidly refreshes session activity via SessionID.
+ * vf_ss_update_by_sid - Rapidly refreshes session activity via SessionID.
  * @s_id: The unique 32-bit SessionID extracted from the UDP tunnel header.
  * @addr: The source address of the incoming UDP packet (for Roaming/Mobility support).
  *
@@ -136,7 +136,7 @@ void vpn_session_update(uint32_t v_ip, uint32_t s_id, const struct sockaddr_in *
  * associated Virtual IP, we can perform a localized search within a single shard
  * lock, significantly reducing global contention.
  */
-void vpn_session_update_by_sid(uint32_t s_id, const struct sockaddr_in *addr) {
+void vf_ss_update_by_sid(uint32_t s_id, const struct sockaddr_in *addr) {
     /* 1. Defensive programming: Ensure input validity */
     if (unlikely(!addr)) {
         return;
@@ -178,49 +178,16 @@ void vpn_session_update_by_sid(uint32_t s_id, const struct sockaddr_in *addr) {
     pthread_rwlock_unlock(&g_shards[idx].lock);
 }
 
-bool vpn_session_lookup_by_ip(uint32_t v_ip, uint32_t *out_sid, struct sockaddr_in *out_addr) {
-    uint32_t idx = vpn_get_shard_idx(v_ip);
-    vpn_session_t *s = NULL;
-    bool found = false;
-
-    pthread_rwlock_rdlock(&g_shards[idx].lock);
-    
-    HASH_FIND(hh_ip, g_shards[idx].ip_table, &v_ip, sizeof(uint32_t), s);
-    if (s) {
-        if (out_sid) *out_sid = s->session_id;
-        if (out_addr) memcpy(out_addr, &s->remote_addr, sizeof(struct sockaddr_in));
-        found = true;
-    }
-    
-    pthread_rwlock_unlock(&g_shards[idx].lock);
-    return found;
-}
-
-bool vpn_session_lookup_by_sid(uint32_t s_id, uint32_t *out_v_ip, struct sockaddr_in *out_addr) {
-    uint32_t idx = vpn_get_shard_idx(s_id); 
-    vpn_session_t *s = NULL;
-    bool found = false;
-
-    pthread_rwlock_rdlock(&g_shards[idx].lock);
-    HASH_FIND(hh_sid, g_shards[idx].sid_table, &s_id, sizeof(uint32_t), s);
-    if (s) {
-        if (out_v_ip) *out_v_ip = s->virtual_ip;
-        if (out_addr) memcpy(out_addr, &s->remote_addr, sizeof(struct sockaddr_in));
-        found = true;
-    }
-    pthread_rwlock_unlock(&g_shards[idx].lock);
-    return found;
-}
 
 /**
- * vpn_session_delete - Remove a session from both IP and SID hash tables.
+ * vf_ss_delete - Remove a session from both IP and SID hash tables.
  * @v_ip: The virtual IP address (Network Byte Order) used as the primary key.
  *
  * This function performs a dual-index removal. Since both indexes (hh_ip and hh_sid)
  * point to the same memory object, we must detach the object from both tables 
  * before calling zfree() to prevent dangling pointers and memory corruption.
  */
-void vpn_session_delete(uint32_t v_ip) {
+void vf_ss_delete(uint32_t v_ip) {
     /* Determine which shard contains this IP */
     uint32_t idx = vpn_get_shard_idx(v_ip);
     vpn_session_t *s = NULL;
@@ -257,7 +224,7 @@ void vpn_session_delete(uint32_t v_ip) {
     pthread_rwlock_unlock(&g_shards[idx].lock);
 }
 
-bool vpn_lookup_session_by_sid(uint32_t sid, vpn_session_t **outs) {
+bool vf_ss_lookup_by_sid(uint32_t sid, vpn_session_t **outs) {
     uint32_t idx = vpn_get_shard_idx(sid); 
     vpn_session_t *s = NULL;
 
@@ -269,7 +236,7 @@ bool vpn_lookup_session_by_sid(uint32_t sid, vpn_session_t **outs) {
     return s != NULL;
 }
 
-bool vpn_lookup_session_by_ip(uint32_t vip, vpn_session_t **outs) {
+bool vf_ss_lookup_by_ip(uint32_t vip, vpn_session_t **outs) {
     uint32_t idx = vpn_get_shard_idx(vip); 
     vpn_session_t *s = NULL;
 
@@ -289,7 +256,7 @@ bool vpn_lookup_session_by_ip(uint32_t vip, vpn_session_t **outs) {
  * This function iterates through all shards. It is designed to be called 
  * by a background maintenance thread or a periodic timer in the main loop.
  */
-void vpn_session_clean_timeout(vpn_ip_pool_t *ipp, int timeout_sec) {
+void vf_ss_clean_timeout(vpn_ip_pool_t *ipp, int timeout_sec) {
     time_t now = time(NULL);
 
     /* Iterate through all shards to distribute the locking overhead */
@@ -307,7 +274,7 @@ void vpn_session_clean_timeout(vpn_ip_pool_t *ipp, int timeout_sec) {
                 
                 /* Return the virtual IP to the pool for reuse by other clients */
                 if (ipp) {
-                    vpn_ip_pool_free(ipp, s->virtual_ip);
+                    vf_ip_pool_free(ipp, s->virtual_ip);
                 }
 
                 /* Detach from both hash indexes simultaneously */
@@ -323,7 +290,7 @@ void vpn_session_clean_timeout(vpn_ip_pool_t *ipp, int timeout_sec) {
     }
 }
 
-void vpn_session_destroy(void) {
+void vf_ss_destroy(void) {
     for (int i = 0; i < VPN_SESSION_SHARD_COUNT; i++) {
         vpn_session_t *s, *tmp;
         pthread_rwlock_wrlock(&g_shards[i].lock);
@@ -338,7 +305,7 @@ void vpn_session_destroy(void) {
     log_info("VPN_SESSION: Manager destroyed.");
 }
 
-int vpn_session_get_expired(vpn_expired_node_t *list, int max_count, 
+int vf_ss_get_expired(vpn_expired_node_t *list, int max_count, 
                              int probe_sec, int dead_sec) {
     int count = 0;
     time_t now = time(NULL);
@@ -363,4 +330,41 @@ int vpn_session_get_expired(vpn_expired_node_t *list, int max_count,
         if (count >= max_count) break;
     }
     return count;
+}
+
+/**
+ * @brief Retrieves the total number of active sessions across all shards.
+ * This function iterates through all memory shards, acquiring a read lock
+ * on each to ensure thread safety while querying the uthash structure.
+ * @note Complexity: O(N) where N is the number of shards. 
+ * The underlying HASH_CNT macro is O(1).
+ * @return uint32_t Total count of active sessions.
+ */
+uint32_t vf_ss_get_total_count(void) {
+    uint32_t total_count = 0;
+    int locked_shards = 0;
+
+    for (int i = 0; i < VPN_SESSION_SHARD_COUNT; i++) {
+        /* Use read-lock to allow concurrent lookups while counting */
+        if (pthread_rwlock_rdlock(&g_shards[i].lock) == 0) {
+            /**
+             * HASH_CNT is a uthash macro that returns the number of items
+             * currently in the hash table by reading the internal counter.
+             */
+            total_count += HASH_CNT(hh_ip, g_shards[i].ip_table);
+            pthread_rwlock_unlock(&g_shards[i].lock);
+            locked_shards++;
+        } else {
+            /* Logging on critical synchronization failure */
+            log_error("SESSION: Failed to acquire rdlock on shard %d", i);
+        }
+    }
+
+    /* Verify if we successfully scanned all shards */
+    if (unlikely(locked_shards < VPN_SESSION_SHARD_COUNT)) {
+        log_warn("SESSION: Partial count returned due to shard lock contention (%d/%d)", 
+                 locked_shards, VPN_SESSION_SHARD_COUNT);
+    }
+
+    return total_count;
 }

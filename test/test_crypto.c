@@ -24,7 +24,7 @@ int main() {
 
     // 1. 密钥生成测试
     uint8_t key[CRYPTO_KEY_SIZE];
-    if (vpn_generate_key(key) != 0) {
+    if (vf_generate_key(key) != 0) {
         printf("[FAIL] Key generation failed\n");
         return -1;
     }
@@ -52,7 +52,7 @@ int main() {
     // 4. 加密测试 (原地加密)
     size_t encrypted_packet_len = 0;
     // 注意：输入是 payload_ptr，输出也是 payload_ptr (原地覆盖)
-    int enc_ret = vpn_encrypt(key, payload_ptr, raw_len, payload_ptr, &encrypted_packet_len);
+    int enc_ret = vf_encrypt(key, payload_ptr, raw_len, payload_ptr, &encrypted_packet_len);
     
     if (enc_ret != 0) {
         printf("[FAIL] Encryption failed with code: %d\n", enc_ret);
@@ -71,7 +71,7 @@ int main() {
     // 模拟从网络收到数据后进行解密
     // 输入: payload_ptr (包含 Nonce+Cipher+Tag)
     // 输出: decrypted_data
-    int dec_ret = vpn_decrypt(key, payload_ptr, encrypted_packet_len, decrypted_data, &decrypted_len);
+    int dec_ret = vf_decrypt(key, payload_ptr, encrypted_packet_len, decrypted_data, &decrypted_len);
 
     if (dec_ret != 0) {
         printf("\n[FAIL] Decryption failed with code: %d\n", dec_ret);
@@ -95,7 +95,7 @@ int main() {
     printf("\n[Step 4] Tamper Test (Modifying 1 byte of ciphertext...)\n");
     payload_ptr[CRYPTO_NONCE_SIZE + 1] ^= 0xFF; // 修改密文中的一个字节
     
-    dec_ret = vpn_decrypt(key, payload_ptr, encrypted_packet_len, decrypted_data, &decrypted_len);
+    dec_ret = vf_decrypt(key, payload_ptr, encrypted_packet_len, decrypted_data, &decrypted_len);
     if (dec_ret == -2) {
         printf("[SUCCESS] Tamper detected! Decryption blocked.\n");
     } else {
@@ -103,7 +103,7 @@ int main() {
         return -1;
     }
 
-    vpn_secure_cleanup(key, CRYPTO_KEY_SIZE);
+    vf_secure_cleanup(key, CRYPTO_KEY_SIZE);
     printf("\n=== All Tests Passed ===\n");
     return 0;
 }

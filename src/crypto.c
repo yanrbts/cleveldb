@@ -62,7 +62,7 @@ static void get_fast_nonce(uint8_t nonce[CRYPTO_NONCE_SIZE]) {
  * * DESIGN NOTE: To support in-place encryption (out_packet == plain), 
  * we must shift the data to make room for the 24-byte Nonce header.
  */
-int vpn_encrypt(const uint8_t key[CRYPTO_KEY_SIZE], 
+int vf_encrypt(const uint8_t key[CRYPTO_KEY_SIZE], 
                 const uint8_t *restrict plain, size_t len, 
                 uint8_t *restrict out_packet, size_t *out_len) {
     
@@ -111,7 +111,7 @@ int vpn_encrypt(const uint8_t key[CRYPTO_KEY_SIZE],
  * @param out_len    Pointer to store decrypted length.
  * @return 0 on success, -1 on length error, -2 on auth failure (tampering).
  */
-int vpn_decrypt(const uint8_t key[CRYPTO_KEY_SIZE], 
+int vf_decrypt(const uint8_t key[CRYPTO_KEY_SIZE], 
                 const uint8_t *packet, size_t packet_len, 
                 uint8_t *out_plain, size_t *out_len) {
     
@@ -124,7 +124,7 @@ int vpn_decrypt(const uint8_t key[CRYPTO_KEY_SIZE],
         return -1;
     }
 
-    /* 3. Pointer Arithmetic (Matched with vpn_encrypt layout) */
+    /* 3. Pointer Arithmetic (Matched with vf_encrypt layout) */
     const uint8_t *nonce  = packet;
     const uint8_t *cipher = packet + CRYPTO_NONCE_SIZE;
     size_t plain_len      = packet_len - CRYPTO_NONCE_SIZE - CRYPTO_TAG_SIZE;
@@ -153,7 +153,7 @@ int vpn_decrypt(const uint8_t key[CRYPTO_KEY_SIZE],
  * @param out_key 32-byte buffer for the key.
  * @return int 0 on success, -1 on failure.
  */
-int vpn_generate_key(uint8_t out_key[CRYPTO_KEY_SIZE]) {
+int vf_generate_key(uint8_t out_key[CRYPTO_KEY_SIZE]) {
     /* GRND_RANDOM is usually not needed; default (0) uses /dev/urandom logic 
      * but ensures the pool has been seeded at least once. */
     ssize_t ret = getrandom(out_key, 32, 0);
@@ -169,7 +169,7 @@ int vpn_generate_key(uint8_t out_key[CRYPTO_KEY_SIZE]) {
  * @brief Securely erases sensitive data.
  * Call this in your session cleanup logic.
  */
-void vpn_secure_cleanup(uint8_t *key, size_t size) {
+void vf_secure_cleanup(uint8_t *key, size_t size) {
     if (key) {
         crypto_wipe(key, size); // Monocypher's secure erase
     }

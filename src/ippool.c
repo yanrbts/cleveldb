@@ -13,7 +13,7 @@
 #include "utils.h"
 #include "ippool.h"
 
-int vpn_ip_pool_init(vpn_ip_pool_t *pool, const char *cidr_start, uint32_t size) {
+int vf_ip_pool_init(vpn_ip_pool_t *pool, const char *cidr_start, uint32_t size) {
     if (unlikely(!pool || !cidr_start || size == 0)) {
         return -EINVAL;
     }
@@ -59,7 +59,7 @@ int vpn_ip_pool_init(vpn_ip_pool_t *pool, const char *cidr_start, uint32_t size)
     return 0;
 }
 
-uint32_t vpn_ip_pool_alloc(vpn_ip_pool_t *pool) {
+uint32_t vf_ip_pool_alloc(vpn_ip_pool_t *pool) {
     if (unlikely(!pool || !pool->bitmap)) return 0;
 
     pthread_mutex_lock(&pool->lock);
@@ -83,7 +83,7 @@ uint32_t vpn_ip_pool_alloc(vpn_ip_pool_t *pool) {
     return 0;
 }
 
-void vpn_ip_pool_free(vpn_ip_pool_t *pool, uint32_t ip) {
+void vf_ip_pool_free(vpn_ip_pool_t *pool, uint32_t ip) {
     if (unlikely(!pool || !pool->bitmap || ip == 0)) return;
 
     uint32_t host_ip = ntohl(ip);
@@ -103,7 +103,7 @@ void vpn_ip_pool_free(vpn_ip_pool_t *pool, uint32_t ip) {
     pthread_mutex_unlock(&pool->lock);
 }
 
-void vpn_ip_pool_destroy(vpn_ip_pool_t *pool) {
+void vf_ip_pool_destroy(vpn_ip_pool_t *pool) {
     if (!pool) return;
     
     pthread_mutex_lock(&pool->lock);

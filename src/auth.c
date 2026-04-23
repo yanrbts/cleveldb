@@ -11,7 +11,7 @@
 #include "log.h"
 #include "auth.h"
 
-void vfast_auth_pack(vpn_auth_t *auth, uint32_t vip, const uint8_t *token, 
+void vf_auth_pack(vpn_auth_t *auth, uint32_t vip, const uint8_t *token, 
     uint32_t key_id, const uint8_t *init_key, uint64_t ts) {
     if (!auth) return;
 
@@ -27,7 +27,7 @@ void vfast_auth_pack(vpn_auth_t *auth, uint32_t vip, const uint8_t *token,
     if (token) memcpy(auth->token, token, 12);
 }
 
-int vfast_auth_verify(const vpn_auth_t *auth, const uint8_t *expected_token) {
+int vf_auth_verify(const vpn_auth_t *auth, const uint8_t *expected_token) {
     if (!auth) return -1;
 
     /* Check magic first to quickly drop irrelevant network noise */
@@ -46,7 +46,7 @@ int vfast_auth_verify(const vpn_auth_t *auth, const uint8_t *expected_token) {
     return 0;
 }
 
-void vfast_auth_parse(const vpn_auth_t *auth, uint32_t *vip, uint64_t *ts) {
+void vf_auth_parse(const vpn_auth_t *auth, uint32_t *vip, uint64_t *ts) {
     if (!auth) return;
 
     if (vip) *vip = auth->vip;

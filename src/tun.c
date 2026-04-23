@@ -19,13 +19,13 @@
 #define VPN_TUN_DEVICE "/dev/net/tun"
 
 /**
- * vpn_tun_init - Initialize a Linux TUN device with high-performance flags.
+ * vf_tun_init - Initialize a Linux TUN device with high-performance flags.
  * @ctx: Context structure to store the file descriptor and device name.
  * @dev_name: Desired interface name (e.g., "tun%d" for auto).
  * @multi_queue: Enable IFF_MULTI_QUEUE for parallel processing with io_uring.
  * @return Returns: 0 on success, negative error code on failure.
  */
-int vpn_tun_init(vpn_tun_ctx_t *ctx, const char *dev_name, int multi_queue) {
+int vf_tun_init(vpn_tun_ctx_t *ctx, const char *dev_name, int multi_queue) {
     struct ifreq ifr;
     int fd = -1;
     int ret = 0;
@@ -74,7 +74,7 @@ int vpn_tun_init(vpn_tun_ctx_t *ctx, const char *dev_name, int multi_queue) {
     }
 
     /* 5. Set Non-Blocking mode for io_uring compatibility */
-    ret = vpn_set_nonblocking(fd);
+    ret = vf_set_nonblocking(fd);
     if (ret < 0) {
         log_error("Failed to set O_NONBLOCK on %s: %d", ifr.ifr_name, ret);
         goto error_cleanup;
@@ -96,14 +96,14 @@ error_cleanup:
 }
 
 /**
- * vpn_tun_set_status - Configure interface MTU and administrative state (UP/DOWN).
+ * vf_tun_set_status - Configure interface MTU and administrative state (UP/DOWN).
  * @dev_name: The name of the interface (e.g., "tun0").
  * @mtu: The Maximum Transmission Unit size. If <= 0, MTU is not changed.
  * @up: Boolean flag; 1 to bring the interface UP, 0 to bring it DOWN.
  *
  * @return Returns: 0 on success, or a negative error code (e.g., -errno).
  */
-int vpn_tun_set_status(const char *dev_name, int mtu, int up) {
+int vf_tun_set_status(const char *dev_name, int mtu, int up) {
     int sock = -1;
     struct ifreq ifr;
     int ret = 0;
@@ -164,14 +164,14 @@ cleanup:
 }
 
 /**
- * vpn_tun_set_ip - Assign an IPv4 address and netmask to the TUN interface.
+ * vf_tun_set_ip - Assign an IPv4 address and netmask to the TUN interface.
  * @dev_name: The name of the interface (e.g., "tun0").
  * @ip_addr:  IPv4 address string (e.g., "10.0.0.1").
  * @netmask:  IPv4 netmask string (e.g., "255.255.255.0").
  *
  * @return Returns: 0 on success, or a negative error code.
  */
-int vpn_tun_set_ip(const char *dev_name, const char *ip_addr, const char *netmask) {
+int vf_tun_set_ip(const char *dev_name, const char *ip_addr, const char *netmask) {
     int sock = -1;
     struct ifreq ifr;
     struct sockaddr_in addr;
@@ -231,13 +231,13 @@ cleanup:
 }
 
 /**
- * vpn_tun_destroy - Close the TUN device and clear context.
+ * vf_tun_destroy - Close the TUN device and clear context.
  * @ctx: Pointer to the TUN context structure.
  *
  * Note: Closing the file descriptor normally triggers the kernel to 
  * destroy the virtual interface unless 'persist' mode was specifically enabled.
  */
-void vpn_tun_destroy(vpn_tun_ctx_t *ctx) {
+void vf_tun_destroy(vpn_tun_ctx_t *ctx) {
     if (!ctx) {
         return;
     }
@@ -264,7 +264,7 @@ void vpn_tun_destroy(vpn_tun_ctx_t *ctx) {
  * @param mtu Desired MTU value.
  * @return 0 on success, -errno on failure.
  */
-int vpn_tun_set_mtu_by_name(const char *dev_name, int mtu) {
+int vf_tun_set_mtu_by_name(const char *dev_name, int mtu) {
     /* Parameter Validation: RFC 791 requires minimum IPv4 MTU of 68 */
     if (!dev_name || mtu < 68) {
         return -EINVAL;
@@ -309,7 +309,7 @@ int vpn_tun_set_mtu_by_name(const char *dev_name, int mtu) {
  * @param mtu The target MTU value (e.g., 1400).
  * @return 0 on success, -1 on failure with errno set.
  */
-int vfast_tun_set_mtu_by_fd(int tun_fd, int mtu) {
+int vf_tun_set_mtu_by_fd(int tun_fd, int mtu) {
     if (tun_fd < 0 || mtu <= 0) {
         errno = EINVAL;
         return -1;
@@ -352,7 +352,7 @@ int vfast_tun_set_mtu_by_fd(int tun_fd, int mtu) {
     return 0;
 }
 
-void vpn_tun_disable_ipv6(const char *dev_name) {
+void vf_tun_disable_ipv6(const char *dev_name) {
     char path[128];
     snprintf(path, sizeof(path), "/proc/sys/net/ipv6/conf/%s/disable_ipv6", dev_name);
     FILE *f = fopen(path, "w");

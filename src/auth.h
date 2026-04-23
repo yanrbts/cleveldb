@@ -32,7 +32,7 @@ typedef struct {
 } __attribute__((packed)) vpn_auth_t;
 
 /**
- * vfast_auth_pack - Serializes parameters into a wire-ready auth structure.
+ * vf_auth_pack - Serializes parameters into a wire-ready auth structure.
  * @param auth:  Pointer to the destination vpn_auth_t structure.
  * @param vip:   Virtual IP to be encoded.
  * @param token: Pointer to a 16-byte buffer containing the auth token.
@@ -43,11 +43,11 @@ typedef struct {
  * This function guarantees a clean memory state by zero-initializing 
  * the structure before assignment, preventing sensitive data leakage.
  */
-void vfast_auth_pack(vpn_auth_t *auth, uint32_t vip, const uint8_t *token, 
+void vf_auth_pack(vpn_auth_t *auth, uint32_t vip, const uint8_t *token, 
     uint32_t key_id, const uint8_t *init_key, uint64_t ts);
 
 /**
- * vfast_auth_verify - Validates the integrity and authenticity of the payload.
+ * vf_auth_verify - Validates the integrity and authenticity of the payload.
  * @param auth:           The received auth structure to validate.
  * @param  expected_token: The reference token to compare against (16 bytes).
  *
@@ -57,10 +57,10 @@ void vfast_auth_pack(vpn_auth_t *auth, uint32_t vip, const uint8_t *token,
  * -2: Magic mismatch (Packet not belonging to VFAST protocol).
  * -3: Token mismatch (Unauthorized access or invalid credentials).
  */
-int vfast_auth_verify(const vpn_auth_t *auth, const uint8_t *expected_token);
+int vf_auth_verify(const vpn_auth_t *auth, const uint8_t *expected_token);
 
 /**
- * vfast_auth_parse - Safe data extraction helper.
+ * vf_auth_parse - Safe data extraction helper.
  * @param auth: Pointer to the validated vpn_auth_t structure.
  * @param vip:  Output pointer for the Virtual IP (optional, can be NULL).
  * @param ts:   Output pointer for the Timestamp (optional, can be NULL).
@@ -68,6 +68,6 @@ int vfast_auth_verify(const vpn_auth_t *auth, const uint8_t *expected_token);
  * Decouples field access from the logic, allowing for future changes in 
  * internal structure representation without breaking API consumers.
  */
-void vfast_auth_parse(const vpn_auth_t *auth, uint32_t *vip, uint64_t *ts);
+void vf_auth_parse(const vpn_auth_t *auth, uint32_t *vip, uint64_t *ts);
 
 #endif /* __AUTH_H__ */

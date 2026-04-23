@@ -60,6 +60,8 @@
 #include "tun.h"
 #include "io.h"
 #include "vfast.h"
+#include "cmd.h"
+#include "cmdengine.h"
 
 struct vfast_server {
     vpn_option_t    opt;
@@ -67,7 +69,7 @@ struct vfast_server {
     udp_conn_t     *udp;       /* UDP transport handle */
     vpn_tun_ctx_t   tun;       /* Virtual network interface */
     vpn_ip_pool_t   ip_pool;   /* IP address management */
-
+    pthread_t       cmd_tid;   /* cmd server thread id */
     struct {
         atomic_uint_least64_t rx_pkts;
         atomic_uint_least64_t tx_pkts;
@@ -85,7 +87,7 @@ static void signal_handler(int sig) {
 /**
  * @brief Processes HELLO packet and submits an asynchronous response.
  * Optimization Highlights:
- * 1. Zero-copy Response Construction: Invokes vfast_auth_pack directly on the 
+ * 1. Zero-copy Response Construction: Invokes vf_auth_pack directly on the 
  * task buffer to eliminate redundant stack allocation and memcpy.
  * 2. Pre-calculated Offsets: Minimizes pointer arithmetic during the hot path.
  * 3. Atomic Stats Integration: (Optional but recommended) for monitoring.
@@ -107,46 +109,46 @@ static bool vfast_handle_hello(vfast_io_t *io, uint8_t *payload, int plen, struc
 
     /* 3. Authentication: Validate client token */
     const uint8_t *secret = (const uint8_t *)VFAST_TOKEN;
-    if (vfast_auth_verify(auth, secret) != 0) {
+    if (vf_auth_verify(auth, secret) != 0) {
         log_warn("Auth failed: %s", inet_ntoa(src->sin_addr));
         return false;
     }
 
     /* 4. IPAM: Allocate Virtual IP from the global address pool */
-    uint32_t vip = vpn_ip_pool_alloc(&vfserver.ip_pool);
+    uint32_t vip = vf_ip_pool_alloc(&vfserver.ip_pool);
     if (unlikely(vip == 0)) {
         log_error("Resource exhaustion: IP Pool is empty. Rejecting %s", inet_ntoa(src->sin_addr));
         return false;
     }
     /* 5. Session Management: Generate SID and link VIP to physical address */
-    uint32_t sid = vpn_generate_sid(vip);
-    vpn_session_update(vip, sid, src);
+    uint32_t sid = vf_ss_generate_sid(vip);
+    vf_ss_update(vip, sid, src);
 
     /* 6. Response Construction: Reuse the same buffer for Egress (Zero-copy) */
     vpn_session_t *s = NULL;
-    if (!vpn_lookup_session_by_sid(sid, &s)) {
+    if (!vf_ss_lookup_by_sid(sid, &s)) {
         log_error("Unexpected error: Session not found after creation for SID[0x%08x]", sid);
         return false;
     }
 
     /**
-     * 6. Response Construction: Use vpn_pack for the full pipeline.
+     * 6. Response Construction: Use vf_pack for the full pipeline.
      * We need to find the base buffer. Assuming payload = buf + VPN_TNL_HLEN.
      */
     uint8_t *base_buf = payload - VPN_TNL_HLEN;
 
     /* Pack response data into the payload area */
-    vfast_auth_pack(auth, vip, secret, s->sec_ctx.active_key.id, 
+    vf_auth_pack(auth, vip, secret, s->sec_ctx.active_key.id, 
                     s->sec_ctx.active_key.raw, 0);
 
     /**
      * 7. The Security Pipeline: [Padding] -> [Header] -> [Obfuscation]
-     * We call vpn_pack with type HELLO. This handles:
+     * We call vf_pack with type HELLO. This handles:
      * - Random padding (to hide handshake size)
      * - Header filling (SID/KID)
      * - Header obfuscation (XOR masking)
      */
-    int tlen = vpn_pack(NULL, base_buf, (int)sizeof(vpn_auth_t), 
+    int tlen = vf_pack(NULL, base_buf, (int)sizeof(vpn_auth_t), 
                              BUF_SIZE, VPN_MSG_HELLO, sid);
 
     if (unlikely(tlen < 0)) return false;
@@ -201,27 +203,27 @@ static bool vfast_keeplive(vfast_io_t *io, vpn_session_t *s, uint8_t *payload, i
     }
 
     /* 3. Session Refresh: Update VIP-SID mapping and 'last_seen' timestamp */
-    vpn_session_update(s->virtual_ip, s->session_id, src);
+    vf_ss_update(s->virtual_ip, s->session_id, src);
 
     /* 4. Response Construction (In-place)
      * Update the heartbeat structure with current server-side metadata.
      */
     vpn_auth_t *res = (vpn_auth_t *)payload;
     uint64_t ts = (uint64_t)time(NULL);
-    vfast_auth_pack(res, s->virtual_ip, (uint8_t *)VFAST_TOKEN, 
+    vf_auth_pack(res, s->virtual_ip, (uint8_t *)VFAST_TOKEN, 
                     s->sec_ctx.active_key.id, NULL, ts);
 
     /**
      * 5. Egress Pipeline: [Padding] -> [Header Fill] -> [Obfuscation]
-     * We use vpn_pack to re-seal the packet. 
-     * Even if KEEPALIVE is plain-text, vpn_pack will:
+     * We use vf_pack to re-seal the packet. 
+     * Even if KEEPALIVE is plain-text, vf_pack will:
      * - Apply random padding (hiding the fixed heartbeat size).
      * - XOR the header (masking SID and MsgType).
      */
     uint8_t *base_buf = payload - VPN_TNL_HLEN;
     
     /* We use sizeof(vpn_auth_t) to ensure the ACK contains fresh metadata */
-    int tlen = vpn_pack(&s->sec_ctx, base_buf, (int)sizeof(vpn_auth_t), 
+    int tlen = vf_pack(&s->sec_ctx, base_buf, (int)sizeof(vpn_auth_t), 
                              BUF_SIZE, VPN_MSG_KEEPALIVE, s->session_id);
 
     if (unlikely(tlen < 0)) {
@@ -251,7 +253,7 @@ static inline void vfast_handle_data(vfast_io_t *io, vpn_session_t *s, uint8_t *
 
 /**
  * @brief Handles Rekey Request: [Verify KID] -> [Load Next Key] -> [ACK] -> [Commit]
- * @param payload Decrypted/Unpadded payload from vpn_unpack.
+ * @param payload Decrypted/Unpadded payload from vf_unpack.
  * @param plen    Length of the decrypted payload.
  */
 static inline void vfast_handle_rekey_req(vfast_io_t *io, vpn_session_t *s, 
@@ -288,7 +290,7 @@ static inline void vfast_handle_rekey_req(vfast_io_t *io, vpn_session_t *s,
     *(uint32_t *)payload = htonl(r_kid);
 
     /* Security Pipeline: Padding + Obfuscation for the ACK */
-    int flen = vpn_pack(&s->sec_ctx, base_buf, 4, BUF_SIZE, VPN_MSG_REKEY_ACK, s->session_id);
+    int flen = vf_pack(&s->sec_ctx, base_buf, 4, BUF_SIZE, VPN_MSG_REKEY_ACK, s->session_id);
 
     if (likely(flen > 0)) {
         vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, base_buf, flen, src);
@@ -299,7 +301,7 @@ static inline void vfast_handle_rekey_req(vfast_io_t *io, vpn_session_t *s,
      * Promote 'next_key' to 'active_key'. The previous key is kept in a 
      * grace-period slot to handle late-arriving packets from the client.
      */
-    vfast_rekey_commit(&s->sec_ctx);
+    vf_rekey_commit(&s->sec_ctx);
     
     log_info("REKEY: Switched to KeyID %u for SID 0x%08x", r_kid, s->session_id);
 }
@@ -315,7 +317,7 @@ static inline void vfast_handle_rekey_ack(vpn_session_t *s) {
     }
 
     /* Client is ready, we can now safely rotate keys */
-    vfast_rekey_commit(&s->sec_ctx);
+    vf_rekey_commit(&s->sec_ctx);
     
     log_info("REKEY: Committed for SID[0x%08x] (Server-initiated)", s->session_id);
 }
@@ -330,6 +332,7 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
      /* 1. Basic Validation: Ensure packet is large enough to contain header */
     if (unlikely(len < (int)sizeof(vpn_tunnel_hdr_t))) {
         atomic_fetch_add(&vfserver.stats.drops, 1);
+        cmd_reass_stats_add(0, 0, 1);
         return -1;
     }
 
@@ -339,24 +342,25 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
     uint8_t *payload = NULL;
 
     /* Handled manually at the entrance for total control. */
-    vpn_remove_header_obfs(data, (size_t)len);
+    vf_remove_header_obfs(data, (size_t)len);
 
     /* 1. Map the VPN header to extract session information */
     vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
 
     sid = ntohl(hdr->session_id);
     if (sid != 0) {
-        if (!vpn_lookup_session_by_sid(sid, &s)) {
+        if (!vf_ss_lookup_by_sid(sid, &s)) {
             atomic_fetch_add(&vfserver.stats.drops, 1);
             log_warn("No session found for SID[0x%08x] from %s. Packet dropped.", sid, inet_ntoa(src->sin_addr));
         }
     }
 
-    payload = vpn_unpack(s ? &s->sec_ctx : NULL, data, len, &plen);
+    payload = vf_unpack(s ? &s->sec_ctx : NULL, data, len, &plen);
     if (unlikely(!payload)) {
         log_warn("Ingress: Decryption failed or invalid packet from %s", 
                  inet_ntoa(src->sin_addr));
         atomic_fetch_add(&vfserver.stats.drops, 1);
+        cmd_reass_stats_add(0, 0, 1);
         return -1;
     }
 
@@ -375,7 +379,7 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
             break;
         case VPN_DPD_RESPONSE:
             log_info("Received DPD Response from %s. Session is alive.", inet_ntoa(src->sin_addr));
-            vpn_session_update_by_sid(ntohl(hdr->session_id), src);
+            vf_ss_update_by_sid(ntohl(hdr->session_id), src);
             break;
         case VPN_MSG_REKEY_ACK:
             vfast_handle_rekey_ack(s);
@@ -389,6 +393,7 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
     }
 
     atomic_fetch_add(&vfserver.stats.rx_pkts, 1);
+    cmd_reass_stats_add(1, 0, 0);
     return 0;
 }
 
@@ -409,6 +414,7 @@ static int server_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
      */
     if (unlikely(len < (int)sizeof(struct iphdr) || len > (int)(BUF_SIZE - sizeof(vpn_tunnel_hdr_t)))) {
         atomic_fetch_add(&vfserver.stats.drops, 1);
+        cmd_reass_stats_add(0, 0, 1);
         return -1;
     }
 
@@ -425,17 +431,18 @@ static int server_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
 
     /* 4. Session Lookup: Map VIP to client endpoint and session security context */
     vpn_session_t *s = NULL;
-    if (!vpn_lookup_session_by_ip(dest_vip, &s)) {
+    if (!vf_ss_lookup_by_ip(dest_vip, &s)) {
         atomic_fetch_add(&vfserver.stats.drops, 1);
+        cmd_reass_stats_add(0, 0, 1);
         return -1;
     }
 
     /**
      * 5. In-place AEAD Encryption & Packet Packing.
-     * The vpn_pack function now writes the header at task_buf_base and encrypts 
+     * The vf_pack function now writes the header at task_buf_base and encrypts 
      * the payload at 'data' in-situ. This eliminates the need for memcpy.
      */
-    int total_len = vpn_pack(&s->sec_ctx,  /* Encryption Key */
+    int total_len = vf_pack(&s->sec_ctx,  /* Encryption Key */
                              task_buf_base, 
                              len, 
                              BUF_SIZE, 
@@ -452,19 +459,21 @@ static int server_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
         vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, task_buf_base, total_len, &s->remote_addr);
         
         atomic_fetch_add(&vfserver.stats.tx_pkts, 1);
+        cmd_reass_stats_add(0, 1, 0);
         
         /**
          * 7. Signal Task Retention.
          * Returning 1 informs the IO loop that this specific task has been 
          * chained to an outbound write operation and should not be recycled yet.
          */
-        return 1; 
+        return 0; 
     } else {
         log_error("Egress: Packing failed for VIP 0x%08x", ntohl(dest_vip));
         atomic_fetch_add(&vfserver.stats.drops, 1);
+        cmd_reass_stats_add(0, 0, 1);
     }
 
-    return 0;
+    return -1;
 }
 
 /**
@@ -513,16 +522,16 @@ static int vfast_clean_server(void) {
     }
 
     /* 3. Close the TUN device */
-    vpn_tun_destroy(&vfserver.tun);
+    vf_tun_destroy(&vfserver.tun);
 
     /* 4. Business logic teardown */
-    vpn_session_destroy();
-    vpn_ip_pool_destroy(&vfserver.ip_pool);
+    vf_ss_destroy();
+    vf_ip_pool_destroy(&vfserver.ip_pool);
 
     /* 5. Cleanup io_uring */
     vfast_io_exit(&vfserver.io);
-
-    vpn_option_clean(&vfserver.opt);
+    cmd_server_stop(&vfserver.cmd_tid);
+    vf_option_clean(&vfserver.opt);
 
     log_info("VFAST server halted safely.");
     return 0;
@@ -542,32 +551,32 @@ static int vfast_init_server(void) {
 
     /* Initialize IPAM (The IP Pool) - MUST be before sessions */
     /* Starting from 10.0.0.0 with 65536 addresses (/16) */
-    if (vpn_ip_pool_init(&vfserver.ip_pool, 
+    if (vf_ip_pool_init(&vfserver.ip_pool, 
         vfserver.opt.pool_network, vfserver.opt.pool_size) != 0) {
         log_error("Failed to initialize IP Pool");
         return -1;
     }
 
-    if (vpn_session_init() < 0) {
+    if (vf_ss_init() < 0) {
         log_error("Failed to initialize session manager");
         return -1;
     }
 
-    if (vpn_tun_init(&vfserver.tun, vfserver.opt.tun_name, 0) < 0) {
+    if (vf_tun_init(&vfserver.tun, vfserver.opt.tun_name, 0) < 0) {
         log_error("Failed to initialize TUN device");
         return -1;
     }
-    vpn_tun_disable_ipv6(vfserver.opt.tun_name);
-    vpn_tun_set_ip(vfserver.tun.name, vfserver.opt.tun_ip, VFAST_BROADCAST);
-    vpn_tun_set_status(vfserver.tun.name, vfserver.opt.mtu, 1); /* MTU 1400 to allow header overhead */
-    vpn_set_nonblocking(vfserver.tun.fd);
+    vf_tun_disable_ipv6(vfserver.opt.tun_name);
+    vf_tun_set_ip(vfserver.tun.name, vfserver.opt.tun_ip, VFAST_BROADCAST);
+    vf_tun_set_status(vfserver.tun.name, vfserver.opt.mtu, 1); /* MTU 1400 to allow header overhead */
+    vf_set_nonblocking(vfserver.tun.fd);
 
     vfserver.udp = udp_init_listener(vfserver.opt.local_port, vfserver.opt.udp_backlog); 
     if (!vfserver.udp) {
         log_error("Failed to init UDP listener");
         goto cleanup;
     }
-    vpn_set_nonblocking(vfserver.udp->fd);
+    vf_set_nonblocking(vfserver.udp->fd);
     
     vfast_ops_t ops = {
         .on_udp_data = server_on_udp,
@@ -585,6 +594,8 @@ static int vfast_init_server(void) {
 
     vfast_io_set_timer(&vfserver.io, 5000, vfast_server_maintenance, &vfserver.ip_pool);
     vfast_io_set_pmtud_callback(&vfserver.io, vfast_path_mtu_updated, &vfserver.io);
+
+    vfserver.cmd_tid = cmd_start_core();
 
     return 0;
 
@@ -626,7 +637,7 @@ int main(int argc, char *argv[]) {
      * that depend on the timezone.*/
     tzset();
 
-    vpn_option_init(&vfserver.opt);
+    vf_option_init(&vfserver.opt);
 
     if (argc >= 2) {
         j = 1;
@@ -643,7 +654,7 @@ int main(int argc, char *argv[]) {
         /* First argument is the config file name? */
         if (argv[j][0] != '-' || argv[j][1] != '-') {
             configfile = argv[j];
-            if ((tp = (char*)vpn_get_absolute_path(configfile)) != NULL) {
+            if ((tp = (char*)vf_get_absolute_path(configfile)) != NULL) {
                 zfree(vfserver.opt.cfile);
                 vfserver.opt.cfile = tp;
             } else {
@@ -652,7 +663,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    vpn_option_conf(&vfserver.opt, vfserver.opt.cfile);
+    vf_option_conf(&vfserver.opt, vfserver.opt.cfile);
 
     if (vfast_init_server() < 0) return 1;
 

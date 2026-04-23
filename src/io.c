@@ -433,8 +433,8 @@ void vfast_io_run(vfast_io_t *io) {
     uint32_t count = 0;
 
     atomic_store(&io->running, true);
-    uint64_t last_tick_ms = vpn_now_ms();
-    uint64_t last_stat_ms = 0;
+    uint64_t last_tick_ms = vf_now_ms();
+    // uint64_t last_stat_ms = 0;
 
     /* Initial Pipeline Warm-up */
     for (int i = 0; i < 16; i++) {
@@ -459,7 +459,7 @@ void vfast_io_run(vfast_io_t *io) {
         // int ret = io_uring_wait_cqe(&io->ring, &cqe);
 
         /* --- TICK PROCESSING SECTION --- */
-        uint64_t now = vpn_now_ms();
+        uint64_t now = vf_now_ms();
 
         if (io->pmtud_cb && (now - io->last_pmtud_check_ms >= 1000)) {
             vfast_check_icmp_errors(io, io->udp_fd);

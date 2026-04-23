@@ -29,23 +29,23 @@ typedef struct {
  * @brief Initialize the IP pool with industrial exclusion rules.
  * Automatically reserves .0 (Network), .1 (Gateway), and .255 (Broadcast).
  */
-int vpn_ip_pool_init(vpn_ip_pool_t *pool, const char *cidr_start, uint32_t size);
+int vf_ip_pool_init(vpn_ip_pool_t *pool, const char *cidr_start, uint32_t size);
 
 /**
  * @brief Allocate an IP address from the pool. Thread-safe.
  * @return IP address in Network Byte Order, 0 if pool is exhausted.
  */
-uint32_t vpn_ip_pool_alloc(vpn_ip_pool_t *pool);
+uint32_t vf_ip_pool_alloc(vpn_ip_pool_t *pool);
 
 /**
  * @brief Reclaim an IP address. Validates range before marking as free.
  * @param ip IP in Network Byte Order.
  */
-void vpn_ip_pool_free(vpn_ip_pool_t *pool, uint32_t ip);
+void vf_ip_pool_free(vpn_ip_pool_t *pool, uint32_t ip);
 
 /**
  * @brief Thread-safe destruction of the pool resources.
  */
-void vpn_ip_pool_destroy(vpn_ip_pool_t *pool);
+void vf_ip_pool_destroy(vpn_ip_pool_t *pool);
 
 #endif /* VPN_IP_POOL_H */

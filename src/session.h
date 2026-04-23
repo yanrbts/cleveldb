@@ -40,22 +40,86 @@ typedef struct {
     pthread_rwlock_t lock;          
 } vpn_session_shard_t;
 
-uint32_t vpn_generate_sid(uint32_t vip);
-int vpn_session_init(void);
-void vpn_session_destroy(void);
-void vpn_session_delete(uint32_t vip);
-void vpn_session_update(uint32_t vip, uint32_t sid, const struct sockaddr_in *addr);
-void vpn_session_update_by_sid(uint32_t sid, const struct sockaddr_in *addr);
-bool vpn_session_lookup_by_ip(uint32_t vip, uint32_t *out_sid, struct sockaddr_in *out_addr);
-bool vpn_session_lookup_by_sid(uint32_t sid, uint32_t *out_vip, struct sockaddr_in *out_addr);
-void vpn_session_clean_timeout(vpn_ip_pool_t *ipp, int timeout_sec);
-bool vpn_lookup_session_by_sid(uint32_t sid, vpn_session_t **outs);
-bool vpn_lookup_session_by_ip(uint32_t vip, vpn_session_t **outs);
+/**
+ * @brief Generates a unique Session ID (SID) for a given Virtual IP.
+ * @param vip The virtual IP assigned to the client (network byte order).
+ * @return A unique 32-bit session identifier.
+ */
+uint32_t vf_ss_generate_sid(uint32_t vip);
+
+/**
+ * @brief Initializes the session management module.
+ * @details Allocates shard structures and initializes read-write locks.
+ * @return 0 on success, non-zero on error.
+ */
+int vf_ss_init(void);
+
+/**
+ * @brief Tears down the session module and releases all resources.
+ */
+void vf_ss_destroy(void);
+
+/**
+ * @brief Removes a session from the tables using the Virtual IP as the key.
+ * @param vip The Virtual IP of the session to be reclaimed.
+ */
+void vf_ss_delete(uint32_t vip);
+
+/**
+ * @brief Updates or creates a session mapping for an IP-SID pair.
+ * @param vip   Virtual IP (Key).
+ * @param sid   Session ID.
+ * @param addr  Physical remote address (source IP/port) to associate.
+ */
+void vf_ss_update(uint32_t vip, uint32_t sid, const struct sockaddr_in *addr);
+
+/**
+ * @brief Updates the physical remote address of a session identified by SID.
+ * @details Used for handling roaming clients or NAT mapping changes.
+ * @param sid   The Session ID (Key).
+ * @param addr  New physical remote address.
+ */
+void vf_ss_update_by_sid(uint32_t sid, const struct sockaddr_in *addr);
+
+/**
+ * @brief Performs Garbage Collection (GC) on sessions that have timed out.
+ * @param ipp          Pointer to the IP pool to return reclaimed VIPs to.
+ * @param timeout_sec  Inactivity threshold in seconds.
+ */
+void vf_ss_clean_timeout(vpn_ip_pool_t *ipp, int timeout_sec);
+
+/**
+ * @brief Locates a session object by its SID.
+ * @note Acquires a shard read-lock internally.
+ * @param[in]  sid   Session ID to search for.
+ * @param[out] outs  Pointer to store the retrieved session object address.
+ * @return true if found, false otherwise.
+ */
+bool vf_ss_lookup_by_sid(uint32_t sid, vpn_session_t **outs);
+
+/**
+ * @brief Locates a session object by its Virtual IP.
+ * @note Acquires a shard read-lock internally.
+ * @param[in]  vip   Virtual IP to search for.
+ * @param[out] outs  Pointer to store the retrieved session object address.
+ * @return true if found, false otherwise.
+ */
+bool vf_ss_lookup_by_ip(uint32_t vip, vpn_session_t **outs);
+
 /**
  * @brief Scans all shards and collects sessions that exceed the given thresholds.
  * @return Number of nodes collected.
  */
-int vpn_session_get_expired(vpn_expired_node_t *list, int max_count, 
+int vf_ss_get_expired(vpn_expired_node_t *list, int max_count, 
                              int probe_sec, int dead_sec);
+/**
+ * @brief Retrieves the total number of active sessions across all shards.
+ * This function iterates through all memory shards, acquiring a read lock
+ * on each to ensure thread safety while querying the uthash structure.
+ * @note Complexity: O(N) where N is the number of shards. 
+ * The underlying HASH_CNT macro is O(1).
+ * @return uint32_t Total count of active sessions.
+ */
+uint32_t vf_ss_get_total_count(void);
 
 #endif /* __SESSION_H__ */

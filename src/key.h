@@ -35,17 +35,17 @@ typedef struct {
 } vfast_sec_ctx_t;
 
 /* Function prototypes */
-void vfast_rekey_init(vfast_sec_ctx_t *ctx, uint32_t sid);
-bool vfast_rekey_needed(vfast_sec_ctx_t *ctx);
-int vfast_rekey_prepare_next(vfast_sec_ctx_t *ctx);
-void vfast_rekey_commit(vfast_sec_ctx_t *ctx);
+void vf_rekey_init(vfast_sec_ctx_t *ctx, uint32_t sid);
+bool vf_rekey_needed(vfast_sec_ctx_t *ctx);
+int vf_rekey_prepare_next(vfast_sec_ctx_t *ctx);
+void vf_rekey_commit(vfast_sec_ctx_t *ctx);
 
 static inline const uint8_t* 
-vfast_rekey_get_key(const vfast_sec_ctx_t *ctx) {
+vf_rekey_get_key(const vfast_sec_ctx_t *ctx) {
     return ctx->active_key.raw;
 }
 static inline uint32_t 
-vfast_rekey_get_key_id(const vfast_sec_ctx_t *ctx) {
+vf_rekey_get_keyid(const vfast_sec_ctx_t *ctx) {
     return ctx->active_key.id;
 }
 
@@ -60,7 +60,7 @@ vfast_rekey_get_key_id(const vfast_sec_ctx_t *ctx) {
  * @return const uint8_t* Pointer to the raw key, or NULL if no match.
  */
 static inline const uint8_t*
-vfast_rekey_get_decrypt_key(const vfast_sec_ctx_t *ctx, uint8_t wire_kid) {
+vf_rekey_get_decrypt_key(const vfast_sec_ctx_t *ctx, uint8_t wire_kid) {
     /* 1. Check against the Active Key (Current Generation) */
     if (wire_kid == (uint8_t)(ctx->active_key.id & 0xFF)) {
         return ctx->active_key.raw;

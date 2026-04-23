@@ -37,8 +37,8 @@ typedef struct vpn_option_s {
     int      local_port;            /* Local UDP port the server will bind to and listen on */
 } vpn_option_t;
 
-void vpn_option_init(vpn_option_t *opt);
-void vpn_option_conf(vpn_option_t *opt, const char *cfile);
-void vpn_option_clean(vpn_option_t *opt);
+void vf_option_init(vpn_option_t *opt);
+void vf_option_conf(vpn_option_t *opt, const char *cfile);
+void vf_option_clean(vpn_option_t *opt);
 
 #endif
