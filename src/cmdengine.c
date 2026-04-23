@@ -9,9 +9,13 @@
 #include <stdatomic.h>
 #include <dirent.h>
 #include <unistd.h>
+#include <ctype.h>
+
+#include "utils.h"
 #include "log.h"
 #include "cmd.h"
 #include "cmdengine.h"
+#include "session.h"
 
 typedef struct cmd_engine_s {
     atomic_int interval;       /* Atomic integer for scan interval */
@@ -42,6 +46,9 @@ static int cmd_set_islogptk(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_set_isdebug(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_get_reass_stats(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_get_config(void *ctx, int argc, char **argv, cmd_resp_t *resp);
+static int cmd_get_sessions(void *ctx, int argc, char **argv, cmd_resp_t *resp);
+static int cmd_get_session_bysid(void *ctx, int argc, char **argv, cmd_resp_t *resp);
+
 static int cmd_handle_set(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_handle_get(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_handle_status(void *ctx, int argc, char **argv, cmd_resp_t *resp);
@@ -60,6 +67,8 @@ static const cmd_entry_t cmd_table[] = {
     /* --- GET Group Sub-commands --- */
     {"GET", "pktstats", "get packet statistics",           "",           2, cmd_get_reass_stats},
     {"GET", "config",   "get configuration",               "",           2, cmd_get_config},
+    {"GET", "session",  "get session number",              "",           2, cmd_get_sessions},
+    {"GET", "show",     "show session information",        "<sid>",      3, cmd_get_session_bysid},
 
     {NULL, NULL, NULL, NULL, 0, NULL}
 };
@@ -500,7 +509,7 @@ static int cmd_get_config(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
 
     if (argc != 2) {
         cmd_resp_red(resp, "ERR: Unexpected arguments. Usage: GET config");
-        return 0;
+        return -1;
     }
 
     int interval = atomic_load(&engine->interval);
@@ -520,6 +529,91 @@ static int cmd_get_config(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
                     C_GREEN, "debug", C_RESET, 
                     C_YELLOW, cmd_isdebug_enabled() ? "yes" : "no",
                     C_RESET);
+
+    return 0;
+}
+
+static int cmd_get_sessions(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
+    (void)argv;
+
+    cmd_engine_t *engine = (cmd_engine_t *)ctx;
+    if (!engine || !resp) {
+        return -1;
+    }
+
+    if (argc != 2) {
+        cmd_resp_red(resp, "ERR: Unexpected arguments. Usage: GET session");
+        return -1;
+    }
+
+    uint32_t n = vf_ss_get_total_count();
+
+    cmd_resp_printf(resp, "\n  %s%-20s%s : %s%u%s %ssessions%s\n", 
+                    C_GREEN, "session number", C_RESET, 
+                    C_YELLOW, n, C_RESET, 
+                    C_GRAY, C_RESET);
+    return 0;
+}
+
+static int cmd_get_session_bysid(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
+    cmd_engine_t *engine = (cmd_engine_t *)ctx;
+    if (!engine || !resp) {
+        return -1;
+    }
+
+    if (argc < 3 || argv[2] == NULL) {
+        cmd_resp_red(resp, "ERR: Unexpected arguments. Usage: GET show <sid>");
+        return 0;
+    }
+
+    const char *val_str = argv[2];
+    char *endptr;
+    uint32_t sid = (uint32_t)strtoul(val_str, &endptr, 16);
+
+    if (val_str == endptr || (*endptr != '\0' && !isspace(*endptr))) {
+        cmd_resp_red(resp, "ERR: Invalid SID format '%s'. Use hex (e.g., 0x32076a9d)\n", val_str);
+        return -1;
+    }
+
+    /* 3. Lookup session context */
+    vpn_session_t *s = NULL;
+    if (!vf_ss_lookup_by_sid(sid, &s) || s == NULL) {
+        cmd_resp_printf(resp, C_RED "SID [" C_RESET C_YELLOW "0x%08x" C_RESET "] " C_RED "not found" C_RESET, sid);
+        return 0;
+    }
+
+    /* 4. Format Output (Green Keys, Yellow Values) */
+    char ip_buf[INET_ADDRSTRLEN];
+    ip_ntop(s->remote_addr.sin_addr.s_addr, ip_buf, sizeof(ip_buf));
+    uint16_t port = ntohs(s->remote_addr.sin_port);
+
+    cmd_resp_printf(resp, "\n");
+
+    // Session ID
+    cmd_resp_printf(resp, "  %s%-20s%s : %s0x%08x%s\n", 
+                    C_GREEN, "Sid", C_RESET, 
+                    C_YELLOW, s->session_id, C_RESET);
+
+    // Virtual IP
+    char vip_str[INET_ADDRSTRLEN];
+    ip_ntop(s->virtual_ip, vip_str, sizeof(vip_str));
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%s%s\n", 
+                    C_GREEN, "Vip", C_RESET, 
+                    C_YELLOW, vip_str, C_RESET);
+
+    // Remote Address (IP:Port)
+    char endpoint[64];
+    snprintf(endpoint, sizeof(endpoint), "%s:%d", ip_buf, port);
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%s%s\n", 
+                    C_GREEN, "Remote", C_RESET, 
+                    C_YELLOW, endpoint, C_RESET);
+
+    // Last Active (Relative time)
+    uint64_t idle_sec = (uint64_t)(time(NULL) - s->last_seen);
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%llu%s%ss%s\n", 
+                    C_GREEN, "Active", C_RESET, 
+                    C_YELLOW, (unsigned long long)idle_sec, C_RESET,
+                    C_GRAY, C_RESET);
 
     return 0;
 }
