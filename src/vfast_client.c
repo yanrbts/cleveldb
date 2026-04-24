@@ -30,6 +30,7 @@
 #include "io.h"
 #include "key.h"
 #include "vfast.h"
+#include "logo.h"
 
 typedef struct {
     time_t   last_sent;
@@ -579,6 +580,8 @@ int main(int argc, char *argv[]) {
     }
 
     vf_option_conf(&vfclient.opt, vfclient.opt.cfile);
+
+    vf_show_random_banner(false, "1.0.1", "yanruibing", vfclient.opt.remote_host);
     
     /* System Bootstrap */
     if (vfast_init_client() < 0) {

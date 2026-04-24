@@ -62,6 +62,7 @@
 #include "vfast.h"
 #include "cmd.h"
 #include "cmdengine.h"
+#include "logo.h"
 
 struct vfast_server {
     vpn_option_t    opt;
@@ -664,6 +665,8 @@ int main(int argc, char *argv[]) {
     }
 
     vf_option_conf(&vfserver.opt, vfserver.opt.cfile);
+
+    vf_show_random_banner(true, "1.0.1", "yanruibing", vfserver.opt.tun_ip);
 
     if (vfast_init_server() < 0) return 1;
 
