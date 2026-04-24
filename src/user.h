@@ -39,7 +39,7 @@ typedef struct {
  */
 typedef bool (*vf_user_fetch_cb)(const char *username, vf_user_auth_t *out_auth);
 
-bool vf_user_init(const char *db_conn);
+bool vf_user_init(void);
 void vf_user_uninit(void);
 void vf_user_register_datasource(vf_user_fetch_cb cb);
 int vf_user_login(const char *user, const char *pass, uint8_t tk_out[16]);

@@ -11,15 +11,19 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <radcli/radcli.h>
 
 #include "utils.h"
 #include "log.h"
 #include "uthash.h"
+#include "error.h"
 #include "zmalloc.h"
+#include "ippool.h"
 #include "user.h"
 
 #define VF_USER_TOKEN_INTER     3600
 #define VF_USER_TOKEN_MIN       900
+#define VF_USER_RADCLI_CONF     "/etc/radcli/radcli.conf"
 
 /* Internal Cache Node: Persistent Account Data */
 typedef struct {
@@ -44,36 +48,12 @@ static struct {
     vf_user_fetch_cb fetch_cb;     /* Customer-defined data source */
 } g_user_mgr;
 
+static rc_handle *g_rh = NULL;
+
 /* Internal IP Allocator (Placeholder for actual IP pool module) */
 static uint32_t _internal_ip_alloc(void) {
     static uint32_t dyn_pool = 0x0A08000A; // Starts at 10.8.0.10
     return dyn_pool++;
-}
-
-/**
- * Register the external database hook
- */
-void vf_user_register_datasource(vf_user_fetch_cb cb) {
-    pthread_rwlock_wrlock(&g_user_mgr.lock);
-    g_user_mgr.fetch_cb = cb;
-    pthread_rwlock_unlock(&g_user_mgr.lock);
-}
-
-bool vf_user_init(const char *db_conn) {
-    (void)db_conn;
-    memset(&g_user_mgr, 0, sizeof(g_user_mgr));
-
-    if (pthread_rwlock_init(&g_user_mgr.lock, NULL) != 0) {
-        return false;
-    }
-
-    g_user_mgr.urandom_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    if (g_user_mgr.urandom_fd < 0) {
-        pthread_rwlock_destroy(&g_user_mgr.lock);
-        return false;
-    }
-
-    return true;
 }
 
 static vf_db_node_t* vf_sync_user(const char *username) {
@@ -92,12 +72,104 @@ static vf_db_node_t* vf_sync_user(const char *username) {
     return NULL;
 }
 
+/**
+ * Internal RADIUS Authentication Logic
+ */
+static int vf_radius_authenticate(const char *user, const char *pass) {
+    if (unlikely(!g_rh)) return VF_ERR_CONFIG;
+
+    uint32_t service = PW_AUTHENTICATE_ONLY;
+    VALUE_PAIR *send = NULL;
+    int ret = VF_ERR_GENERIC;
+
+    if (rc_avpair_add(g_rh, &send, PW_USER_NAME, (void*)user, -1, 0) == NULL)
+        return VF_ERR_SYSTEM;
+
+    if (rc_avpair_add(g_rh, &send, PW_USER_PASSWORD, (void*)pass, -1, 0) == NULL) {
+        rc_avpair_free(send);
+        return VF_ERR_SYSTEM;
+    }
+
+    if (rc_avpair_add(g_rh, &send, PW_SERVICE_TYPE, &service, -1, 0) == NULL) {
+        rc_avpair_free(send);
+        return VF_ERR_SYSTEM;
+    }
+
+    char msg[PW_MAX_MSG_SIZE] = {0};
+    int result = rc_auth(g_rh, 0, send, NULL, msg);
+    rc_avpair_free(send);
+
+    switch (result) {
+        case OK_RC:
+            ret = VF_OK;
+            break;
+        case BADRESP_RC:
+        case REJECT_RC:
+            log_warn("RADIUS: Access-Reject for user '%s' (%s)", user, msg);
+            ret = VF_ERR_AUTH_DENIED;
+            break;
+        case TIMEOUT_RC:
+            log_error("RADIUS: Server timeout for user '%s'", user);
+            ret = VF_ERR_AUTH_TIMEOUT;
+            break;
+        default:
+            log_error("RADIUS: Unexpected error %d for user '%s'", result, user);
+            ret = VF_ERR_GENERIC;
+            break;
+    }
+    return ret;
+}
+
+/**
+ * Register the external database hook
+ */
+void vf_user_register_datasource(vf_user_fetch_cb cb) {
+    pthread_rwlock_wrlock(&g_user_mgr.lock);
+    g_user_mgr.fetch_cb = cb;
+    pthread_rwlock_unlock(&g_user_mgr.lock);
+}
+
+bool vf_user_init(void) {
+    memset(&g_user_mgr, 0, sizeof(g_user_mgr));
+
+    if (pthread_rwlock_init(&g_user_mgr.lock, NULL) != 0) {
+        return false;
+    }
+
+    /* Initialize RADIUS (libradcli) */
+    /* Using db_conn as the path to radiusclient.conf if provided */
+    g_rh = rc_read_config(VF_USER_RADCLI_CONF);
+    if (!g_rh) {
+        log_error("Failed to read radcli config: %s", VF_USER_RADCLI_CONF);
+        pthread_rwlock_destroy(&g_user_mgr.lock);
+        return false;
+    }
+
+    if (rc_read_dictionary(g_rh, rc_conf_str(g_rh, "dictionary")) != 0) {
+        log_error("Failed to read RADIUS dictionary.");
+        rc_destroy(g_rh);
+        pthread_rwlock_destroy(&g_user_mgr.lock);
+        return false;
+    }
+
+    g_user_mgr.urandom_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (g_user_mgr.urandom_fd < 0) {
+        pthread_rwlock_destroy(&g_user_mgr.lock);
+        return false;
+    }
+
+    return true;
+}
+
 int vf_user_login(const char *user, const char *pass, uint8_t tk_out[16]) {
     if (unlikely(!user || !pass || !tk_out)) return -3;
 
+    /* Step 1: RADIUS Authentication (Primary) */
+    if (vf_radius_authenticate(user, pass) != 0) {
+        return -2;
+    }
+
     vf_db_node_t *u = NULL;
-    
-    /* Step 1: Cache Lookup with Lazy Loading */
     pthread_rwlock_rdlock(&g_user_mgr.lock);
     HASH_FIND_STR(g_user_mgr.db_cache, user, u);
     pthread_rwlock_unlock(&g_user_mgr.lock);
@@ -127,7 +199,6 @@ int vf_user_login(const char *user, const char *pass, uint8_t tk_out[16]) {
     if (unlikely(!session)) return -3;
 
     memcpy(session->token, tk_out, 16);
-    
     /* Resolve VIP Logic: Static from DB takes priority over Pool */
     session->identity.base = u->auth.base;
     session->identity.vip  = (u->auth.static_vip != 0) ? 
@@ -178,7 +249,7 @@ int vf_user_logout(const uint8_t token[16]) {
     HASH_FIND(hh, g_user_mgr.token_cache, token, 16, session);
     if (session) {
         HASH_DEL(g_user_mgr.token_cache, session);
-        free(session);
+        zfree(session);
         pthread_rwlock_unlock(&g_user_mgr.lock);
         return 0;
     }
@@ -204,6 +275,12 @@ void vf_user_uninit(void) {
     pthread_rwlock_wrlock(&g_user_mgr.lock);
 
     if (g_user_mgr.urandom_fd >= 0) close(g_user_mgr.urandom_fd);
+
+    /* Clean RADIUS handle */
+    if (g_rh) {
+        rc_destroy(g_rh);
+        g_rh = NULL;
+    }
 
     /* Flush Active Sessions */
     vf_token_node_t *tk, *tk_tmp;

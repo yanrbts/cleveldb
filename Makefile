@@ -4,7 +4,7 @@
 
 CC      := gcc
 CFLAGS  := -O3 -ggdb -Wall -Wextra -D_GNU_SOURCE -std=gnu11 -Isrc -Itest
-LDFLAGS := -luring -lpthread
+LDFLAGS := -luring -lpthread -lradcli
 
 # Directories
 SRC_DIR  := src
