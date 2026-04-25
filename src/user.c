@@ -23,7 +23,7 @@
 
 #define VF_USER_TOKEN_INTER     3600
 #define VF_USER_TOKEN_MIN       900
-#define VF_USER_RADCLI_CONF     "/etc/radcli/radcli.conf"
+#define VF_USER_RADCLI_CONF     "./radcli.conf"
 
 /* Internal Cache Node: Persistent Account Data */
 typedef struct {
@@ -33,7 +33,7 @@ typedef struct {
 
 /* Internal Session Node: Volatile Active Tokens */
 typedef struct {
-    uint8_t token[16];      /* Key */
+    uint8_t token[VF_TOKEN_LEN];      /* Key */
     vf_identity_t identity; /* Snapshot including assigned VIP */
     time_t expire;
     UT_hash_handle hh;
@@ -161,7 +161,7 @@ bool vf_user_init(void) {
     return true;
 }
 
-int vf_user_login(const char *user, const char *pass, uint8_t tk_out[16]) {
+int vf_user_login(const char *user, const char *pass, uint8_t tk_out[VF_TOKEN_LEN]) {
     if (unlikely(!user || !pass || !tk_out)) return -3;
 
     /* Step 1: RADIUS Authentication (Primary) */
@@ -193,12 +193,13 @@ int vf_user_login(const char *user, const char *pass, uint8_t tk_out[16]) {
     }
 
     /* Step 3: Token & Session Initialization */
-    if (read(g_user_mgr.urandom_fd, tk_out, 16) != 16) return -3;
+    if (read(g_user_mgr.urandom_fd, tk_out, VF_TOKEN_LEN) != VF_TOKEN_LEN)
+        return -3;
 
     vf_token_node_t *session = (vf_token_node_t *)zcalloc(sizeof(vf_token_node_t));
     if (unlikely(!session)) return -3;
 
-    memcpy(session->token, tk_out, 16);
+    memcpy(session->token, tk_out, VF_TOKEN_LEN);
     /* Resolve VIP Logic: Static from DB takes priority over Pool */
     session->identity.base = u->auth.base;
     session->identity.vip  = (u->auth.static_vip != 0) ? 
@@ -207,7 +208,7 @@ int vf_user_login(const char *user, const char *pass, uint8_t tk_out[16]) {
     session->expire = time(NULL) + VF_USER_TOKEN_INTER;
 
     pthread_rwlock_wrlock(&g_user_mgr.lock);
-    HASH_ADD(hh, g_user_mgr.token_cache, token, 16, session);
+    HASH_ADD(hh, g_user_mgr.token_cache, token, VF_TOKEN_LEN, session);
     pthread_rwlock_unlock(&g_user_mgr.lock);
 
     log_info("User '%s' authenticated. VIP: %u", user, session->identity.vip);
@@ -222,7 +223,7 @@ bool vf_user_verify_pkt(const vpn_auth_t *pkt, vf_identity_t *info) {
 
     pthread_rwlock_rdlock(&g_user_mgr.lock);
     vf_token_node_t *session = NULL;
-    HASH_FIND(hh, g_user_mgr.token_cache, pkt->token, 16, session);
+    HASH_FIND(hh, g_user_mgr.token_cache, pkt->token, VF_TOKEN_LEN, session);
 
     if (likely(session && now <= session->expire)) {
         if (info) {
@@ -241,12 +242,12 @@ bool vf_user_verify_pkt(const vpn_auth_t *pkt, vf_identity_t *info) {
     return valid;
 }
 
-int vf_user_logout(const uint8_t token[16]) {
+int vf_user_logout(const uint8_t token[VF_TOKEN_LEN]) {
     if (unlikely(!token)) return -1;
 
     pthread_rwlock_wrlock(&g_user_mgr.lock);
     vf_token_node_t *session = NULL;
-    HASH_FIND(hh, g_user_mgr.token_cache, token, 16, session);
+    HASH_FIND(hh, g_user_mgr.token_cache, token, VF_TOKEN_LEN, session);
     if (session) {
         HASH_DEL(g_user_mgr.token_cache, session);
         zfree(session);

@@ -75,6 +75,8 @@ void vf_option_init(vpn_option_t *opt) {
     /* Client */
     strncpy(opt->remote_host, VPN_OPT_REMOTE_HOST, sizeof(opt->remote_host) - 1);
     opt->remote_port   = VPN_OPT_REMOTE_PORT;
+    opt->username      = NULL;
+    memset(opt->password, 0, sizeof(opt->password));
     
     /* Server */
     strncpy(opt->tun_ip, VPN_OPT_TUN_IP, sizeof(opt->tun_ip) - 1);
@@ -161,6 +163,11 @@ void vf_option_conf(vpn_option_t *opt, const char *cfile) {
             if (opt->remote_port < 1 || opt->remote_port > 65535) {
                 err = "Invalid remote port"; goto loaderr;
             }
+        } else if (!strcasecmp(first, "username")) {
+            opt->username = zstrdup(second);
+        } else if (!strcasecmp(first, "password")) {
+            strncpy(opt->password, second, sizeof(opt->password) - 1);
+            opt->password[sizeof(opt->password) - 1] = '\0';
         } else if (!strcasecmp(first, "udp-backlog")) {
             opt->udp_backlog = atoi(second);
             if (opt->udp_backlog < 1) {

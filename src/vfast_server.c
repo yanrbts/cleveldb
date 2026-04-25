@@ -63,6 +63,7 @@
 #include "cmd.h"
 #include "cmdengine.h"
 #include "logo.h"
+#include "user.h"
 
 struct vfast_server {
     vpn_option_t    opt;
@@ -388,6 +389,10 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
         case VPN_MSG_REKEY_REQ:
             vfast_handle_rekey_req(io, s, payload, plen, src);
             break;
+        case VPN_MSG_AUTH_REQ:
+            break;
+        case VPN_MSG_LOGOUT:
+            break;
         default:
             log_warn("Unknown VPN msg type: 0x%02x", hdr->msg_type);
             break;
@@ -516,6 +521,7 @@ int vfast_setup_signals(void) {
 static int vfast_clean_server(void) {
     log_info("Initiating graceful shutdown...");
 
+    vf_user_uninit();
     /* 1. Stop the Transport (UDP) */
     if (vfserver.udp) {
         udp_close(vfserver.udp);
@@ -541,6 +547,11 @@ static int vfast_clean_server(void) {
 static int vfast_init_server(void) {
     memset(&vfserver.io, 0, sizeof(vfast_io_t));
     atomic_store(&vfserver.io.running, true);
+
+    if(!vf_user_init()) {
+        log_error("Failed user init.");
+        return -1;
+    }
 
     if (vfast_load_key(vfserver.opt.keyfile, vfserver.opt.master_key) < 0) {
         log_error("Failed load key file.");

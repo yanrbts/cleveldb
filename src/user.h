@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include "auth.h"
 
+#define VF_TOKEN_LEN    16
+
 /* Role definitions for Access Control */
 typedef enum {
     VF_ROLE_GUEST = 0,
@@ -42,9 +44,9 @@ typedef bool (*vf_user_fetch_cb)(const char *username, vf_user_auth_t *out_auth)
 bool vf_user_init(void);
 void vf_user_uninit(void);
 void vf_user_register_datasource(vf_user_fetch_cb cb);
-int vf_user_login(const char *user, const char *pass, uint8_t tk_out[16]);
+int vf_user_login(const char *user, const char *pass, uint8_t tk_out[VF_TOKEN_LEN]);
 bool vf_user_verify_pkt(const vpn_auth_t *pkt, vf_identity_t *info);
-int vf_user_logout(const uint8_t token[16]);
+int vf_user_logout(const uint8_t token[VF_TOKEN_LEN]);
 void vf_user_cron_clean(void);
 
 #endif /* __USER_H__ */

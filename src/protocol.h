@@ -55,7 +55,6 @@
 
 /* Protocol Constants */
 #define VPN_VERSION             1
-#define VPN_MTU_DEFAULT         1400  /* Standard MTU for tunnel interfaces */
 #define VPN_HDR_FLAG_PADDING    0x01
 
 /* Message Types */
@@ -67,22 +66,28 @@ typedef enum {
     VPN_DPD_REQUEST    = 0x05,  /* Dead Peer Detection Request */
     VPN_DPD_RESPONSE   = 0x06,  /* Dead Peer Detection Response */
     VPN_MSG_REKEY_REQ  = 0x07,  /* Triggered by vf_rekey_needed */
-    VPN_MSG_REKEY_ACK  = 0x08   /* Confirmation to call vf_rekey_commit */
+    VPN_MSG_REKEY_ACK  = 0x08,  /* Confirmation to call vf_rekey_commit */
+    VPN_MSG_AUTH_REQ   = 0x09, 
+    VPN_MSG_AUTH_RESP  = 0x0A,
+    VPN_MSG_LOGOUT     = 0x0B
 } vpn_msg_t;
 
 /* * Packed Structure for Network Transmission
  * Total size: 8 bytes (64-bit aligned for optimal CPU access)
  */
 typedef struct {
+    uint16_t magic;
     uint8_t  version;      /* Protocol version */
     uint8_t  msg_type;     /* Message type from vfast_msg_t */
+
+    uint16_t total_len;    /* Length of Header + Payload + Padding */
     uint8_t  key_id;       /* Key ID for encryption (0 for HELLO, n for active session key) */
     uint8_t  flags;        /* Reserved for future flags (e.g. compression, encryption type) */
     uint32_t session_id;   /* Unique session identifier (Network Byte Order) */
+    uint32_t seq_num;
 
     uint8_t  padding_len;  /* Length of padding bytes */
     uint8_t  reserved[3];  /* keep 4-byte alignment */
-    uint32_t seq_num;
 } __attribute__((packed)) vpn_tunnel_hdr_t;
 
 #define VPN_TNL_HLEN sizeof(vpn_tunnel_hdr_t)

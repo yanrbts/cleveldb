@@ -312,6 +312,8 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     case VPN_MSG_REKEY_ACK:
         vfast_handle_new_key();
         break;
+    case VPN_MSG_AUTH_RESP:
+        break;
     default:
         log_warn("Ingress: Unknown message type [0x%02x] received.", hdr->msg_type);
         break;

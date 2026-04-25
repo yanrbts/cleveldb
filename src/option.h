@@ -29,6 +29,8 @@ typedef struct vpn_option_s {
     /* Client-Specific Configuration */
     char     remote_host[64];       /* Remote server IP address or hostname to connect to */
     int      remote_port;           /* Destination port on the remote server (e.g., 9999) */
+    char     *username;
+    char     password[64];
     
     /* Server-Specific Configuration (Ignored by Client) */
     char     tun_ip[32];            /* Static IP address assigned to the server's TUN interface (e.g., "10.0.0.1") */
