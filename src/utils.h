@@ -8,10 +8,20 @@
 
 #include <stdint.h>
 #include <stdatomic.h>
+#include <endian.h>
+#include <stdint.h>
 
 #define UNUSED(x)       (void)(x)
 #define likely(x)       __builtin_expect(!!(x), 1)
 #define unlikely(x)     __builtin_expect(!!(x), 0)
+
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+#define htonll(x)       __builtin_bswap64(x)
+#define ntohll(x)       __builtin_bswap64(x)
+#else
+#define htonll(x)       (x)
+#define ntohll(x)       (x)
+#endif
 
 int vf_set_nonblocking(int fd);
 const char *vf_get_absolute_path(char *filename);

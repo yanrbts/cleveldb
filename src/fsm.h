@@ -14,7 +14,9 @@
 
 typedef enum {
     ST_IDLE = 0,
-    ST_WAIT_AUTH,
+    ST_HELLO_WAIT,      /* 已发送 HELLO，等待服务端回应确认链路通畅 */
+    ST_AUTH_SEND,       /* 链路通了，准备发送登录请求 (VPN_MSG_AUTH_REQ) */
+    ST_AUTH_WAIT,       /* 已发送登录请求，等待 RADIUS 认证结果 */
     ST_CONNECTED,
     ST_RECONNECTING
 } vfast_state_t;
@@ -22,8 +24,9 @@ typedef enum {
 typedef struct {
     atomic_int      state;         
     uint32_t        sid;           
-    uint32_t        vip;           
-    atomic_long     last_rx_time;  
+    // uint32_t        vip;           
+    atomic_long     last_rx_time;
+    time_t          last_tx_hello;  
     time_t          last_tx_auth;  
     time_t          last_tx_keep;  
     pthread_t       thread_id;
@@ -35,10 +38,13 @@ typedef struct {
     const uint8_t  *key;          /* Pointer to the session key (set after auth) */
     vfast_sec_ctx_t *sec;         /* Pointer to the security context */
     atomic_uint_fast32_t next_seq;
+    const char     *pass_word;
+    const char     *user_name;
 } vfast_fsm_t;
 
 /* Signature updated to accept vfast_io_t */
-int vf_fsm_init(vfast_fsm_t *fsm, vfast_io_t *io, const char *sip, uint16_t sport, atomic_bool *running, const uint8_t *key);
+int vf_fsm_init(vfast_fsm_t *fsm, vfast_io_t *io, const char *username, const char *pwd, 
+    const char *sip, uint16_t sport, atomic_bool *running, const uint8_t *key);
 void vf_fsm_update(vfast_fsm_t *fsm);
 int vf_fsm_is_connected(vfast_fsm_t *fsm);
 void vf_fsm_force_reconnect(vfast_fsm_t *fsm);

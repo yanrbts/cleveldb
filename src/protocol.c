@@ -48,7 +48,7 @@ static inline uint16_t _calculate_checksum(uint16_t *buf, int len) {
  * @return Total bytes for wire transmission, or -1 on error.
  */
 int vf_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int plen, 
-             int max_size, vpn_msg_t type, uint32_t sid) {
+             int max_size, vf_msg_t type, uint32_t sid) {
     
     if (unlikely(!buf)) return -1;
 
@@ -63,10 +63,10 @@ int vf_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int plen,
      * 2. Encryption Branching: 
      * HELLO and KEEPALIVE bypass AEAD to maintain handshake availability.
      */
-    if (type == VPN_MSG_HELLO || type == VPN_MSG_KEEPALIVE) {
+    if (sec == NULL || type == VPN_MSG_HELLO || type == VPN_MSG_KEEPALIVE) {
         out_len = (size_t)i_plen;
     } else {
-        if (unlikely(!sec)) return -1;
+        // if (unlikely(!sec)) return -1;
         
         const uint8_t *key = vf_rekey_get_key(sec);
         kid = vf_rekey_get_keyid(sec);
@@ -76,11 +76,11 @@ int vf_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int plen,
             return -1;
         }
     }
+    int tlen = VPN_TNL_HLEN + (int)out_len;
 
     /* 3. Header Construction & Boundary Validation */
-    vf_fill_header(buf, (uint8_t)type, sid, kid);
+    vf_fill_header(buf, tlen, (uint8_t)type, sid, kid);
 
-    int tlen = VPN_TNL_HLEN + (int)out_len;
     if (unlikely(tlen > max_size)) return -1;
 
     /* 4. Mandatory Obfuscation: Mask header to bypass DPI pattern matching */
@@ -96,13 +96,13 @@ int vf_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int plen,
  */
 uint8_t* vf_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int res, int *out_plen) {
     
-    if (unlikely(!buf || res < (int)sizeof(vpn_tunnel_hdr_t))) return NULL;
+    if (unlikely(!buf || res < (int)sizeof(vf_hdr_t))) return NULL;
 
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
+    vf_hdr_t *hdr = (vf_hdr_t *)buf;
     // if (out_sid) *out_sid = ntohl(hdr->session_id);
 
-    uint8_t *ptr = buf + sizeof(vpn_tunnel_hdr_t);
-    size_t rlen = (size_t)(res - sizeof(vpn_tunnel_hdr_t));
+    uint8_t *ptr = buf + sizeof(vf_hdr_t);
+    size_t rlen = (size_t)(res - sizeof(vf_hdr_t));
     size_t dlen = 0;
 
     /**
@@ -120,10 +120,10 @@ uint8_t* vf_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int res, int *out_p
     }
 
     /* 3. Mandatory Unpadding: Restore exact length regardless of encryption state */
-    size_t tlen = dlen + sizeof(vpn_tunnel_hdr_t);
+    size_t tlen = dlen + sizeof(vf_hdr_t);
     if (unlikely(vf_remove_padding(buf, &tlen) != 0)) return NULL;
 
-    if (out_plen) *out_plen = (int)(tlen - sizeof(vpn_tunnel_hdr_t));
+    if (out_plen) *out_plen = (int)(tlen - sizeof(vf_hdr_t));
 
     return ptr;
 }
@@ -161,7 +161,7 @@ int vf_apply_padding(uint8_t *buf, int raw_len, uint8_t max_pad) {
     }
 
     /* 1. Locate the encapsulation header at the buffer base */
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
+    vf_hdr_t *hdr = (vf_hdr_t *)buf;
     
     /* Use thread-local seed to avoid cache contention in multi-threaded I/O */
     static __thread uint32_t local_seed = 0x5EED5EED; 
@@ -228,7 +228,7 @@ int vf_remove_padding(uint8_t *buf, size_t *p_len) {
         return -1;
     }
 
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
+    vf_hdr_t *hdr = (vf_hdr_t *)buf;
 
     /* 2. Check if the PADDING_PRESENT flag (0x01) is active */
     if (hdr->flags & VPN_HDR_FLAG_PADDING) {
@@ -274,7 +274,7 @@ void vf_apply_header_obfs(uint8_t *buf, size_t wire_len) {
         return;
     }
 
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
+    vf_hdr_t *hdr = (vf_hdr_t *)buf;
 
     /**
      * 1. Key Derivation:
@@ -319,7 +319,7 @@ void vf_remove_header_obfs(uint8_t *buf, size_t wire_len) {
     }
 
     /* Use a temporary pointer for structured access */
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
+    vf_hdr_t *hdr = (vf_hdr_t *)buf;
 
     /**
      * 2. Key Extraction:
@@ -352,11 +352,11 @@ void vf_remove_header_obfs(uint8_t *buf, size_t wire_len) {
  * * Use this to identify alignment shifts or endianness issues.
  */
 void vpn_debug_print_hdr(const void *buf, int len) {
-    if (!buf || len < (int)sizeof(vpn_tunnel_hdr_t)) {
+    if (!buf || len < (int)sizeof(vf_hdr_t)) {
         return;
     }
 
-    const vpn_tunnel_hdr_t *hdr = (const vpn_tunnel_hdr_t *)buf;
+    const vf_hdr_t *hdr = (const vf_hdr_t *)buf;
     const uint8_t *raw = (const uint8_t *)buf;
 
     printf("--- [] VPN HEADER DEBUG ---\n");
@@ -370,13 +370,13 @@ void vpn_debug_print_hdr(const void *buf, int len) {
             hdr->session_id, ntohl(hdr->session_id));
     
     /* 2. Print Header Memory Size */
-    printf("  Header Sz:  %zu bytes\n", sizeof(vpn_tunnel_hdr_t));
+    printf("  Header Sz:  %zu bytes\n", sizeof(vf_hdr_t));
 
     /* 3. Hex Dump of the first 16 bytes (Raw Memory) */
     printf("  Raw Hex:    ");
     for (int i = 0; i < 16 && i < len; i++) {
         printf("%02x ", raw[i]);
-        if (i == sizeof(vpn_tunnel_hdr_t) - 1) printf("| "); // 分隔符：头结束位置
+        if (i == sizeof(vf_hdr_t) - 1) printf("| "); // 分隔符：头结束位置
     }
     printf("\n-----------------------------\n");
 }

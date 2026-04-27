@@ -49,6 +49,11 @@
 #include <locale.h>
 #include <liburing.h>
 
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
+#include <netinet/in.h>
+#include <string.h>
+
 #include "log.h"
 #include "utils.h"
 #include "auth.h"
@@ -84,6 +89,58 @@ static void signal_handler(int sig) {
     (void)sig;
     atomic_store(&vfserver.io.running, false);
     log_info("Signal received, initiating shutdown...");
+}
+
+/**
+ * @brief Generates a stateless, cryptographic cookie for Anti-DoS protection.
+ *
+ * This implementation uses HMAC-SHA256 to bind the client's network identity 
+ * (IP/Port) with a server-side secret. The resulting 18-byte truncated hash 
+ * ensures the client can prove reachability before resources are allocated.
+ *
+ * @param out_cookie Buffer to store the 18-byte cookie (must be >= 18 bytes).
+ * @param src        Pointer to the client's sockaddr_in structure.
+ * @param secret     Pointer to the 16-byte server-side secret key.
+ */
+static inline void vfast_generate_cookie(uint8_t *out_cookie, 
+                                         const struct sockaddr_in *src, 
+                                         const uint8_t *secret) 
+{
+    /* * Buffer for HMAC input: 4 (IPv4) + 2 (Port) + 16 (Secret/Salt) = 22 bytes.
+     * Using a fixed-size array is faster than heap allocation for small payloads.
+     */
+    uint8_t input[22];
+    uint8_t hmac_result[EVP_MAX_MD_SIZE];
+    unsigned int hmac_len = 0;
+
+    /* 1. Pack network identity into the input buffer (Network Byte Order) */
+    memcpy(input, &src->sin_addr.s_addr, 4);
+    memcpy(input + 4, &src->sin_port, 2);
+    
+    /* 2. Mix in the secret to ensure uniqueness per server instance/rotation */
+    memcpy(input + 6, secret, 16);
+
+    /**
+     * 3. Compute HMAC-SHA256.
+     * Note: In high-concurrency environments, consider using HMAC_CTX 
+     * recycling if OpenSSL version < 1.1.0. For modern OpenSSL, 
+     * this one-shot function is highly optimized.
+     */
+    if (unlikely(!HMAC(EVP_sha256(), 
+                       secret, 16, 
+                       input, sizeof(input), 
+                       hmac_result, &hmac_len))) {
+        /* Industrial fallback: Zero out cookie on internal crypto failure */
+        memset(out_cookie, 0, 18);
+        return;
+    }
+
+    /**
+     * 4. Truncate and Persist.
+     * 144 bits (18 bytes) provides collision resistance far exceeding 
+     * the requirements for stateless handshake verification.
+     */
+    memcpy(out_cookie, hmac_result, 18);
 }
 
 /**
@@ -161,6 +218,137 @@ static bool vfast_handle_hello(vfast_io_t *io, uint8_t *payload, int plen, struc
              sid, inet_ntoa(src->sin_addr));
 
     vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, base_buf, tlen, src);
+
+    return true;
+}
+
+/**
+ * @brief Handles HELLO requests using the stateless 32-byte payload.
+ * Optimized for: Zero-copy, Anti-DoS (Stateless), and 8-byte alignment.
+ */
+static bool vfast_handle_hello_ex(vfast_io_t *io, uint8_t *payload, int plen, struct sockaddr_in *src) {
+    if (unlikely(plen < (int)sizeof(vf_payload_hello_req_t))) {
+        log_warn("Ingress: Malformed HELLO from %s", inet_ntoa(src->sin_addr));
+        return false;
+    }
+
+    uint8_t *base_buf = payload - VPN_TNL_HLEN;
+
+    vf_payload_hello_resp_t *resp = (vf_payload_hello_resp_t *)payload;
+    memset(resp, 0, sizeof(vf_payload_hello_resp_t));
+
+    resp->server_ts     = htonll(vf_now_ms());
+    resp->selected_caps = htons(VF_DEFAULT_CAPS);
+    resp->status        = htonl(VF_S_OK);
+
+    vfast_generate_cookie(resp->cookie, src, vfserver.opt.master_key);
+
+    int tlen = vf_pack(NULL, 
+                       base_buf, 
+                       (int)sizeof(vf_payload_hello_resp_t),
+                       BUF_SIZE, 
+                       VPN_MSG_HELLO,
+                       0);
+
+    if (unlikely(tlen < 0)) {
+        log_error("FSM: Failed to pack HELLO_ACK for %s", inet_ntoa(src->sin_addr));
+        return false;
+    }
+    log_debug("FSM: HELLO_ACK sent to %s (Cookie generated)", inet_ntoa(src->sin_addr));
+
+    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, base_buf, tlen, src);
+    io_uring_submit(&io->ring);
+
+    return true;
+}
+
+/**
+ * @brief Handles AUTH requests from clients (VF_MSG_AUTH_REQ).
+ * Performs Cookie validation, IPAM allocation, and Session initialization.
+ */
+static bool vfast_handle_auth(vfast_io_t *io, uint8_t *payload, int plen, struct sockaddr_in *src) {
+    /* 1. Preliminary length check (Assuming vf_payload_auth_req_t contains the cookie) */
+    if (unlikely(plen < (int)sizeof(vf_payload_auth_req_t))) {
+        log_warn("Ingress: Malformed AUTH_REQ from %s", inet_ntoa(src->sin_addr));
+        return false;
+    }
+    uint8_t token[VF_TOKEN_LEN] = {0};
+    vf_payload_auth_req_t *req = (vf_payload_auth_req_t *)payload;
+
+    vf_user_login(req->username, req->password, token);
+
+    // /* 2. Anti-DoS: Validate the stateless cookie */
+    // uint8_t expected_cookie[18]; // 匹配你之前的 generate_cookie 逻辑
+    // vfast_generate_cookie(expected_cookie, src, vfserver.opt.master_key);
+    
+    // if (unlikely(memcmp(req->cookie, expected_cookie, 18) != 0)) {
+    //     log_warn("Security: Invalid cookie from %s. Possible spoofing or timeout.", 
+    //              inet_ntoa(src->sin_addr));
+    //     return false;
+    // }
+
+    /* 3. IPAM: Allocate Virtual IP from the global address pool */
+    uint32_t vip = vf_ip_pool_alloc(&vfserver.ip_pool);
+    if (unlikely(vip == 0)) {
+        log_error("Resource Exhaustion: IP Pool empty. Rejecting %s", inet_ntoa(src->sin_addr));
+        /* TODO: Send an AUTH_RESP with status VF_S_BUSY */
+        return false;
+    }
+
+    /* 4. Session Management: Generate SID and link VIP to physical address */
+    uint32_t sid = vf_ss_generate_sid(vip);
+    vf_ss_update(vip, sid, src);
+
+    /* 5. Retrieve the newly created session context for Key Management */
+    vpn_session_t *s = NULL;
+    if (!vf_ss_lookup_by_sid(sid, &s)) {
+        log_error("FSM: Session lookup failed for SID 0x%08x", sid);
+        return false;
+    }
+
+    /* 6. Response Construction (Zero-copy reuse of the buffer) */
+    uint8_t *base_buf = payload - VPN_TNL_HLEN;
+    vf_payload_auth_resp_t *resp = (vf_payload_auth_resp_t *)payload;
+
+    /* Clear the area for the new structure */
+    memset(resp, 0, sizeof(vf_payload_auth_resp_t));
+
+    /* Fill Authentication Response Data */
+    resp->status         = htonl(VF_S_OK);
+    resp->vip            = vip; // Already in Network Order from IP pool
+    resp->key_id         = htonl(s->sec_ctx.active_key.id);
+    resp->keepalive_int  = htonl(300);
+    
+    /* Session Security: Generate or copy the initial key */
+    memcpy(resp->init_key, s->sec_ctx.active_key.raw, 32);  
+    /* Token: Optional unique identifier for this session */
+    memcpy(resp->token, token, VF_TOKEN_LEN);
+
+    /**
+     * 7. The Security Pipeline: [Padding] -> [Header] -> [Obfuscation]
+     * Use VPN_MSG_AUTH_ACK as the message type.
+     */
+    int tlen = vf_pack(NULL, 
+                       base_buf, 
+                       (int)sizeof(vf_payload_auth_resp_t), 
+                       BUF_SIZE, 
+                       VPN_MSG_AUTH_ACK, 
+                       sid);
+
+    if (unlikely(tlen < 0)) {
+        log_error("FSM: Packing failed for AUTH_ACK");
+        return false;
+    }
+
+    /* 8. Log and Asynchronous Dispatch */
+    char ip_str[INET_ADDRSTRLEN];
+    ip_ntop(vip, ip_str, sizeof(ip_str));
+    
+    log_info("Auth Success | VIP: %s | SID: 0x%08x | To: %s", 
+             ip_str, sid, inet_ntoa(src->sin_addr));
+
+    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, base_buf, tlen, src);
+    io_uring_submit(&io->ring);
 
     return true;
 }
@@ -332,7 +520,7 @@ static inline void vfast_handle_rekey_ack(vpn_session_t *s) {
 static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
      UNUSED(arg);
      /* 1. Basic Validation: Ensure packet is large enough to contain header */
-    if (unlikely(len < (int)sizeof(vpn_tunnel_hdr_t))) {
+    if (unlikely(len < (int)sizeof(vf_hdr_t))) {
         atomic_fetch_add(&vfserver.stats.drops, 1);
         cmd_reass_stats_add(0, 0, 1);
         return -1;
@@ -347,7 +535,7 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
     vf_remove_header_obfs(data, (size_t)len);
 
     /* 1. Map the VPN header to extract session information */
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
+    vf_hdr_t *hdr = (vf_hdr_t *)data;
 
     sid = ntohl(hdr->session_id);
     if (sid != 0) {
@@ -374,7 +562,8 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
             vfast_handle_data(io, s, payload, plen, src);
             break;
         case VPN_MSG_HELLO:
-            vfast_handle_hello(io, payload, plen, src);
+            // vfast_handle_hello(io, payload, plen, src);
+            vfast_handle_hello_ex(io, payload, plen, src);
             break;
         case VPN_MSG_KEEPALIVE:
             vfast_keeplive(io, s, payload, plen, src);
@@ -390,6 +579,7 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
             vfast_handle_rekey_req(io, s, payload, plen, src);
             break;
         case VPN_MSG_AUTH_REQ:
+
             break;
         case VPN_MSG_LOGOUT:
             break;
@@ -418,7 +608,7 @@ static int server_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
      * 1. Fast boundary check: Ensure L3 header is present and buffer has headroom.
      * Fixed: Explicitly cast the capacity calculation to (int) to resolve sign-compare warnings.
      */
-    if (unlikely(len < (int)sizeof(struct iphdr) || len > (int)(BUF_SIZE - sizeof(vpn_tunnel_hdr_t)))) {
+    if (unlikely(len < (int)sizeof(struct iphdr) || len > (int)(BUF_SIZE - sizeof(vf_hdr_t)))) {
         atomic_fetch_add(&vfserver.stats.drops, 1);
         cmd_reass_stats_add(0, 0, 1);
         return -1;
@@ -426,10 +616,10 @@ static int server_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
 
     /**
      * 2. Zero-Copy Back-calculation.
-     * Since the IO engine reads TUN data with an offset of sizeof(vpn_tunnel_hdr_t),
+     * Since the IO engine reads TUN data with an offset of sizeof(vf_hdr_t),
      * the 'data' pointer passed here is already positioned for in-place packing.
      */
-    uint8_t *task_buf_base = data - sizeof(vpn_tunnel_hdr_t);
+    uint8_t *task_buf_base = data - sizeof(vf_hdr_t);
 
     /* 3. L3 Header Analysis: Extract Destination Virtual IP (Network Byte Order) */
     const struct iphdr *iph = (const struct iphdr *)data;

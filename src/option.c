@@ -263,6 +263,7 @@ void vf_option_clean(vpn_option_t *opt) {
     if (opt->pidfile) zfree(opt->pidfile);
     if (opt->cfile) zfree(opt->cfile);
     if (opt->keyfile) zfree(opt->keyfile);
+    if (opt->username) zfree(opt->username);
 
     log_info("Options resource cleanup...");
 }

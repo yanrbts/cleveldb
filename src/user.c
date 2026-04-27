@@ -138,9 +138,11 @@ bool vf_user_init(void) {
 
     /* Initialize RADIUS (libradcli) */
     /* Using db_conn as the path to radiusclient.conf if provided */
-    g_rh = rc_read_config(VF_USER_RADCLI_CONF);
+    const char *apath = vf_get_absolute_path(VF_USER_RADCLI_CONF);
+    g_rh = rc_read_config(apath);
     if (!g_rh) {
-        log_error("Failed to read radcli config: %s", VF_USER_RADCLI_CONF);
+        log_error("Failed to read radcli config [%s]: %s (errno: %d)", 
+              apath, strerror(errno), errno);
         pthread_rwlock_destroy(&g_user_mgr.lock);
         return false;
     }
@@ -157,6 +159,8 @@ bool vf_user_init(void) {
         pthread_rwlock_destroy(&g_user_mgr.lock);
         return false;
     }
+
+    zfree((void*)apath);
 
     return true;
 }

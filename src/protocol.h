@@ -50,12 +50,33 @@
 #define __PROTOCOL_H__
 
 #include <stdint.h>
+#include "log.h"
 #include "key.h"
 #include "io.h"
+#include "utils.h"
+#include "error.h"
 
 /* Protocol Constants */
 #define VPN_VERSION             1
 #define VPN_HDR_FLAG_PADDING    0x01
+#define VF_MAGIC                0x5646 /* "VF" in Little-Endian */
+#define VF_RTT_THRESHOLD_MS     200
+#define VF_DEFAULT_CAPS         0x0001
+
+typedef enum {
+    /* 0xx: Success */
+    VF_S_OK         = 0,   /* Success: Proceed to AUTH */
+    /* 1xx: Client-Side Errors (Requests) */
+    VF_S_VER_ERR    = 101, /* Version mismatch: Upgrade client */
+    VF_S_CAP_ERR    = 102, /* Unsupported capabilities */
+    VF_S_COOKIE_ERR = 103, /* Invalid or expired cookie */
+    /* 2xx: Server-Side Errors (Resources) */
+    VF_S_BUSY       = 201, /* Server busy: Resource exhausted */
+    VF_S_MAINT      = 202, /* Server maintenance in progress */
+    VF_S_DENY       = 203, /* Policy denied: Access restricted */
+    /* 3xx: System Failures */
+    VF_S_SYS_ERR    = 301  /* Internal server error */
+} vf_status_t;
 
 /* Message Types */
 typedef enum {
@@ -68,11 +89,11 @@ typedef enum {
     VPN_MSG_REKEY_REQ  = 0x07,  /* Triggered by vf_rekey_needed */
     VPN_MSG_REKEY_ACK  = 0x08,  /* Confirmation to call vf_rekey_commit */
     VPN_MSG_AUTH_REQ   = 0x09, 
-    VPN_MSG_AUTH_RESP  = 0x0A,
+    VPN_MSG_AUTH_ACK   = 0x0A,
     VPN_MSG_LOGOUT     = 0x0B
-} vpn_msg_t;
+} vf_msg_t;
 
-/* * Packed Structure for Network Transmission
+/* Packed Structure for Network Transmission
  * Total size: 8 bytes (64-bit aligned for optimal CPU access)
  */
 typedef struct {
@@ -88,9 +109,73 @@ typedef struct {
 
     uint8_t  padding_len;  /* Length of padding bytes */
     uint8_t  reserved[3];  /* keep 4-byte alignment */
-} __attribute__((packed)) vpn_tunnel_hdr_t;
+} __attribute__((packed)) vf_hdr_t;
 
-#define VPN_TNL_HLEN sizeof(vpn_tunnel_hdr_t)
+#define VPN_TNL_HLEN sizeof(vf_hdr_t)
+
+/**
+ * Hello Request Payload (Client -> Server)
+ * Total Size: 24 Bytes (8-byte aligned)
+ */
+typedef struct {
+    uint64_t timestamp;      /* 8 bytes: Client local time */
+    uint8_t  random_pad[14]; /* 14 bytes: Padding to reach 24-byte boundary */
+} __attribute__((packed)) vf_payload_hello_req_t;
+
+/**
+ * Hello Response Payload (Server -> Client)
+ * Total Size: 32 Bytes (8-byte aligned)
+ */
+typedef struct {
+    uint64_t server_ts;      /* 8 bytes: Server local time */
+    uint32_t status;         /* 4 bytes: OK/Busy/Mismatch */
+    uint16_t selected_caps;  /* 2 bytes: Final features */
+    uint8_t  cookie[18];     /* 18 bytes: Cookie + Padding to 32-byte boundary */
+} __attribute__((packed)) vf_payload_hello_resp_t;
+
+/**
+ * Auth Request Payload (Client -> Server)
+ * Used with VF_MSG_AUTH_REQ.
+ */
+typedef struct {
+    char     username[64];
+    char     password[64];  /* Raw password or Hash */
+    uint64_t timestamp;     /* Anti-replay & latency measurement */
+    uint8_t  nonce[16];     /* Random bytes for session key derivation */
+} __attribute__((packed)) vf_payload_auth_req_t;
+
+/**
+ * Auth Response Payload (Server -> Client)
+ * Used with VF_MSG_AUTH_RESP.
+ */
+typedef struct {
+    uint32_t status;        /* 0 for success, non-zero for error codes */
+    uint32_t vip;           /* Virtual IP for TUN interface (Network Order) */
+    uint8_t  token[16];     /* Session token for subsequent messages */
+    uint32_t key_id;
+    uint32_t keepalive_int;  /* 4 bytes: Heartbeat interval (Moved here to align) */
+    uint8_t  init_key[32];   /* 32 bytes: Initial Session Key */
+} __attribute__((packed)) vf_payload_auth_resp_t;
+
+/**
+ * Data Payload (Encapsulated IP Traffic)
+ * Used with VF_MSG_DATA.
+ * The payload follows the header directly.
+ */
+typedef struct {
+    uint8_t  ip_version;    /* Hint: 4 for IPv4, 6 for IPv6 */
+    uint8_t  protocol;      /* Original protocol (TCP/UDP/ICMP) */
+    uint8_t  data[];        /* Raw IP packet starting from IP header */
+} __attribute__((packed)) vf_payload_data_t;
+
+/**
+ * Heartbeat & DPD Payload
+ * Used with VF_MSG_KEEPALIVE, VF_MSG_DPD_REQ/RESP.
+ */
+typedef struct {
+    uint64_t echo_id;       /* Random ID to match REQ and RESP */
+    uint64_t timestamp;     /* RTT calculation */
+} __attribute__((packed)) vf_payload_echo_t;
 
 /**
  * @brief Encapsulates and encrypts a VFAST tunnel packet.
@@ -115,7 +200,7 @@ typedef struct {
  * Before: [8B Gap] [Payload(N)]
  * After:  [Header(8B)] [Nonce(24B)] [Cipher(N)] [Tag(16B)]
  */
-int vf_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int payload_len, int max_buf_size, vpn_msg_t type, uint32_t sid);
+int vf_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int payload_len, int max_buf_size, vf_msg_t type, uint32_t sid);
 
 /**
  * @brief Decapsulates, authenticates, and decrypts incoming VFAST packets.
@@ -141,31 +226,46 @@ int vf_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int payload_len, int max_b
 uint8_t* vf_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int received_len, int *out_ip_len);
 
 /**
- * @brief Encapsulates the tunnel header with protocol-specific metadata.
- * * In high-performance asynchronous I/O (like io_uring), packets may remain 
- * in the kernel queue during a rekeying event. Including the 'kid' (Key ID) 
- * in every header allows the receiver to perform a "Lockless Key Lookup," 
- * matching the packet to either the 'Active' or 'Previous' key accurately.
- *
- * @param buf  Pointer to the start of the transmission buffer.
- * @param type The message type (e.g., VPN_MSG_DATA, VPN_MSG_KEEPALIVE).
- * @param sid  The Session ID assigned during the HELLO exchange.
- * @param kid  The Key ID currently active in the security context.
+ * @brief Safely fills the VPN tunnel header with boundary checks.
+ * @param buf      Pointer to the message buffer.
+ * @param buf_sz   The actual allocated size of buf (for safety check).
+ * @param total_sz The logical total length of the packet (Header + Payload).
+ * @param type     Message type (vf_msg_t).
+ * @param sid      Session ID.
+ * @param kid      Key ID.
+ * @return int     VF_OK (0) on success, VF_ERR_INVALID_PARAM (-6) on overflow.
  */
-static inline void vf_fill_header(void *buf, uint8_t type, uint32_t sid, uint32_t kid) {
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)buf;
+static inline int vf_fill_header(void *buf, uint64_t total_sz, 
+                                 uint8_t type, uint32_t sid, uint32_t kid) {
+    /* 1. Boundary Check: Ensure buffer can at least hold the header */
+    if (unlikely(!buf)) {
+        return VF_ERR_INVALID_PARAM;
+    }
 
+    /* 2. Range Check: total_sz must fit into uint16_t total_len field */
+    if (unlikely(total_sz > BUF_SIZE)) {
+        log_error("Packet too large: %lu bytes", total_sz);
+        return VF_ERR_INVALID_PARAM;
+    }
+
+    vf_hdr_t *hdr = (vf_hdr_t *)buf;
+
+    /* 3. Fill Fields with Network Byte Order */
+    hdr->magic    = htons(VF_MAGIC); /* Using the optimized 16-bit magic */
     hdr->version  = VPN_VERSION;
     hdr->msg_type = type;
+    hdr->total_len = htons((uint16_t)total_sz);
 
-    /**
-     * Store the truncated Key ID. 
-     * Using (kid & 0xFF) allows the receiver to distinguish between 
-     * consecutive rekeying generations (e.g., Gen 2 vs Gen 3).
-     */
-    hdr->key_id = (uint8_t)(kid & 0xFF);
-    hdr->flags = 0;
+    hdr->key_id     = (uint8_t)(kid & 0xFF);
+    hdr->flags      = 0;
     hdr->session_id = htonl(sid);
+    
+    /* 4. Sequence Number (Should be managed by a global/session counter) 
+     * Note: In a real scenario, don't forget to increment this.
+     */
+    // hdr->seq_num = htonl(next_seq); 
+
+    return VF_OK;
 }
 
 /**

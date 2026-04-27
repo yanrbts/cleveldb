@@ -36,60 +36,84 @@ static void fsm_send_pkt(vfast_fsm_t *fsm, uint8_t type) {
         return;
     }
 
-    int total_len = 0;
+    /* Clear the entire buffer to prevent information leakage from previous tasks */
+    memset(task->buf, 0, BUF_SIZE);
 
-    /* 2. Protocol Encapsulation Path */
-    if (type == VPN_MSG_HELLO) {
-        /**
-         * HANDSHAKE PHASE:
-         * At this stage, no session key is negotiated. vf_pack will skip 
-         * encryption and perform plain-text encapsulation.
-         */
-        vpn_auth_t *auth = (vpn_auth_t *)(task->buf + VPN_TNL_HLEN);
-        
-        /* Populate authentication credentials directly into the reserved payload offset */
-        vf_auth_pack(auth, fsm->vip, (uint8_t *)VFAST_TOKEN, 0, NULL, 0);
+    int payload_len = 0;
+    uint8_t *payload_ptr = task->buf + VPN_TNL_HLEN;
 
-        total_len = vf_pack(NULL,                 /* No key available yet */
-                             task->buf,            /* Target buffer */
-                             sizeof(vpn_auth_t),   /* Payload length */
-                             BUF_SIZE,             /* Buffer capacity */
-                             VPN_MSG_HELLO,        /* Message type */
-                             fsm->sid);                   /* Session ID (N/A) */
-    } else if (type == VPN_MSG_KEEPALIVE) {
-        /**
-         * ESTABLISHED PHASE:
-         * Keep-alive packets are encrypted using the negotiated session key to
-         * obscure traffic patterns and prevent protocol fingerprinting.
-         */
-        total_len = vf_pack(fsm->sec,   /* Use active session key */
-                             task->buf,            /* Target buffer */
-                             0,                    /* Keep-alive has 0-byte payload */
-                             BUF_SIZE,             /* Buffer capacity */
-                             VPN_MSG_KEEPALIVE,    /* Message type */
-                             fsm->sid);      /* Current Session ID */
+    /* 2. Fill Payloads based on Type */
+    switch (type) {
+        case VPN_MSG_HELLO: {
+            vf_payload_hello_req_t *hello = (vf_payload_hello_req_t *)payload_ptr;
+            /* Using the zero-redundancy 24-byte structure we discussed */
+            hello->timestamp = htonll((uint64_t)time(NULL));
+            /* random_pad is already zeroed; entropy can be added if needed */
+            payload_len = sizeof(vf_payload_hello_req_t);
+            break;
+        }
+
+        case VPN_MSG_AUTH_REQ: {
+            vf_payload_auth_req_t *auth = (vf_payload_auth_req_t *)payload_ptr;
+            /* Anti-replay & credentials */
+            auth->timestamp = htonll((uint64_t)time(NULL));
+            strncpy(auth->username, fsm->user_name, sizeof(auth->username) - 1);
+            auth->username[sizeof(auth->username) - 1] = '\0';
+            strncpy(auth->password, fsm->pass_word, sizeof(auth->password) - 1);
+            auth->password[sizeof(auth->password) - 1] = '\0';
+            
+            /* If we received a cookie from HELLO_ACK, attach it here for DDOS protection */
+            payload_len = sizeof(vf_payload_auth_req_t);
+            break;
+        }
+
+        case VPN_MSG_KEEPALIVE: {
+            vf_payload_echo_t *echo = (vf_payload_echo_t *)payload_ptr;
+            uint32_t seq = (uint32_t)atomic_fetch_add(&fsm->next_seq, 1);
+
+            echo->echo_id = htonll((uint64_t)seq);
+            echo->timestamp = htonll((uint64_t)time(NULL));
+            payload_len = sizeof(vf_payload_echo_t);
+            break;
+        }
+
+        default:
+            log_error("FSM: Unsupported control packet type: %u", type);
+            goto rollback;
     }
 
-    /* 3. Asynchronous Submission */
-    if (likely(total_len > 0)) {
-        /**
-         * Since 'task->buf' is guaranteed to be within the task pool, 
-         * vfast_submit_write will skip internal memcpy and submit the 
-         * raw pointer directly to the io_uring SQ.
-         */
-        vfast_submit_write(fsm->io, 
-                           fsm->io->udp_fd, 
-                           OP_UDP_SEND, 
-                           task->buf, 
-                           total_len, 
-                           &fsm->dst_addr);
-        
-        io_uring_submit(&fsm->io->ring);
-    } else {
-        /* Rollback: Release the task if encapsulation failed to prevent pool leakage */
-        task->in_use = false;
-        log_error("FSM: Packet encapsulation failed for type %d", type);
+    /* 3. Encapsulation */
+    /* Only KEEPALIVE uses the security context (sec). 
+     * HELLO and AUTH_REQ are sent before the session key is established. */
+    void *sec_ctx = (type == VPN_MSG_KEEPALIVE || type == VPN_MSG_HELLO) ? NULL : fsm->sec;
+
+    int total_len = vf_pack(sec_ctx, 
+                            task->buf, 
+                            payload_len, 
+                            BUF_SIZE, 
+                            type, 
+                            fsm->sid);
+
+    if (unlikely(total_len <= 0)) {
+        log_error("FSM: Encapsulation failed for type %u", type);
+        goto rollback;
     }
+
+    /* 4. Submission to io_uring */
+    vfast_submit_write(fsm->io, 
+                        fsm->io->udp_fd, 
+                        OP_UDP_SEND, 
+                        task->buf, 
+                        total_len, 
+                        &fsm->dst_addr);
+
+    /* Force the kernel to process the SQE immediately */
+    io_uring_submit(&fsm->io->ring);
+    return;
+
+rollback:
+    /* Critical: Prevent memory leak in the task pool */
+    task->in_use = false;
 }
 /**
  * @brief FSM Background Worker Thread (Logic remains consistent).
@@ -107,21 +131,40 @@ static void *fsm_worker(void *arg) {
         switch (state) {
             case ST_IDLE:
             case ST_RECONNECTING:
+                /* 第一步：敲门 (HELLO) */
                 fsm_send_pkt(fsm, VPN_MSG_HELLO);
-                fsm->last_tx_auth = now;
-                atomic_store(&fsm->state, ST_WAIT_AUTH);
+                fsm->last_tx_hello = now;
+                atomic_store(&fsm->state, ST_HELLO_WAIT);
                 log_info("FSM: HELLO submitted to %s:%d", 
                          fsm->server_ip, fsm->server_port);
                 break;
-
-            case ST_WAIT_AUTH:
+            
+            case ST_HELLO_WAIT:
+                /* 等待 HELLO_ACK。如果超时没收到，说明路不通，回到 IDLE 重试 */
+                if (now - fsm->last_tx_hello >= FSM_AUTH_RETRY) {
+                    log_warn("FSM: HELLO timeout, server unreachable. Retrying...");
+                    atomic_store(&fsm->state, ST_IDLE);
+                }
+                break;
+            
+            case ST_AUTH_SEND:
+                /* 第二步：递交身份证 (AUTH) */
+                fsm_send_pkt(fsm, VPN_MSG_AUTH_REQ);
+                fsm->last_tx_auth = now;
+                atomic_store(&fsm->state, ST_AUTH_WAIT);
+                log_info("FSM: Sending AUTH_REQ for user: %s", fsm->user_name);
+                break;
+            
+            case ST_AUTH_WAIT:
+                /* 等待 AUTH_RESP (包含 VIP 和 Token) */
                 if (now - fsm->last_tx_auth >= FSM_AUTH_RETRY) {
-                    log_warn("FSM: Auth timeout, retrying...");
+                    log_warn("FSM: Auth request timeout. Returning to HELLO...");
                     atomic_store(&fsm->state, ST_IDLE);
                 }
                 break;
 
             case ST_CONNECTED:
+                /* 第三步：维持连接 (KEEPALIVE) */
                 if (now - fsm->last_tx_keep >= FSM_KEEPALIVE) {
                     fsm_send_pkt(fsm, VPN_MSG_KEEPALIVE);
                     fsm->last_tx_keep = now;
@@ -141,7 +184,8 @@ static void *fsm_worker(void *arg) {
 /**
  * @brief Initializes the FSM with io_uring support.
  */
-int vf_fsm_init(vfast_fsm_t *fsm, vfast_io_t *io, const char *sip, uint16_t sport, atomic_bool *running, const uint8_t *key) {
+int vf_fsm_init(vfast_fsm_t *fsm, vfast_io_t *io, const char *username, const char *pwd, 
+    const char *sip, uint16_t sport, atomic_bool *running, const uint8_t *key) {
     if (!io || !sip) return -1;
 
     memset(fsm, 0, sizeof(vfast_fsm_t));
@@ -151,6 +195,8 @@ int vf_fsm_init(vfast_fsm_t *fsm, vfast_io_t *io, const char *sip, uint16_t spor
     fsm->sid = 0;
     fsm->running = running;
     fsm->key = key;
+    fsm->user_name = username;
+    fsm->pass_word = pwd;
     strncpy(fsm->server_ip, sip, sizeof(fsm->server_ip) - 1);
     
     /* Pre-calculate sockaddr_in for io_uring performance */

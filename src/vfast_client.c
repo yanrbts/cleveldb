@@ -31,6 +31,7 @@
 #include "key.h"
 #include "vfast.h"
 #include "logo.h"
+#include "error.h"
 
 typedef struct {
     time_t   last_sent;
@@ -52,6 +53,8 @@ struct vfast_client {
     _Atomic (vfast_sec_ctx_t *) active_ptr;
     vfast_sec_ctx_t     sec_ctxs[2];
     vfast_fsm_t         fsm;
+    struct sockaddr_in  dst_addr;
+    uint32_t            vip;
 } vfclient;
 
 /**
@@ -103,29 +106,69 @@ static inline int client_handle_data(vfast_io_t *io, uint8_t *payload, int plen)
  */
 static inline int client_handle_hello(vfast_io_t *io, uint32_t sid, uint8_t *payload, int plen) {
     UNUSED(io);
+    UNUSED(sid);
 
-    /* State Lock: ignore subsequent HELLO if already established */
-    if (vf_fsm_is_connected(&vfclient.fsm)) {
+    /* 1. Pre-condition: Only process if we are waiting for HELLO */
+    if (atomic_load(&vfclient.fsm.state) != ST_HELLO_WAIT) {
         return 0; 
     }
 
     /* 2. Boundary and Integrity Validation */
-    if (unlikely(!payload || plen < (int)sizeof(vpn_auth_t))) {
-        log_error("Ingress: HELLO payload too small or null (len: %d)", plen);
+    if (unlikely(!payload || plen < (int)sizeof(vf_payload_hello_resp_t))) {
+        log_error("Ingress: HELLO_ACK payload undersized (len: %d)", plen);
         return -1;
     }
 
-    if (unlikely(sid == 0)) {
-        log_error("Ingress: Server assigned a NULL SID (0x00000000)");
+    vf_payload_hello_resp_t *resp = (vf_payload_hello_resp_t *)payload;
+
+    /* 3. Check Server Status */
+    uint32_t status = ntohl(resp->status);
+    if (unlikely(status != VF_S_OK)) {
+        log_error("FSM: Server rejected HELLO. Status Code: %u", status);
+        atomic_store(&vfclient.fsm.state, ST_IDLE);
         return -1;
     }
 
-    vpn_auth_t *auth = (vpn_auth_t *)payload;
-    
-    /* Persist session parameters */
+    // uint64_t server_ts = ntohll(resp->server_ts);
+
+    /* 5. State Transition */
+    log_info("FSM: HELLO acknowledged. Moving to AUTH phase.");
+    atomic_store(&vfclient.fsm.state, ST_AUTH_SEND);
+
+    return 0;
+}
+
+/**
+ * @brief Handles AUTH response from the server (VF_MSG_AUTH_RESP).
+ * Transition: ST_AUTH_WAIT -> ST_CONNECTED
+ */
+static inline int client_handle_auth(vfast_io_t *io, uint32_t sid, uint8_t *payload, int plen) {
+    UNUSED(io);
+    /* 1. Pre-condition: Only process if we are waiting for AUTH response */
+    if (atomic_load(&vfclient.fsm.state) != ST_AUTH_WAIT) {
+        return 0;
+    }
+
+    /* 2. Boundary Validation */
+    if (unlikely(!payload || plen < (int)sizeof(vf_payload_auth_resp_t))) {
+        log_error("Ingress: HELLO_ACK payload undersized (len: %d)", plen);
+        return -1;
+    }
+
+    vf_payload_auth_resp_t *resp = (vf_payload_auth_resp_t *)payload;
+
+    /* 3. Check Auth Status */
+    uint32_t status = ntohl(resp->status);
+    if (unlikely(status != VF_S_OK)) {
+        log_error("FSM: Authentication failed. Server Status: %u", status);
+        atomic_store(&vfclient.fsm.state, ST_IDLE);
+        return -1;
+    }
+
     vfast_sec_ctx_t *ctx = atomic_load(&vfclient.active_ptr);
-    memcpy(ctx->active_key.raw, auth->init_key, REKEY_KEY_SIZE);
-    ctx->active_key.id = ntohl(auth->key_id);
+
+    memcpy(ctx->active_key.raw, resp->init_key, REKEY_KEY_SIZE);
+    ctx->active_key.id = ntohl(resp->key_id);
     ctx->active_key.created_at = time(NULL);
     ctx->sid = sid;
 
@@ -133,13 +176,15 @@ static inline int client_handle_hello(vfast_io_t *io, uint32_t sid, uint8_t *pay
     atomic_store(&ctx->active_key.bytes_processed, 0);
     atomic_store(&ctx->rekey_pending, false);
 
+    /* 4. Session & Security Initialization */
+    vfclient.vip = resp->vip;
     vfclient.fsm.sid = sid;
-    vfclient.fsm.vip = auth->vip;
     vfclient.fsm.sec = ctx;
 
     /* Convert Virtual IP to string for system configuration */
     char ip_str[INET_ADDRSTRLEN];
-    ip_ntop(auth->vip, ip_str, sizeof(ip_str));
+    ip_ntop(resp->vip, ip_str, sizeof(ip_str));
+
     /**
      * Synchronous Interface Configuration: transition to 
      * ST_CONNECTED only if the system call succeeds.
@@ -154,6 +199,36 @@ static inline int client_handle_hello(vfast_io_t *io, uint32_t sid, uint8_t *pay
                   vfclient.tun.name, ip_str);
         return -1;
     }
+}
+
+/**
+ * @brief Handles incoming Keepalive/DPD messages.
+ * If it's a Request, we must respond. If it's a Response, update Liveness.
+ */
+static inline int client_handle_keepalive(vfast_io_t *io, uint32_t sid, uint8_t *payload, int plen) {
+    UNUSED(io);
+    UNUSED(sid);
+    /* 1. Basic Validation */
+    if (unlikely(!payload || plen < (int)sizeof(vf_payload_echo_t))) {
+        return -1;
+    }
+
+    vf_payload_echo_t *echo = (vf_payload_echo_t *)payload;
+
+    /* 3. Logic based on Message Direction (Optional RTT logic) */
+    uint64_t sent_ms = ntohll(echo->timestamp);
+    uint64_t now_ms = vf_now_ms();
+
+    if (likely(now_ms >= sent_ms)) {
+        uint64_t rtt = now_ms - sent_ms;
+
+        if (unlikely(rtt > VF_RTT_THRESHOLD_MS)) {
+            log_warn("FSM: High latency detected! RTT: %llu ms (Threshold: %d ms), SID: 0x%08x", 
+                     rtt, VF_RTT_THRESHOLD_MS, sid);
+        }
+    }
+    
+    return 0;
 }
 
 /**
@@ -279,7 +354,7 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     vf_remove_header_obfs(data, (size_t)len);
 
     /* Direct mapping to inspect the header */
-    vpn_tunnel_hdr_t *hdr = (vpn_tunnel_hdr_t *)data;
+    vf_hdr_t *hdr = (vf_hdr_t *)data;
 
     sid = ntohl(hdr->session_id);
     /**
@@ -304,7 +379,7 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     case VPN_MSG_HELLO:
         return client_handle_hello(io, sid, payload, plen);
     case VPN_MSG_KEEPALIVE:
-        break;
+        return client_handle_keepalive(io, sid, payload, plen);
     case VPN_DPD_REQUEST:
         log_info("Received DPD Request from server. Responding with DPD Response.");
         client_handle_dpd(io, data, src);
@@ -312,8 +387,8 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     case VPN_MSG_REKEY_ACK:
         vfast_handle_new_key();
         break;
-    case VPN_MSG_AUTH_RESP:
-        break;
+    case VPN_MSG_AUTH_ACK:
+        return client_handle_auth(io, sid, payload, plen);
     default:
         log_warn("Ingress: Unknown message type [0x%02x] received.", hdr->msg_type);
         break;
@@ -437,14 +512,14 @@ static void vfast_rekey_timer_handler(vfast_io_t *io, void *arg) {
         vfast_task_t *task = vfast_borrow_task(io);
         if (likely(task)) {
             /* Payload: [NewKeyID: 4B][RawKey: 32B] */
-            uint8_t *payload = task->buf + sizeof(vpn_tunnel_hdr_t);
+            uint8_t *payload = task->buf + sizeof(vf_hdr_t);
             uint32_t net_kid = htonl(ctx->next_key.id);
             memcpy(payload, &net_kid, 4);
             memcpy(payload + 4, ctx->next_key.raw, REKEY_KEY_SIZE);
 
-            int total_len = vf_pack(vfclient.active_ptr,               /* Use active session key */
+            int total_len = vf_pack(vfclient.active_ptr,                /* Use active session key */
                              task->buf,                                 /* Target buffer */
-                             VPN_TNL_HLEN + 4 + REKEY_KEY_SIZE,         /* Keep-alive has 0-byte payload */
+                             4 + REKEY_KEY_SIZE,                        /* Keep-alive has 0-byte payload */
                              BUF_SIZE,                                  /* Buffer capacity */
                              VPN_MSG_REKEY_REQ,                         /* Message type */
                              vfclient.fsm.sid);                         /* Current Session ID */
@@ -475,6 +550,12 @@ reschedule:
     return;
 }
 
+static inline void vfast_init_sockaddr() {
+    vfclient.dst_addr.sin_family = AF_INET;
+    vfclient.dst_addr.sin_port = htons(vfclient.opt.remote_port);
+    ip_pton(vfclient.opt.remote_host, &vfclient.dst_addr.sin_addr.s_addr);
+}
+
 /**
  * vfast_init_server - Pipeline and Environment Setup.
  * Initializes memory, kernel interfaces, and warms up the I/O ring.
@@ -483,6 +564,7 @@ static int vfast_init_client() {
     memset(&vfclient.io, 0, sizeof(vfast_io_t));
     atomic_store(&vfclient.io.running, true);
 
+    vfast_init_sockaddr();
     vfast_init_secctx();
 
     if (vfast_load_key(vfclient.opt.keyfile, vfclient.opt.master_key) < 0) {
@@ -595,6 +677,8 @@ int main(int argc, char *argv[]) {
     vf_fsm_init(
         &vfclient.fsm,
         &vfclient.io,
+        vfclient.opt.username,
+        vfclient.opt.password,
         vfclient.opt.remote_host, 
         vfclient.opt.remote_port, 
         &vfclient.io.running,
