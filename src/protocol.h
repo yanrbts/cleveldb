@@ -115,11 +115,10 @@ typedef struct {
 
 /**
  * Hello Request Payload (Client -> Server)
- * Total Size: 24 Bytes (8-byte aligned)
+ * Total Size: 8 Bytes (8-byte aligned)
  */
 typedef struct {
     uint64_t timestamp;      /* 8 bytes: Client local time */
-    uint8_t  random_pad[14]; /* 14 bytes: Padding to reach 24-byte boundary */
 } __attribute__((packed)) vf_payload_hello_req_t;
 
 /**
@@ -129,19 +128,20 @@ typedef struct {
 typedef struct {
     uint64_t server_ts;      /* 8 bytes: Server local time */
     uint32_t status;         /* 4 bytes: OK/Busy/Mismatch */
-    uint16_t selected_caps;  /* 2 bytes: Final features */
-    uint8_t  cookie[18];     /* 18 bytes: Cookie + Padding to 32-byte boundary */
+    uint32_t selected_caps;  /* 4 bytes: Final features */
+    uint8_t  cookie[16];     /* 16 bytes: Cookie + Padding to 32-byte boundary */
 } __attribute__((packed)) vf_payload_hello_resp_t;
 
 /**
  * Auth Request Payload (Client -> Server)
- * Used with VF_MSG_AUTH_REQ.
+ * Optimized for: Alignment, Security, and Cache Efficiency.
+ * Total Size: 152 Bytes (Perfectly 8-byte aligned: 152 / 8 = 19)
  */
 typedef struct {
-    char     username[64];
-    char     password[64];  /* Raw password or Hash */
-    uint64_t timestamp;     /* Anti-replay & latency measurement */
-    uint8_t  nonce[16];     /* Random bytes for session key derivation */
+    uint64_t timestamp;      /* 8 bytes: Moved to front for perfect 8-byte alignment */
+    uint8_t  cookie[16];     /* 16 bytes: Fixed size, no alignment issues */
+    char     username[64];   /* 64 bytes: MUST be handled with strnlen/strncpy */
+    char     password[64];   /* 64 bytes: Internal hash or encrypted string */
 } __attribute__((packed)) vf_payload_auth_req_t;
 
 /**

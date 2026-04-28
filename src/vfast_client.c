@@ -110,7 +110,8 @@ static inline int client_handle_hello(vfast_io_t *io, uint32_t sid, uint8_t *pay
 
     /* 1. Pre-condition: Only process if we are waiting for HELLO */
     if (atomic_load(&vfclient.fsm.state) != ST_HELLO_WAIT) {
-        return 0; 
+        log_error("State is not ST_HELLO_WAIT");
+        return -1; 
     }
 
     /* 2. Boundary and Integrity Validation */
@@ -129,7 +130,8 @@ static inline int client_handle_hello(vfast_io_t *io, uint32_t sid, uint8_t *pay
         return -1;
     }
 
-    // uint64_t server_ts = ntohll(resp->server_ts);
+    memcpy(vfclient.fsm.cookie, resp->cookie, sizeof(vfclient.fsm.cookie));
+    vfclient.fsm.server_ts = ntohll(resp->server_ts);
 
     /* 5. State Transition */
     log_info("FSM: HELLO acknowledged. Moving to AUTH phase.");
@@ -146,7 +148,8 @@ static inline int client_handle_auth(vfast_io_t *io, uint32_t sid, uint8_t *payl
     UNUSED(io);
     /* 1. Pre-condition: Only process if we are waiting for AUTH response */
     if (atomic_load(&vfclient.fsm.state) != ST_AUTH_WAIT) {
-        return 0;
+        log_error("State is not ST_AUTH_WAIT");
+        return -1;
     }
 
     /* 2. Boundary Validation */

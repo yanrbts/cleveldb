@@ -1,29 +1,15 @@
-以下是经过美观排版、统一格式、命令块使用 ```bash
+docker 配置服务kanidm ```bash
 
 ```markdown
 # libtinytun - High-Performance C VPN Library
 
-A lightweight, industrial-grade VPN core library built with C and `io_uring` for extreme concurrency.
+sudo mkdir -p /etc/systemd/system/docker.service.d
+sudo vim /etc/systemd/system/docker.service.d/http-proxy.conf
 
-## Features
-
-- **Zero-Copy Architecture** — Powered by Linux `io_uring` for low-latency packet processing
-- **Multi-Queue Support** — Parallel TUN device handling for multi-core scalability
-- **High Concurrency** — Designed to handle 10,000+ simultaneous sessions
-- **Minimalist Core** — Stripped-down implementation focusing on speed and security
-
-## Prerequisites
-
-- **OS**: Linux Kernel 5.10+ (Recommended for stable io_uring support)
-- **Library**: `liburing` (v2.0 or higher)
-- **Permissions**: `CAP_NET_ADMIN` (Required for TUN device manipulation)
-
-## Installation
-
-### 1. Install Dependencies
-
-```bash
-sudo apt update && sudo apt install -y liburing-dev build-essential
+[Service]
+Environment="HTTP_PROXY=http://127.0.0.1:7890"
+Environment="HTTPS_PROXY=http://127.0.0.1:7890"
+Environment="NO_PROXY=localhost,127.0.0.1,::1"
 ```
 
 ### 2. Build & Install

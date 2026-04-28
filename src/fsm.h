@@ -23,8 +23,7 @@ typedef enum {
 
 typedef struct {
     atomic_int      state;         
-    uint32_t        sid;           
-    // uint32_t        vip;           
+    uint32_t        sid;             
     atomic_long     last_rx_time;
     time_t          last_tx_hello;  
     time_t          last_tx_auth;  
@@ -40,6 +39,8 @@ typedef struct {
     atomic_uint_fast32_t next_seq;
     const char     *pass_word;
     const char     *user_name;
+    uint8_t         cookie[16];
+    uint64_t        server_ts;
 } vfast_fsm_t;
 
 /* Signature updated to accept vfast_io_t */

@@ -46,9 +46,7 @@ static void fsm_send_pkt(vfast_fsm_t *fsm, uint8_t type) {
     switch (type) {
         case VPN_MSG_HELLO: {
             vf_payload_hello_req_t *hello = (vf_payload_hello_req_t *)payload_ptr;
-            /* Using the zero-redundancy 24-byte structure we discussed */
             hello->timestamp = htonll((uint64_t)time(NULL));
-            /* random_pad is already zeroed; entropy can be added if needed */
             payload_len = sizeof(vf_payload_hello_req_t);
             break;
         }
@@ -56,7 +54,8 @@ static void fsm_send_pkt(vfast_fsm_t *fsm, uint8_t type) {
         case VPN_MSG_AUTH_REQ: {
             vf_payload_auth_req_t *auth = (vf_payload_auth_req_t *)payload_ptr;
             /* Anti-replay & credentials */
-            auth->timestamp = htonll((uint64_t)time(NULL));
+            auth->timestamp = htonll(fsm->server_ts);
+            memcpy(auth->cookie, fsm->cookie, sizeof(auth->cookie));
             strncpy(auth->username, fsm->user_name, sizeof(auth->username) - 1);
             auth->username[sizeof(auth->username) - 1] = '\0';
             strncpy(auth->password, fsm->pass_word, sizeof(auth->password) - 1);
