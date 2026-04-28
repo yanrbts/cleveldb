@@ -10,6 +10,13 @@ sudo vim /etc/systemd/system/docker.service.d/http-proxy.conf
 Environment="HTTP_PROXY=http://127.0.0.1:7890"
 Environment="HTTPS_PROXY=http://127.0.0.1:7890"
 Environment="NO_PROXY=localhost,127.0.0.1,::1"
+
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+newgrp docker
+
+sudo systemctl start docker
+sudo systemctl enable docker
 ```
 
 ### 2. Build & Install
