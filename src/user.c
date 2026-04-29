@@ -135,7 +135,7 @@ bool vf_user_init(void) {
     if (pthread_rwlock_init(&g_user_mgr.lock, NULL) != 0) {
         return false;
     }
-
+    rc_openlog("my-prog-name");
     /* Initialize RADIUS (libradcli) */
     /* Using db_conn as the path to radiusclient.conf if provided */
     const char *apath = vf_get_absolute_path(VF_USER_RADCLI_CONF);
