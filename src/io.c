@@ -32,9 +32,9 @@
  * It ensures that a task buffer currently owned by the kernel (in_use == true) is never 
  * overwritten, preventing memory corruption and race conditions.
  * @param io Pointer to the specific I/O instance (Data or Control plane).
- * @return Pointer to an available vfast_task_t, or NULL if the pool is fully saturated.
+ * @return Pointer to an available vf_task_t, or NULL if the pool is fully saturated.
  */
-static vfast_task_t* get_task_from_instance(vfast_io_t *io) {
+static vf_task_t* get_task_from_instance(vf_io_t *io) {
     /* Limit the search to the pool size to avoid infinite loops.
      * We attempt to find at least one free slot among all pre-allocated tasks.
      */
@@ -43,7 +43,7 @@ static vfast_task_t* get_task_from_instance(vfast_io_t *io) {
          * This provides a simple load-balancing (Round-Robin) across the buffer pool.
          */
         int idx = atomic_fetch_add(&io->pool_idx, 1) % io->pool_size;
-        vfast_task_t* task = &io->task_pool[idx];
+        vf_task_t* task = &io->task_pool[idx];
         
         /**
          * CRITICAL SECTION: Atomic Ownership Acquisition.
@@ -78,7 +78,7 @@ static vfast_task_t* get_task_from_instance(vfast_io_t *io) {
  * @brief Professional Path MTU Discovery (PMTUD) Handler
  * Optimized for memory alignment, dual-stack support, and kernel compliance.
  */
-void vfast_check_icmp_errors(vfast_io_t *io, int udp_fd) {
+void vfast_check_icmp_errors(vf_io_t *io, int udp_fd) {
     if (unlikely(!io || udp_fd < 0)) return;
 
     /* 1. Use a union to guarantee alignment for CMSG macros.
@@ -156,7 +156,7 @@ void vfast_check_icmp_errors(vfast_io_t *io, int udp_fd) {
 /**
  * @brief Initializes the io_uring instance and registers fixed files.
  */
-int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, int pool_size, int io_ring_depth, vfast_ops_t ops) {
+int vf_io_init(vf_io_t *io, int udp_fd, int tun_fd, int pool_size, int io_ring_depth, vfast_ops_t ops) {
     io->udp_fd = udp_fd;
     io->tun_fd = tun_fd;
     io->ops    = ops;
@@ -164,7 +164,7 @@ int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, int pool_size, int io_
     io->io_ring_depth = io_ring_depth;
 
     /* Initialize io_uring with default parameters */
-    // io->task_pool = zcalloc(pool_size * sizeof(vfast_task_t));
+    // io->task_pool = zcalloc(pool_size * sizeof(vf_task_t));
     // if (!io->task_pool) return -1;
 
     /* MEMORY ALIGNMENT: 
@@ -172,7 +172,7 @@ int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, int pool_size, int io_
      * pin the physical pages and map them into the async I/O context.
      * _SC_PAGESIZE ensures the pool starts at a hardware-friendly boundary.
      */
-    size_t pool_bytes = pool_size * sizeof(vfast_task_t);
+    size_t pool_bytes = pool_size * sizeof(vf_task_t);
     if (posix_memalign((void**)&io->task_pool, sysconf(_SC_PAGESIZE), pool_bytes) != 0) {
         return -1;
     }
@@ -225,9 +225,9 @@ int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, int pool_size, int io_
  * @param fd  The file descriptor to read from (UDP or TUN).
  * @param op  The operation type (OP_UDP_RECV or OP_TUN_READ).
  */
-void vfast_submit_read(vfast_io_t *io, int fd, int op) {
+void vf_io_read(vf_io_t *io, int fd, int op) {
     /* 1. Acquire a task from the pre-allocated pool to ensure memory reuse */
-    vfast_task_t *task = get_task_from_instance(io);
+    vf_task_t *task = get_task_from_instance(io);
     if (unlikely(!task)) {
         return;
     }
@@ -293,13 +293,13 @@ void vfast_submit_read(vfast_io_t *io, int fd, int op) {
  * @param len  Length of data to be transmitted.
  * @param dest Destination address (used for UDP; ignored for TUN).
  */
-void vfast_submit_write(vfast_io_t *io, int fd, int op, uint8_t *data, int len, struct sockaddr_in *dest) {
+void vf_io_write(vf_io_t *io, int fd, int op, uint8_t *data, int len, struct sockaddr_in *dest) {
     /**
-     * Reconstruct the vfast_task_t pointer from the data buffer address.
+     * Reconstruct the vf_task_t pointer from the data buffer address.
      * Since 'data' is guaranteed to be a member of the task pool, we calculate
      * the task's base address using the fixed offset of the 'buf' member.
      */
-    vfast_task_t *task = vfast_data_to_task(data);
+    vf_task_t *task = vfast_data_to_task(data);
 
     /* Acquire a Submission Queue Entry (SQE) from the instance's ring */
     struct io_uring_sqe *sqe = io_uring_get_sqe(&io->ring);
@@ -365,7 +365,7 @@ void vfast_submit_write(vfast_io_t *io, int fd, int op, uint8_t *data, int len, 
  * @brief Submits a raw buffer for asynchronous transmission, bypassing the task pool.
  * @note The 'data' buffer must remain valid until the CQE is reaped (e.g., session member).
  */
-void vfast_submit_raw(vfast_io_t *io, int fd, void *data, size_t len, struct sockaddr_in *dst) {
+void vf_io_raw(vf_io_t *io, int fd, void *data, size_t len, struct sockaddr_in *dst) {
     if (unlikely(!io || !data || len == 0)) return;
 
     struct io_uring_sqe *sqe = io_uring_get_sqe(&io->ring);
@@ -402,10 +402,10 @@ void vfast_submit_raw(vfast_io_t *io, int fd, void *data, size_t len, struct soc
     io_uring_submit(&io->ring);
 }
 
-static inline void vfast_monitor_pool_status(vfast_io_t *io) {
+static inline void vfast_monitor_pool_status(vf_io_t *io) {
     int tun_read = 0, udp_recv = 0, tun_write = 0, udp_send = 0, unknown = 0;
     int pool_size = io->pool_size;
-    vfast_task_t *pool = io->task_pool;
+    vf_task_t *pool = io->task_pool;
 
     for (int i = 0; i < pool_size; i++) {
         if (__atomic_load_n(&pool[i].in_use, __ATOMIC_RELAXED)) {
@@ -427,7 +427,7 @@ static inline void vfast_monitor_pool_status(vfast_io_t *io) {
 /**
  * @brief Main event loop for processing completions.
  */
-void vfast_io_run(vfast_io_t *io) {
+void vf_io_run(vf_io_t *io) {
     struct io_uring_cqe *cqe;
     unsigned head;
     uint32_t count = 0;
@@ -438,8 +438,8 @@ void vfast_io_run(vfast_io_t *io) {
 
     /* Initial Pipeline Warm-up */
     for (int i = 0; i < 16; i++) {
-        vfast_submit_read(io, io->tun_fd, OP_TUN_READ);
-        vfast_submit_read(io, io->udp_fd, OP_UDP_RECV);
+        vf_io_read(io, io->tun_fd, OP_TUN_READ);
+        vf_io_read(io, io->udp_fd, OP_UDP_RECV);
     }
     io_uring_submit(&io->ring);
 
@@ -485,7 +485,7 @@ void vfast_io_run(vfast_io_t *io) {
         /* Batch process all available CQEs in the ring */
         io_uring_for_each_cqe(&io->ring, head, cqe) {
             count++;
-            vfast_task_t *task = (vfast_task_t *)io_uring_cqe_get_data(cqe);
+            vf_task_t *task = (vf_task_t *)io_uring_cqe_get_data(cqe);
             if (!task) continue;
 
             int res = cqe->res;
@@ -495,11 +495,11 @@ void vfast_io_run(vfast_io_t *io) {
                     case OP_TUN_READ:
                         uint8_t *tun_data = task->buf + VPN_TNL_HLEN;
                         io->ops.on_tun_data(io, tun_data, res, &task->addr, io->ops.ctx);
-                        vfast_submit_read(io, io->tun_fd, OP_TUN_READ);
+                        vf_io_read(io, io->tun_fd, OP_TUN_READ);
                         break;
                     case OP_UDP_RECV:
                         io->ops.on_udp_data(io, task->buf, res, &task->addr, io->ops.ctx);
-                        vfast_submit_read(io, io->udp_fd, OP_UDP_RECV);
+                        vf_io_read(io, io->udp_fd, OP_UDP_RECV);
                         break;
                     default: /* Write/Send completion */
                         break;
@@ -512,7 +512,7 @@ void vfast_io_run(vfast_io_t *io) {
 
                 /* Re-submit read tasks to prevent pipeline starvation */
                 if (task->op == OP_TUN_READ || task->op == OP_UDP_RECV) {
-                    vfast_submit_read(io, (task->op == OP_TUN_READ) ? io->tun_fd : io->udp_fd, task->op);
+                    vf_io_read(io, (task->op == OP_TUN_READ) ? io->tun_fd : io->udp_fd, task->op);
                 }
             }
            /* RELEASE OWNERSHIP: 
@@ -538,7 +538,7 @@ void vfast_io_run(vfast_io_t *io) {
 /**
  * @brief Cleanly releases io_uring resources and unregisters files.
  */
-void vfast_io_exit(vfast_io_t *io) {
+void vf_io_exit(vf_io_t *io) {
     if (!io) return;
 
     if (io->udp_fd >= 0) close(io->udp_fd);
@@ -548,7 +548,7 @@ void vfast_io_exit(vfast_io_t *io) {
     io_uring_queue_exit(&io->ring);
     
     /* CRITICAL: Free the dynamically allocated private task pool.
-     * This was allocated during vfast_io_init via calloc.
+     * This was allocated during vf_io_init via calloc.
      */
     if (io->task_pool) {
         free(io->task_pool);
@@ -557,7 +557,7 @@ void vfast_io_exit(vfast_io_t *io) {
     log_info("vfast_io resources released successfully.");
 }
 
-vfast_task_t* vfast_borrow_task(vfast_io_t *io) {
+vf_task_t* vf_io_task(vf_io_t *io) {
     if (unlikely(!io)) return NULL;
     return get_task_from_instance(io);
 }
@@ -568,12 +568,12 @@ vfast_task_t* vfast_borrow_task(vfast_io_t *io) {
  * This implements the Dependency Injection pattern, allowing the I/O core 
  * to trigger external logic (like session maintenance) without having 
  * a direct compile-time dependency on those modules.
- * @param io       Pointer to the initialized vfast_io_t context.
+ * @param io       Pointer to the initialized vf_io_t context.
  * @param ms       Interval in milliseconds. If 0, the timer is disabled.
  * @param cb       The callback function to execute on every tick.
  * @param arg      User-defined context passed back to the callback.
  */
-void vfast_io_set_timer(vfast_io_t *io, uint32_t ms, on_timer_cb cb, void *arg) {
+void vf_io_set_timer(vf_io_t *io, uint32_t ms, on_timer_cb cb, void *arg) {
     if (unlikely(!io)) {
         return;
     }
@@ -590,7 +590,7 @@ void vfast_io_set_timer(vfast_io_t *io, uint32_t ms, on_timer_cb cb, void *arg) 
     }
 }
 
-void vfast_io_set_pmtud_callback(vfast_io_t *io, on_pmtud_cb cb, void *arg) {
+void vf_io_set_pmtud_callback(vf_io_t *io, on_pmtud_cb cb, void *arg) {
     if (unlikely(!io)) {
         return;
     }

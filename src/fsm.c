@@ -29,8 +29,8 @@
 static void fsm_send_pkt(vfast_fsm_t *fsm, uint8_t type) {
     /* 1. Acquire a pre-allocated task buffer from the IO engine's pool.
      * This ensures the data resides in a registered memory region for io_uring,
-     * allowing for true zero-copy transmission in vfast_submit_write. */
-    vfast_task_t *task = vfast_borrow_task(fsm->io);
+     * allowing for true zero-copy transmission in vf_io_write. */
+    vf_task_t *task = vf_io_task(fsm->io);
     if (unlikely(!task)) {
         log_error("FSM: Task pool exhaustion. Cannot dispatch control packet (type: %d)", type);
         return;
@@ -71,7 +71,7 @@ static void fsm_send_pkt(vfast_fsm_t *fsm, uint8_t type) {
             uint32_t seq = (uint32_t)atomic_fetch_add(&fsm->next_seq, 1);
 
             echo->echo_id = htonll((uint64_t)seq);
-            echo->timestamp = htonll((uint64_t)time(NULL));
+            echo->timestamp = htonll((uint64_t)vf_now_ms());
             payload_len = sizeof(vf_payload_echo_t);
             break;
         }
@@ -99,7 +99,7 @@ static void fsm_send_pkt(vfast_fsm_t *fsm, uint8_t type) {
     }
 
     /* 4. Submission to io_uring */
-    vfast_submit_write(fsm->io, 
+    vf_io_write(fsm->io, 
                         fsm->io->udp_fd, 
                         OP_UDP_SEND, 
                         task->buf, 
@@ -183,7 +183,7 @@ static void *fsm_worker(void *arg) {
 /**
  * @brief Initializes the FSM with io_uring support.
  */
-int vf_fsm_init(vfast_fsm_t *fsm, vfast_io_t *io, const char *username, const char *pwd, 
+int vf_fsm_init(vfast_fsm_t *fsm, vf_io_t *io, const char *username, const char *pwd, 
     const char *sip, uint16_t sport, atomic_bool *running, const uint8_t *key) {
     if (!io || !sip) return -1;
 

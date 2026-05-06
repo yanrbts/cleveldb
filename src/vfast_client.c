@@ -47,7 +47,7 @@ static vfast_rekey_mgr_t g_rekey_mgr = {
 
 struct vfast_client {
     vpn_option_t        opt;
-    vfast_io_t          io;
+    vf_io_t          io;
     udp_conn_t         *udp;       /* UDP transport handle */
     vpn_tun_ctx_t       tun;       /* Virtual network interface */
     _Atomic (vfast_sec_ctx_t *) active_ptr;
@@ -91,20 +91,20 @@ static void vfast_cleanup() {
 /**
  * @brief Handles incoming encrypted data packets (VPN_MSG_DATA).
  */
-static inline int client_handle_data(vfast_io_t *io, uint8_t *payload, int plen) {
+static inline int client_handle_data(vf_io_t *io, uint8_t *payload, int plen) {
     /* Silently drop data packets if the FSM is not in CONNECTED state */
     if (unlikely(!vf_fsm_is_connected(&vfclient.fsm))) {
         return 0; 
     }
     /* Forward decrypted IP packet to TUN device via asynchronous io_uring write */
-    vfast_submit_write(io, io->tun_fd, OP_TUN_WRITE, payload, plen, NULL);
+    vf_io_write(io, io->tun_fd, OP_TUN_WRITE, payload, plen, NULL);
     return 0;
 }
 
 /**
  * @brief Handles handshake responses (VPN_MSG_HELLO) from the server.
  */
-static inline int client_handle_hello(vfast_io_t *io, uint32_t sid, uint8_t *payload, int plen) {
+static inline int client_handle_hello(vf_io_t *io, uint32_t sid, uint8_t *payload, int plen) {
     UNUSED(io);
     UNUSED(sid);
 
@@ -144,7 +144,7 @@ static inline int client_handle_hello(vfast_io_t *io, uint32_t sid, uint8_t *pay
  * @brief Handles AUTH response from the server (VF_MSG_AUTH_RESP).
  * Transition: ST_AUTH_WAIT -> ST_CONNECTED
  */
-static inline int client_handle_auth(vfast_io_t *io, uint32_t sid, uint8_t *payload, int plen) {
+static inline int client_handle_auth(vf_io_t *io, uint32_t sid, uint8_t *payload, int plen) {
     UNUSED(io);
     /* 1. Pre-condition: Only process if we are waiting for AUTH response */
     if (atomic_load(&vfclient.fsm.state) != ST_AUTH_WAIT) {
@@ -208,7 +208,7 @@ static inline int client_handle_auth(vfast_io_t *io, uint32_t sid, uint8_t *payl
  * @brief Handles incoming Keepalive/DPD messages.
  * If it's a Request, we must respond. If it's a Response, update Liveness.
  */
-static inline int client_handle_keepalive(vfast_io_t *io, uint32_t sid, uint8_t *payload, int plen) {
+static inline int client_handle_keepalive(vf_io_t *io, uint32_t sid, uint8_t *payload, int plen) {
     UNUSED(io);
     UNUSED(sid);
     /* 1. Basic Validation */
@@ -287,11 +287,11 @@ void vfast_handle_new_key(void) {
  * @param data Pointer to the received packet buffer (task->buf).
  * @param src  The remote address to reply to.
  */
-static inline void client_handle_dpd(vfast_io_t *io, uint8_t *data, struct sockaddr_in *src) {
+static inline void client_handle_dpd(vf_io_t *io, uint8_t *data, struct sockaddr_in *src) {
     if (unlikely(!io || !data || !src)) return;
 
     /* 1. Use the macro to find the original task context */
-    vfast_task_t *task = vfast_data_to_task(data);
+    vf_task_t *task = vfast_data_to_task(data);
     uint32_t sid = vfclient.fsm.sid;
 
     uint8_t dummy[16];
@@ -319,7 +319,7 @@ static inline void client_handle_dpd(vfast_io_t *io, uint8_t *data, struct socka
      * 3. Asynchronous Dispatch via io_uring
      * The task remains 'in_use' until the CQE is reaped in the main loop.
      */
-    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, task->buf, tlen, src);
+    vf_io_write(io, io->udp_fd, OP_UDP_SEND, task->buf, tlen, src);
 
     log_debug("DPD: Sent masked DPD response (len: %d) to server", tlen);
 }
@@ -338,7 +338,7 @@ static inline void client_handle_dpd(vfast_io_t *io, uint8_t *data, struct socka
  * @param src  Source address (Server).
  * @return 0 on success, -1 on protocol/validation error.
  */
-int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
+int client_on_udp(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
     UNUSED(arg);
 
     uint32_t sid = 0;
@@ -410,7 +410,7 @@ int client_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
  * @param arg   User-defined argument.
  * @return 0 on success, -1 on failure.
  */
-int client_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
+int client_on_tun(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
     UNUSED(src);
     UNUSED(arg);
     
@@ -452,7 +452,7 @@ int client_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *sr
     // vf_apply_header_obfs(vfast_packet_base, total_len);
 
     /* 3. Submit Asynchronous UDP Send via io_uring */
-    vfast_submit_write(io, 
+    vf_io_write(io, 
                        io->udp_fd, 
                        OP_UDP_SEND, 
                        vfast_packet_base, 
@@ -478,7 +478,7 @@ static int vfast_init_secctx() {
  * @brief Professional Rekey Decision Engine (Event-driven)
  * This callback executes within the IO thread context.
  */
-static void vfast_rekey_timer_handler(vfast_io_t *io, void *arg) {
+static void vfast_rekey_timer_handler(vf_io_t *io, void *arg) {
     vfast_rekey_mgr_t *mgr = (vfast_rekey_mgr_t *)arg;
     
     /* Security Check: FSM state validation */
@@ -512,7 +512,7 @@ static void vfast_rekey_timer_handler(vfast_io_t *io, void *arg) {
         }
 
         /* Buffer Management: Borrow a task object from the IO ring */
-        vfast_task_t *task = vfast_borrow_task(io);
+        vf_task_t *task = vf_io_task(io);
         if (likely(task)) {
             /* Payload: [NewKeyID: 4B][RawKey: 32B] */
             uint8_t *payload = task->buf + sizeof(vf_hdr_t);
@@ -527,7 +527,7 @@ static void vfast_rekey_timer_handler(vfast_io_t *io, void *arg) {
                              VPN_MSG_REKEY_REQ,                         /* Message type */
                              vfclient.fsm.sid);                         /* Current Session ID */
 
-            vfast_submit_write(io, io->udp_fd, 
+            vf_io_write(io, io->udp_fd, 
                                OP_UDP_SEND, task->buf, 
                                total_len, &vfclient.fsm.dst_addr);
             
@@ -564,7 +564,7 @@ static inline void vfast_init_sockaddr() {
  * Initializes memory, kernel interfaces, and warms up the I/O ring.
  */
 static int vfast_init_client() {
-    memset(&vfclient.io, 0, sizeof(vfast_io_t));
+    memset(&vfclient.io, 0, sizeof(vf_io_t));
     atomic_store(&vfclient.io.running, true);
 
     vfast_init_sockaddr();
@@ -596,7 +596,7 @@ static int vfast_init_client() {
         .on_tun_data = client_on_tun,
         .ctx = NULL
     };
-    vfast_io_init(
+    vf_io_init(
         &vfclient.io,
         vfclient.udp->fd, 
         vfclient.tun.fd, 
@@ -605,8 +605,8 @@ static int vfast_init_client() {
         ops
     );
 
-    vfast_io_set_timer(&vfclient.io, g_rekey_mgr.poll_ms, vfast_rekey_timer_handler, &g_rekey_mgr);
-    vfast_io_set_pmtud_callback(&vfclient.io, vfast_path_mtu_updated, &vfclient.io);
+    vf_io_set_timer(&vfclient.io, g_rekey_mgr.poll_ms, vfast_rekey_timer_handler, &g_rekey_mgr);
+    vf_io_set_pmtud_callback(&vfclient.io, vfast_path_mtu_updated, &vfclient.io);
 
     log_info("VFAST Client initialized successfully. Connecting to %s...", vfclient.opt.remote_host);
     return 0;
@@ -688,7 +688,7 @@ int main(int argc, char *argv[]) {
         vfclient.opt.master_key
     );
 
-    vfast_io_run(&vfclient.io);
+    vf_io_run(&vfclient.io);
 
     vf_fsm_pthread_join(&vfclient.fsm);
     vfast_cleanup();

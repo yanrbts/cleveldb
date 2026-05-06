@@ -20,15 +20,15 @@
 #define BUF_SIZE        2048        /**< MTU-aligned buffer size (including overhead) */
 
 /**
- * @brief Retrieves the parent vfast_task_t pointer from a buffer pointer.
- * @details Since 'buf' is a member of 'vfast_task_t', we subtract the offset 
+ * @brief Retrieves the parent vf_task_t pointer from a buffer pointer.
+ * @details Since 'buf' is a member of 'vf_task_t', we subtract the offset 
  * of 'buf' from the current data pointer to get the structure's base address.
  */
 #define vfast_data_to_task(d) \
-    ((vfast_task_t *)((uint8_t *)(d) - offsetof(vfast_task_t, buf)))
+    ((vf_task_t *)((uint8_t *)(d) - offsetof(vf_task_t, buf)))
 
 struct vfast_io;
-typedef struct vfast_io vfast_io_t;
+typedef struct vfast_io vf_io_t;
 
 /**
  * @brief Async state machine operation codes.
@@ -44,8 +44,8 @@ enum {
  * @brief Functional interface for business logic callbacks.
  * These are invoked upon successful completion of asynchronous read operations.
  */
-typedef int (*on_data_cb)(vfast_io_t *io, uint8_t *buf, int len, struct sockaddr_in *addr, void *arg);
-typedef void (*on_timer_cb)(vfast_io_t *io, void *arg);
+typedef int (*on_data_cb)(vf_io_t *io, uint8_t *buf, int len, struct sockaddr_in *addr, void *arg);
+typedef void (*on_timer_cb)(vf_io_t *io, void *arg);
 typedef void (*on_pmtud_cb)(uint32_t new_mtu, void *arg);
 
 /**
@@ -71,7 +71,7 @@ typedef struct {
     struct sockaddr_in  addr;           /**< Source/Dest address storage */
     socklen_t           addr_len;       /**< Length of sockaddr */
     atomic_bool         in_use;         /**< Spin-lock style usage flag for pool safety */
-} vfast_task_t;
+} vf_task_t;
 
 /**
  * @brief The primary I/O context holding the io_uring instance and state.
@@ -85,7 +85,7 @@ struct vfast_io {
     bool                is_server;      /**< Operation mode (Server vs Client) */
     atomic_bool         running;
 
-    vfast_task_t       *task_pool;
+    vf_task_t       *task_pool;
     atomic_int          pool_idx;
     int                 pool_size;
     int                 io_ring_depth;   /**< Counter for batching logic */   
@@ -103,28 +103,28 @@ struct vfast_io {
  * @brief Initializes the vfast_io context and io_uring subsystem.
  * @return 0 on success, negative error code on failure.
  */
-int vfast_io_init(vfast_io_t *io, int udp_fd, int tun_fd, int pool_size, int io_ring_depth, vfast_ops_t ops);
+int vf_io_init(vf_io_t *io, int udp_fd, int tun_fd, int pool_size, int io_ring_depth, vfast_ops_t ops);
 
 /**
  * @brief Starts the infinite event loop (blocking).
  */
-void vfast_io_run(vfast_io_t *io);
+void vf_io_run(vf_io_t *io);
 
 /**
  * @brief Gracefully terminates the I/O engine and releases resources.
  */
-void vfast_io_exit(vfast_io_t *io);
+void vf_io_exit(vf_io_t *io);
 
 /**
  * @brief Posts an asynchronous read or receive request to the Submission Queue (SQ).
  * Prepares a task from the pool and submits a read/recvmsg operation. The actual 
  * data processing occurs in the registered callbacks within @ref vfast_ops_t.
  *
- * @param io    Pointer to the initialized vfast_io_t context.
+ * @param io    Pointer to the initialized vf_io_t context.
  * @param fd    The raw file descriptor (UDP or TUN).
  * @param op    Operation type: @ref OP_TUN_READ or @ref OP_UDP_RECV.
  */
-void vfast_submit_read(vfast_io_t *io, int fd, int op);
+void vf_io_read(vf_io_t *io, int fd, int op);
 
 /**
  * @brief Posts an asynchronous write or send request to the Submission Queue (SQ).
@@ -132,7 +132,7 @@ void vfast_submit_read(vfast_io_t *io, int fd, int op);
  * an internal batching mechanism defined by SUBMIT_THRESHOLD to balance throughput 
  * and per-packet latency.
  *
- * @param io    Pointer to the initialized vfast_io_t context.
+ * @param io    Pointer to the initialized vf_io_t context.
  * @param fd    The raw file descriptor (used to determine the registered file index).
  * @param op    Operation type: @ref OP_TUN_WRITE or @ref OP_UDP_SEND.
  * @param data  Pointer to the payload. If this points to a buffer within the 
@@ -141,13 +141,13 @@ void vfast_submit_read(vfast_io_t *io, int fd, int op);
  * @param dest  Destination address (mandatory for @ref OP_UDP_SEND, 
  * ignored for @ref OP_TUN_WRITE).
  */
-void vfast_submit_write(vfast_io_t *io, int fd, int op, uint8_t *data, int len, struct sockaddr_in *dest);
+void vf_io_write(vf_io_t *io, int fd, int op, uint8_t *data, int len, struct sockaddr_in *dest);
 
 /**
  * @brief Submits a raw buffer for asynchronous transmission, bypassing the task pool.
  * @note The 'data' buffer must remain valid until the CQE is reaped (e.g., session member).
  */
-void vfast_submit_raw(vfast_io_t *io, int fd, void *data, size_t len, struct sockaddr_in *dst);
+void vf_io_raw(vf_io_t *io, int fd, void *data, size_t len, struct sockaddr_in *dst);
 
 /**
  * @brief Borrows a task from the pre-allocated pool for external use.
@@ -155,7 +155,7 @@ void vfast_submit_raw(vfast_io_t *io, int fd, void *data, size_t len, struct soc
  * without directly managing the pool. The returned task is marked as 'in use' and
  * must be released back to the pool by setting 'in_use' to false after use.
  */
-vfast_task_t* vfast_borrow_task(vfast_io_t *io);
+vf_task_t* vf_io_task(vf_io_t *io);
 
 /**
  * @brief Configures a periodic timer callback for the I/O event loop.
@@ -163,12 +163,12 @@ vfast_task_t* vfast_borrow_task(vfast_io_t *io);
  * This implements the Dependency Injection pattern, allowing the I/O core 
  * to trigger external logic (like session maintenance) without having 
  * a direct compile-time dependency on those modules.
- * @param io       Pointer to the initialized vfast_io_t context.
+ * @param io       Pointer to the initialized vf_io_t context.
  * @param ms       Interval in milliseconds. If 0, the timer is disabled.
  * @param cb       The callback function to execute on every tick.
  * @param arg      User-defined context passed back to the callback.
  */
-void vfast_io_set_timer(vfast_io_t *io, uint32_t ms, on_timer_cb cb, void *arg);
+void vf_io_set_timer(vf_io_t *io, uint32_t ms, on_timer_cb cb, void *arg);
 
 /**
  * @brief Configures a callback for Path MTU Discovery (PMTUD) events.
@@ -176,10 +176,10 @@ void vfast_io_set_timer(vfast_io_t *io, uint32_t ms, on_timer_cb cb, void *arg);
  * This allows the I/O engine to notify the business logic layer of changes in 
  * the effective MTU, enabling dynamic adjustments to packet sizes or triggering
  * session renegotiation as needed.
- * @param io   Pointer to the initialized vfast_io_t context.
+ * @param io   Pointer to the initialized vf_io_t context.
  * @param cb   The callback function to execute when a PMTUD event is detected.
  * @param arg  User-defined context passed back to the callback.
  */
-void vfast_io_set_pmtud_callback(vfast_io_t *io, on_pmtud_cb cb, void *arg);
+void vf_io_set_pmtud_callback(vf_io_t *io, on_pmtud_cb cb, void *arg);
 
 #endif /* VFAST_CORE_H */

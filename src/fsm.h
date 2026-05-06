@@ -9,7 +9,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <netinet/in.h> // Required for sockaddr_in
-#include "io.h"         // Required for vfast_io_t
+#include "io.h"         // Required for vf_io_t
 #include "key.h"        // Required for vfast_sec_ctx_t
 
 typedef enum {
@@ -32,7 +32,7 @@ typedef struct {
     char            server_ip[64];
     uint16_t        server_port;
     struct sockaddr_in dst_addr;   /* Pre-calculated server address */
-    vfast_io_t     *io;            /* Unified IO Engine */
+    vf_io_t     *io;            /* Unified IO Engine */
     atomic_bool    *running;
     const uint8_t  *key;          /* Pointer to the session key (set after auth) */
     vfast_sec_ctx_t *sec;         /* Pointer to the security context */
@@ -43,8 +43,8 @@ typedef struct {
     uint64_t        server_ts;
 } vfast_fsm_t;
 
-/* Signature updated to accept vfast_io_t */
-int vf_fsm_init(vfast_fsm_t *fsm, vfast_io_t *io, const char *username, const char *pwd, 
+/* Signature updated to accept vf_io_t */
+int vf_fsm_init(vfast_fsm_t *fsm, vf_io_t *io, const char *username, const char *pwd, 
     const char *sip, uint16_t sport, atomic_bool *running, const uint8_t *key);
 void vf_fsm_update(vfast_fsm_t *fsm);
 int vf_fsm_is_connected(vfast_fsm_t *fsm);

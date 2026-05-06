@@ -60,7 +60,7 @@
 #define VPN_VERSION             1
 #define VPN_HDR_FLAG_PADDING    0x01
 #define VF_MAGIC                0x5646 /* "VF" in Little-Endian */
-#define VF_RTT_THRESHOLD_MS     200
+#define VF_RTT_THRESHOLD_MS     1000ULL
 #define VF_DEFAULT_CAPS         0x0001
 
 typedef enum {

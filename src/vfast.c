@@ -146,7 +146,7 @@ cleanup_fail:
  * @param io  Pointer to the VFast I/O engine.
  * @param ipp Pointer to the IP address pool.
  */
-void vfast_server_maintenance(vfast_io_t *io, void *data) {
+void vfast_server_maintenance(vf_io_t *io, void *data) {
     if (unlikely(!io || !data)) return;
 
     vpn_ip_pool_t *ipp = (vpn_ip_pool_t *)data;
@@ -180,7 +180,7 @@ void vfast_server_maintenance(vfast_io_t *io, void *data) {
             vf_ip_pool_free(ipp, node->virtual_ip);
         } else {
             /* Strategy B: Active Probing (Keep-alive) */
-            vfast_task_t *task = vfast_borrow_task(io);
+            vf_task_t *task = vf_io_task(io);
             if (unlikely(!task)) {
                 /* System backpressure: Skip probe if task pool is saturated */
                 continue; 
@@ -207,7 +207,7 @@ void vfast_server_maintenance(vfast_io_t *io, void *data) {
 
             if (likely(tlen > 0)) {
                 /* 4. Asynchronous Dispatch via io_uring */
-                vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, task->buf, 
+                vf_io_write(io, io->udp_fd, OP_UDP_SEND, task->buf, 
                                    tlen, &node->remote_addr);
                 
                 log_debug("DPD: Sent masked probe to SID[0x%08x]", node->session_id);
@@ -219,7 +219,7 @@ void vfast_server_maintenance(vfast_io_t *io, void *data) {
 void vfast_path_mtu_updated(uint32_t new_mtu, void *arg) {
     if (!!arg) return;
 
-    vfast_io_t *io = (vfast_io_t *)arg;
+    vf_io_t *io = (vf_io_t *)arg;
 
     if (vf_tun_set_mtu_by_fd(io->tun_fd, new_mtu) != 0) {
         log_error("Failed to update TUN MTU to %u: %s", new_mtu, strerror(errno));

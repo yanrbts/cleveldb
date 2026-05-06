@@ -72,7 +72,7 @@
 
 struct vfast_server {
     vpn_option_t    opt;
-    vfast_io_t      io;
+    vf_io_t      io;
     udp_conn_t     *udp;       /* UDP transport handle */
     vpn_tun_ctx_t   tun;       /* Virtual network interface */
     vpn_ip_pool_t   ip_pool;   /* IP address management */
@@ -125,7 +125,7 @@ static inline void vfast_generate_cookie(uint8_t *out,
  * @brief Handles HELLO requests using the stateless 32-byte payload.
  * Optimized for: Zero-copy, Anti-DoS (Stateless), and 8-byte alignment.
  */
-static bool vfast_handle_hello(vfast_io_t *io, uint8_t *payload, int plen, struct sockaddr_in *src) {
+static bool vfast_handle_hello(vf_io_t *io, uint8_t *payload, int plen, struct sockaddr_in *src) {
     if (unlikely(plen < (int)sizeof(vf_payload_hello_req_t))) {
         log_warn("Ingress: Malformed HELLO from %s", inet_ntoa(src->sin_addr));
         return false;
@@ -155,7 +155,7 @@ static bool vfast_handle_hello(vfast_io_t *io, uint8_t *payload, int plen, struc
     }
     log_debug("HELLO_ACK sent to %s (Cookie generated)", inet_ntoa(src->sin_addr));
 
-    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, base_buf, tlen, src);
+    vf_io_write(io, io->udp_fd, OP_UDP_SEND, base_buf, tlen, src);
     io_uring_submit(&io->ring);
 
     return true;
@@ -165,7 +165,7 @@ static bool vfast_handle_hello(vfast_io_t *io, uint8_t *payload, int plen, struc
  * @brief Handles AUTH requests from clients (VF_MSG_AUTH_REQ).
  * Performs Cookie validation, IPAM allocation, and Session initialization.
  */
-static bool vfast_handle_auth(vfast_io_t *io, uint8_t *payload, int plen, struct sockaddr_in *src) {
+static bool vfast_handle_auth(vf_io_t *io, uint8_t *payload, int plen, struct sockaddr_in *src) {
     /* 1. Preliminary length check (Assuming vf_payload_auth_req_t contains the cookie) */
     if (unlikely(plen < (int)sizeof(vf_payload_auth_req_t))) {
         log_warn("Ingress: Malformed AUTH_REQ from %s", inet_ntoa(src->sin_addr));
@@ -267,7 +267,7 @@ static bool vfast_handle_auth(vfast_io_t *io, uint8_t *payload, int plen, struct
     log_info("Auth Success | VIP: %s | SID: 0x%08x | To: %s", 
              ip_str, sid, inet_ntoa(src->sin_addr));
 
-    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, base_buf, tlen, src);
+    vf_io_write(io, io->udp_fd, OP_UDP_SEND, base_buf, tlen, src);
     io_uring_submit(&io->ring);
 
     return true;
@@ -281,7 +281,7 @@ err:
  * @brief Responds to client's Keepalive/DPD request (Echo Service).
  * This function performs an in-place modification of the payload to save memory cycles.
  */
-static bool vfast_handle_echo(vfast_io_t *io, vpn_session_t *s, uint32_t sid, uint8_t *payload, int plen, struct sockaddr_in *src) {
+static bool vfast_handle_echo(vf_io_t *io, vpn_session_t *s, uint32_t sid, uint8_t *payload, int plen, struct sockaddr_in *src) {
     /* 1. Validation */
     if (unlikely(!payload || plen < (int)sizeof(vf_payload_echo_t))) {
         return false;
@@ -334,7 +334,7 @@ static bool vfast_handle_echo(vfast_io_t *io, vpn_session_t *s, uint32_t sid, ui
     if (unlikely(tlen < 0)) return false;
 
     /* 5. Asynchronous Write via io_uring */
-    vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, base_buf, tlen, src);
+    vf_io_write(io, io->udp_fd, OP_UDP_SEND, base_buf, tlen, src);
     
     /* Optional: Batch submits are usually handled in the main loop, 
      * but we can force it for latency-sensitive heartbeats. */
@@ -348,11 +348,11 @@ static bool vfast_handle_echo(vfast_io_t *io, vpn_session_t *s, uint32_t sid, ui
  * * This internal helper handles the decryption, validation, and submission 
  * to the virtual network device.
  */
-static inline void vfast_handle_data(vfast_io_t *io, vpn_session_t *s, uint8_t *payload, int plen, struct sockaddr_in *src) {
+static inline void vfast_handle_data(vf_io_t *io, vpn_session_t *s, uint8_t *payload, int plen, struct sockaddr_in *src) {
     UNUSED(s);
     UNUSED(src);
 
-    vfast_submit_write(io, io->tun_fd, OP_TUN_WRITE, payload, plen, NULL);
+    vf_io_write(io, io->tun_fd, OP_TUN_WRITE, payload, plen, NULL);
 }
 
 /**
@@ -360,7 +360,7 @@ static inline void vfast_handle_data(vfast_io_t *io, vpn_session_t *s, uint8_t *
  * @param payload Decrypted/Unpadded payload from vf_unpack.
  * @param plen    Length of the decrypted payload.
  */
-static inline void vfast_handle_rekey_req(vfast_io_t *io, vpn_session_t *s, 
+static inline void vfast_handle_rekey_req(vf_io_t *io, vpn_session_t *s, 
                                           uint8_t *payload, int plen, struct sockaddr_in *src) {
     /* 1. Validation: Payload should contain [KeyID (4B)][Raw Key (32B)] */
     const int req_size = 4 + REKEY_KEY_SIZE;
@@ -397,7 +397,7 @@ static inline void vfast_handle_rekey_req(vfast_io_t *io, vpn_session_t *s,
     int flen = vf_pack(&s->sec_ctx, base_buf, 4, BUF_SIZE, VPN_MSG_REKEY_ACK, s->session_id);
 
     if (likely(flen > 0)) {
-        vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, base_buf, flen, src);
+        vf_io_write(io, io->udp_fd, OP_UDP_SEND, base_buf, flen, src);
     }
 
     /**
@@ -431,7 +431,7 @@ static inline void vfast_handle_rekey_ack(vpn_session_t *s) {
  * Decapsulates the VPN header, decrypts the payload, and writes the 
  * resulting plain IP packet to the TUN device.
  */
-static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
+static int server_on_udp(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
      UNUSED(arg);
      /* 1. Basic Validation: Ensure packet is large enough to contain header */
     if (unlikely(len < (int)sizeof(vf_hdr_t))) {
@@ -513,7 +513,7 @@ static int server_on_udp(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
  * memcpy, we back-calculate the buffer head and pack the VPN encapsulation 
  * directly in-place.
  */
-static int server_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
+static int server_on_tun(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
     UNUSED(src);
     UNUSED(arg);
 
@@ -563,9 +563,9 @@ static int server_on_tun(vfast_io_t *io, uint8_t *data, int len, struct sockaddr
          * 6. Asynchronous UDP Transmission.
          * We submit the original task buffer, which now contains [Header + Encrypted Payload].
          * CRITICAL: The task's 'in_use' flag must NOT be cleared until the 
-         * OP_UDP_SEND completion is reaped in vfast_io_run.
+         * OP_UDP_SEND completion is reaped in vf_io_run.
          */
-        vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, task_buf_base, total_len, &s->remote_addr);
+        vf_io_write(io, io->udp_fd, OP_UDP_SEND, task_buf_base, total_len, &s->remote_addr);
         
         atomic_fetch_add(&vfserver.stats.tx_pkts, 1);
         cmd_reass_stats_add(0, 1, 0);
@@ -639,7 +639,7 @@ static int vfast_clean_server(void) {
     vf_ip_pool_destroy(&vfserver.ip_pool);
 
     /* 5. Cleanup io_uring */
-    vfast_io_exit(&vfserver.io);
+    vf_io_exit(&vfserver.io);
     cmd_server_stop(&vfserver.cmd_tid);
     vf_option_clean(&vfserver.opt);
 
@@ -648,7 +648,7 @@ static int vfast_clean_server(void) {
 }
 
 static int vfast_init_server(void) {
-    memset(&vfserver.io, 0, sizeof(vfast_io_t));
+    memset(&vfserver.io, 0, sizeof(vf_io_t));
     atomic_store(&vfserver.io.running, true);
 
     if(!vf_user_init()) {
@@ -698,7 +698,7 @@ static int vfast_init_server(void) {
         .on_tun_data = server_on_tun,
         .ctx = NULL
     };
-    vfast_io_init(
+    vf_io_init(
         &vfserver.io, 
         vfserver.udp->fd, 
         vfserver.tun.fd, 
@@ -707,8 +707,8 @@ static int vfast_init_server(void) {
         ops
     );
 
-    vfast_io_set_timer(&vfserver.io, 5000, vfast_server_maintenance, &vfserver.ip_pool);
-    vfast_io_set_pmtud_callback(&vfserver.io, vfast_path_mtu_updated, &vfserver.io);
+    vf_io_set_timer(&vfserver.io, 5000, vfast_server_maintenance, &vfserver.ip_pool);
+    vf_io_set_pmtud_callback(&vfserver.io, vfast_path_mtu_updated, &vfserver.io);
 
     vfserver.cmd_tid = cmd_start_core();
 
@@ -786,7 +786,7 @@ int main(int argc, char *argv[]) {
 
     log_info("VFAST server is up and running on port %d. Press Ctrl+C to stop.", vfserver.opt.local_port);
 
-    vfast_io_run(&vfserver.io);
+    vf_io_run(&vfserver.io);
 
     vfast_clean_server();
     return 0;
