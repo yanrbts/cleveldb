@@ -153,7 +153,7 @@ static bool vfast_handle_hello(vfast_io_t *io, uint8_t *payload, int plen, struc
         log_error("FSM: Failed to pack HELLO_ACK for %s", inet_ntoa(src->sin_addr));
         return false;
     }
-    log_debug("FSM: HELLO_ACK sent to %s (Cookie generated)", inet_ntoa(src->sin_addr));
+    log_debug("HELLO_ACK sent to %s (Cookie generated)", inet_ntoa(src->sin_addr));
 
     vfast_submit_write(io, io->udp_fd, OP_UDP_SEND, base_buf, tlen, src);
     io_uring_submit(&io->ring);
@@ -201,14 +201,6 @@ static bool vfast_handle_auth(vfast_io_t *io, uint8_t *payload, int plen, struct
         return false;
     }
 
-    /* 4. Credentials Validation */
-    uint8_t token[VF_TOKEN_LEN] = {0};
-    if (unlikely(vf_user_login(req->username, req->password, token) != 0)) {
-        log_warn("Auth Failed: User '%.32s' from %s", req->username, inet_ntoa(src->sin_addr));
-        /* TODO: Optional send AUTH_ERR to client */
-        return false;
-    }
-
     /* 3. IPAM: Allocate Virtual IP from the global address pool */
     uint32_t vip = vf_ip_pool_alloc(&vfserver.ip_pool);
     if (unlikely(vip == 0)) {
@@ -216,6 +208,13 @@ static bool vfast_handle_auth(vfast_io_t *io, uint8_t *payload, int plen, struct
         goto err;
     }
 
+    /* 4. Credentials Validation */
+    uint8_t token[VF_TOKEN_LEN] = {0};
+    if (unlikely(vf_user_login(vip, req->username, req->password, token) != 0)) {
+        log_warn("Auth Failed: User '%.32s' from %s", req->username, inet_ntoa(src->sin_addr));
+        /* TODO: Optional send AUTH_ERR to client */
+        return false;
+    }
     /* 4. Session Management: Generate SID and link VIP to physical address */
     uint32_t sid = vf_ss_generate_sid(vip);
     vf_ss_update(vip, sid, src);

@@ -154,7 +154,7 @@ static inline int client_handle_auth(vfast_io_t *io, uint32_t sid, uint8_t *payl
 
     /* 2. Boundary Validation */
     if (unlikely(!payload || plen < (int)sizeof(vf_payload_auth_resp_t))) {
-        log_error("Ingress: HELLO_ACK payload undersized (len: %d)", plen);
+        log_error("Ingress: AUTH_ACK payload undersized (len: %d)", plen);
         return -1;
     }
 

@@ -108,7 +108,10 @@ uint8_t* vf_unpack(const vfast_sec_ctx_t *sec, uint8_t *buf, int res, int *out_p
     /**
      * 2. Decryption Branching: Matches the logic in vf_pack.
      */
-    if (hdr->msg_type == VPN_MSG_HELLO || hdr->msg_type == VPN_MSG_KEEPALIVE) {
+    if (hdr->msg_type == VPN_MSG_HELLO 
+        || hdr->msg_type == VPN_MSG_KEEPALIVE 
+        || hdr->msg_type == VPN_MSG_AUTH_REQ
+        || hdr->msg_type == VPN_MSG_AUTH_ACK) {
         dlen = rlen;
     } else {
         if (unlikely(!sec)) return NULL;

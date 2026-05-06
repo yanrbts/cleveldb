@@ -42,7 +42,6 @@ typedef struct {
 /* Global Manager Singleton */
 static struct {
     int urandom_fd;
-    vf_db_node_t    *db_cache;     /* Lazy-loaded user credentials */
     vf_token_node_t *token_cache;  /* Active sessions */
     pthread_rwlock_t lock;
     vf_user_fetch_cb fetch_cb;     /* Customer-defined data source */
@@ -50,74 +49,99 @@ static struct {
 
 static rc_handle *g_rh = NULL;
 
-/* Internal IP Allocator (Placeholder for actual IP pool module) */
-static uint32_t _internal_ip_alloc(void) {
-    static uint32_t dyn_pool = 0x0A08000A; // Starts at 10.8.0.10
-    return dyn_pool++;
-}
+// static vf_db_node_t* vf_sync_user(const char *username) {
+//     if (!g_user_mgr.fetch_cb) return NULL;
 
-static vf_db_node_t* vf_sync_user(const char *username) {
-    if (!g_user_mgr.fetch_cb) return NULL;
-
-    vf_user_auth_t ext_auth;
-    if (g_user_mgr.fetch_cb(username, &ext_auth)) {
-        vf_db_node_t *node = (vf_db_node_t *)zcalloc(sizeof(vf_db_node_t));
-        if (node) {
-            node->auth = ext_auth; // Structural copy
-            HASH_ADD(hh, g_user_mgr.db_cache, auth.base.name, 
-                     strlen(node->auth.base.name), node);
-            return node;
-        }
-    }
-    return NULL;
-}
+//     vf_user_auth_t ext_auth;
+//     if (g_user_mgr.fetch_cb(username, &ext_auth)) {
+//         vf_db_node_t *node = (vf_db_node_t *)zcalloc(sizeof(vf_db_node_t));
+//         if (node) {
+//             node->auth = ext_auth; // Structural copy
+//             HASH_ADD(hh, g_user_mgr.db_cache, auth.base.name, 
+//                      strlen(node->auth.base.name), node);
+//             return node;
+//         }
+//     }
+//     return NULL;
+// }
 
 /**
- * Internal RADIUS Authentication Logic
+ * @brief Authenticates a user against the RADIUS server.
+ * * This function constructs a RADIUS Access-Request packet. 
+ * Includes Message-Authenticator (Attribute 80) to support modern 
+ * FreeRADIUS security requirements (mitigating BLAST RADIUS).
+ *
+ * @param user The username string.
+ * @param pass The password string.
+ * @return int VF_OK on success, or specific VF_ERR code on failure.
  */
 static int vf_radius_authenticate(const char *user, const char *pass) {
-    if (unlikely(!g_rh)) return VF_ERR_CONFIG;
+    /* 1. Basic sanity check for the RADIUS handle */
+    if (unlikely(!g_rh)) {
+        return VF_ERR_CONFIG;
+    }
 
-    uint32_t service = PW_AUTHENTICATE_ONLY;
-    VALUE_PAIR *send = NULL;
+    /* Correct structure type for radcli is VALUE_PAIR */
+    VALUE_PAIR *send = NULL, *received = NULL;
     int ret = VF_ERR_GENERIC;
+    uint32_t service = 1;  /* Standard Service-Type: Login-User (1) */
+    
+    /* 2. Build the Attribute-Value Pair (AVP) list */
 
-    if (rc_avpair_add(g_rh, &send, PW_USER_NAME, (void*)user, -1, 0) == NULL)
+    /* Add User-Name (Attribute 1) */
+    if (rc_avpair_add(g_rh, &send, PW_USER_NAME, (void*)user, -1, 0) == NULL) {
         return VF_ERR_SYSTEM;
+    }
 
+    /* Add User-Password (Attribute 2) */
     if (rc_avpair_add(g_rh, &send, PW_USER_PASSWORD, (void*)pass, -1, 0) == NULL) {
         rc_avpair_free(send);
         return VF_ERR_SYSTEM;
     }
 
+    /* Add Service-Type (Attribute 6) - Pass address of the integer */
     if (rc_avpair_add(g_rh, &send, PW_SERVICE_TYPE, &service, -1, 0) == NULL) {
         rc_avpair_free(send);
         return VF_ERR_SYSTEM;
     }
 
+    /* 4. Perform the RADIUS Authentication
+     * The second argument '0' is the NAS-Port. 
+     * 'msg' will capture any Reply-Message from the server.
+     */
     char msg[PW_MAX_MSG_SIZE] = {0};
-    int result = rc_auth(g_rh, 0, send, NULL, msg);
-    rc_avpair_free(send);
+    int result = rc_auth(g_rh, 0, send, &received, msg);
+    
+    /* Clean up the allocated AVP list */
+    if (send) rc_avpair_free(send);
+    if (received) rc_avpair_free(received);
 
+    /* 5. Process RADIUS return codes */
     switch (result) {
-        case OK_RC:
-            ret = VF_OK;
-            break;
-        case BADRESP_RC:
-        case REJECT_RC:
-            log_warn("RADIUS: Access-Reject for user '%s' (%s)", user, msg);
-            ret = VF_ERR_AUTH_DENIED;
-            break;
-        case TIMEOUT_RC:
-            log_error("RADIUS: Server timeout for user '%s'", user);
-            ret = VF_ERR_AUTH_TIMEOUT;
-            break;
-        default:
-            log_error("RADIUS: Unexpected error %d for user '%s'", result, user);
-            ret = VF_ERR_GENERIC;
-            break;
+    case OK_RC:
+        /* Access-Accept received */
+        ret = VF_OK;
+        log_info("RADIUS: User '%s' %s", user, msg[0] ? msg : "Authenticated");
+        break;
+    case BADRESP_RC:
+    case REJECT_RC:
+        /* Access-Reject received or invalid packet signature */
+        log_warn("RADIUS: Auth rejected for user '%s': %s", 
+                    user, msg[0] ? msg : "No reason");
+        ret = VF_ERR_AUTH_DENIED;
+        break;
+    case TIMEOUT_RC:
+        /* No response. Common causes: Wrong Secret, IP not in clients.conf */
+        log_error("RADIUS: Timeout for user '%s'. Check connectivity/secret.", user);
+        ret = VF_ERR_AUTH_TIMEOUT;
+        break;
+    default:
+        log_error("RADIUS: Unexpected error %d for user '%s'", result, user);
+        ret = VF_ERR_GENERIC;
+        break;
     }
-    return ret;
+
+    return ret; 
 }
 
 /**
@@ -165,34 +189,11 @@ bool vf_user_init(void) {
     return true;
 }
 
-int vf_user_login(const char *user, const char *pass, uint8_t tk_out[VF_TOKEN_LEN]) {
+int vf_user_login(uint32_t vip, const char *user, const char *pass, uint8_t tk_out[VF_TOKEN_LEN]) {
     if (unlikely(!user || !pass || !tk_out)) return -3;
 
     /* Step 1: RADIUS Authentication (Primary) */
     if (vf_radius_authenticate(user, pass) != 0) {
-        return -2;
-    }
-
-    vf_db_node_t *u = NULL;
-    pthread_rwlock_rdlock(&g_user_mgr.lock);
-    HASH_FIND_STR(g_user_mgr.db_cache, user, u);
-    pthread_rwlock_unlock(&g_user_mgr.lock);
-
-    if (!u) {
-        pthread_rwlock_wrlock(&g_user_mgr.lock);
-        HASH_FIND_STR(g_user_mgr.db_cache, user, u); /* Double check */
-        if (!u) u = vf_sync_user(user);
-        pthread_rwlock_unlock(&g_user_mgr.lock);
-    }
-
-    if (unlikely(!u)) {
-        log_error("Login failed: User '%s' not found.", user);
-        return -1;
-    }
-
-    /* Step 2: Credential Verification */
-    if (strcmp(pass, u->auth.pass_hash) != 0) {
-        log_error("Login failed: Password mismatch for user '%s'.", user);
         return -2;
     }
 
@@ -205,17 +206,17 @@ int vf_user_login(const char *user, const char *pass, uint8_t tk_out[VF_TOKEN_LE
 
     memcpy(session->token, tk_out, VF_TOKEN_LEN);
     /* Resolve VIP Logic: Static from DB takes priority over Pool */
-    session->identity.base = u->auth.base;
-    session->identity.vip  = (u->auth.static_vip != 0) ? 
-                             u->auth.static_vip : _internal_ip_alloc();
-    
+    strncpy(session->identity.base.name, user, sizeof(session->identity.base.name) - 1);
+    session->identity.base.name[sizeof(session->identity.base.name) - 1] = '\0';
+    session->identity.base.role = VF_ROLE_USER; // Default role; can be extended to
+
+    session->identity.vip  = vip;
     session->expire = time(NULL) + VF_USER_TOKEN_INTER;
 
     pthread_rwlock_wrlock(&g_user_mgr.lock);
     HASH_ADD(hh, g_user_mgr.token_cache, token, VF_TOKEN_LEN, session);
     pthread_rwlock_unlock(&g_user_mgr.lock);
 
-    log_info("User '%s' authenticated. VIP: %u", user, session->identity.vip);
     return 0;
 }
 
@@ -295,11 +296,11 @@ void vf_user_uninit(void) {
     }
 
     /* Flush DB Cache */
-    vf_db_node_t *u, *u_tmp;
-    HASH_ITER(hh, g_user_mgr.db_cache, u, u_tmp) {
-        HASH_DEL(g_user_mgr.db_cache, u);
-        free(u);
-    }
+    // vf_db_node_t *u, *u_tmp;
+    // HASH_ITER(hh, g_user_mgr.db_cache, u, u_tmp) {
+    //     HASH_DEL(g_user_mgr.db_cache, u);
+    //     free(u);
+    // }
 
     pthread_rwlock_unlock(&g_user_mgr.lock);
     pthread_rwlock_destroy(&g_user_mgr.lock);
