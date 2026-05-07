@@ -94,7 +94,7 @@ static void vfast_cleanup() {
 static inline int client_handle_data(vf_io_t *io, uint8_t *payload, int plen) {
     /* Silently drop data packets if the FSM is not in CONNECTED state */
     if (unlikely(!vf_fsm_is_connected(&vfclient.fsm))) {
-        return 0; 
+        return -1; 
     }
     /* Forward decrypted IP packet to TUN device via asynchronous io_uring write */
     vf_io_write(io, io->tun_fd, OP_TUN_WRITE, payload, plen, NULL);
@@ -287,8 +287,8 @@ void vfast_handle_new_key(void) {
  * @param data Pointer to the received packet buffer (task->buf).
  * @param src  The remote address to reply to.
  */
-static inline void client_handle_dpd(vf_io_t *io, uint8_t *data, struct sockaddr_in *src) {
-    if (unlikely(!io || !data || !src)) return;
+static inline bool client_handle_dpd(vf_io_t *io, uint8_t *data, struct sockaddr_in *src) {
+    if (unlikely(!io || !data || !src)) return false;
 
     /* 1. Use the macro to find the original task context */
     vf_task_t *task = vfast_data_to_task(data);
@@ -312,7 +312,7 @@ static inline void client_handle_dpd(vf_io_t *io, uint8_t *data, struct sockaddr
 
     if (unlikely(tlen <= 0)) {
         log_error("DPD: Failed to pack DPD response for SID 0x%08x", sid);
-        return;
+        return false;
     }
 
     /**
@@ -322,6 +322,8 @@ static inline void client_handle_dpd(vf_io_t *io, uint8_t *data, struct sockaddr
     vf_io_write(io, io->udp_fd, OP_UDP_SEND, task->buf, tlen, src);
 
     log_debug("DPD: Sent masked DPD response (len: %d) to server", tlen);
+
+    return true;
 }
 
 /**
@@ -338,17 +340,18 @@ static inline void client_handle_dpd(vf_io_t *io, uint8_t *data, struct sockaddr
  * @param src  Source address (Server).
  * @return 0 on success, -1 on protocol/validation error.
  */
-int client_on_udp(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
+static vf_task_state_t client_on_udp(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
     UNUSED(arg);
 
     uint32_t sid = 0;
     int plen = 0;
     uint8_t *payload = NULL;
+    bool isuse = false;
 
     /* 1. Preliminary Boundary Check */
     if (unlikely(len < (int)VPN_TNL_HLEN)) {
         log_warn("Ingress: Packet dropped (too short: %d bytes)", len);
-        return -1;
+        return IO_TASK_DONE;
     }
 
     /* 2. PHASE 1: Mandatory De-obfuscation (Peel the shell)
@@ -378,26 +381,30 @@ int client_on_udp(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, 
 
     switch (hdr->msg_type) {
     case VPN_MSG_DATA:
-        return client_handle_data(io, payload, plen);
+        client_handle_data(io, payload, plen);
+        break;
     case VPN_MSG_HELLO:
-        return client_handle_hello(io, sid, payload, plen);
+        client_handle_hello(io, sid, payload, plen);
+        break;
     case VPN_MSG_KEEPALIVE:
-        return client_handle_keepalive(io, sid, payload, plen);
+        client_handle_keepalive(io, sid, payload, plen);
+        break;
     case VPN_DPD_REQUEST:
         log_info("Received DPD Request from server. Responding with DPD Response.");
-        client_handle_dpd(io, data, src);
+        isuse = client_handle_dpd(io, data, src);
         break;
     case VPN_MSG_REKEY_ACK:
         vfast_handle_new_key();
         break;
     case VPN_MSG_AUTH_ACK:
-        return client_handle_auth(io, sid, payload, plen);
+        client_handle_auth(io, sid, payload, plen);
+        break;
     default:
         log_warn("Ingress: Unknown message type [0x%02x] received.", hdr->msg_type);
         break;
     }
 
-    return 0;
+    return isuse ? IO_TASK_USE : IO_TASK_DONE;
 }
 
 /**
@@ -408,15 +415,15 @@ int client_on_udp(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, 
  * @param len   The length of the plain IP packet.
  * @param src   The source address of the packet.
  * @param arg   User-defined argument.
- * @return 0 on success, -1 on failure.
+ * @return IO_TASK_USE if the packet was processed and sent, IO_TASK_DONE if it was dropped (e.g. not connected).
  */
-int client_on_tun(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
+static vf_task_state_t client_on_tun(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
     UNUSED(src);
     UNUSED(arg);
     
     /* 1. Connection Check: Drop packets if not authenticated */
     if (unlikely(!vf_fsm_is_connected(&vfclient.fsm))) {
-        return 0;
+        return IO_TASK_DONE;
     }
     /* Get the active context instantly via atomic pointer */
     vfast_sec_ctx_t *ctx = atomic_load(&vfclient.active_ptr);
@@ -429,8 +436,6 @@ int client_on_tun(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, 
      * Since 'data' starts at (task->buf + VPN_TNL_HLEN), we pass (data - VPN_TNL_HLEN).
      */
     uint8_t *vfast_packet_base = data - VPN_TNL_HLEN;
-
-    // int payload_len = vf_apply_padding(vfast_packet_base, len, 32);
     
     /* We use BUF_SIZE to prevent overflows during encryption (+40 bytes) */
     int total_len = vf_pack(ctx, 
@@ -442,24 +447,18 @@ int client_on_tun(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, 
 
     if (unlikely(total_len < 0)) {
         log_error("Failed to pack TUN packet for SID: 0x%08x", vfclient.fsm.sid);
-        return -1;
+        return IO_TASK_DONE;
     }
-
-    /* 2. Get next sequence from our global client context */
-    // uint32_t seq = vf_get_next_sequence(&vfclient.fsm.next_seq);
-    /* 3. HEADER OBFS (Post-encryption) */
-    /* This makes the Header look like random noise */
-    // vf_apply_header_obfs(vfast_packet_base, total_len);
 
     /* 3. Submit Asynchronous UDP Send via io_uring */
     vf_io_write(io, 
-                       io->udp_fd, 
-                       OP_UDP_SEND, 
-                       vfast_packet_base, 
-                       total_len, 
-                       &vfclient.fsm.dst_addr);
+                io->udp_fd, 
+                OP_UDP_SEND, 
+                vfast_packet_base, 
+                total_len, 
+                &vfclient.fsm.dst_addr);
 
-    return 0;
+    return IO_TASK_USE;
 }
 
 static int vfast_init_secctx() {
@@ -591,7 +590,7 @@ static int vfast_init_client() {
     }
     udp_set_connect(vfclient.udp, inet_addr(vfclient.opt.remote_host), vfclient.opt.remote_port);
 
-    vfast_ops_t ops = {
+    vf_ops_t ops = {
         .on_udp_data = client_on_udp,
         .on_tun_data = client_on_tun,
         .ctx = NULL

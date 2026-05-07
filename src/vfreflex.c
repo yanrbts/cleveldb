@@ -15,7 +15,7 @@
 
 /* Sub-command dictionaries for deeper completion */
 static const char *set_subs[] = {"interval", "logpkt", "debug", NULL};
-static const char *get_subs[] = {"config", "pktstats", "session", "show", NULL};
+static const char *get_subs[] = {"config", "pktstats", "session", "show", "tasks", NULL};
 static const char *help_subs[] = {"SET", "GET", NULL};
 
 /* Professional UI Data Structure with Sub-command Support */

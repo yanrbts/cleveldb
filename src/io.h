@@ -40,11 +40,16 @@ enum {
     OP_UDP_SEND  = 4                /**< Async sendmsg to UDP socket */
 };
 
+typedef enum {
+    IO_TASK_DONE = 0,             /**< Task is free and can be allocated */
+    IO_TASK_USE  = 1              /**< Task is currently in use */
+} vf_task_state_t;
+
 /**
  * @brief Functional interface for business logic callbacks.
  * These are invoked upon successful completion of asynchronous read operations.
  */
-typedef int (*on_data_cb)(vf_io_t *io, uint8_t *buf, int len, struct sockaddr_in *addr, void *arg);
+typedef vf_task_state_t (*on_data_cb)(vf_io_t *io, uint8_t *buf, int len, struct sockaddr_in *addr, void *arg);
 typedef void (*on_timer_cb)(vf_io_t *io, void *arg);
 typedef void (*on_pmtud_cb)(uint32_t new_mtu, void *arg);
 
@@ -55,7 +60,7 @@ typedef struct {
     on_data_cb on_udp_data;        /**< Triggered on UDP RX completion */
     on_data_cb on_tun_data;        /**< Triggered on TUN/TAP read completion */
     void *ctx;                    /**< User-defined context passed to callbacks */
-} vfast_ops_t;
+} vf_ops_t;
 
 /**
  * @brief Per-operation context (Task) used for tracking async state.
@@ -80,7 +85,7 @@ struct vfast_io {
     struct io_uring     ring;           /**< The core io_uring structure */
     int                 udp_fd;         /**< Bound UDP socket file descriptor */
     int                 tun_fd;         /**< TUN/TAP device file descriptor */
-    vfast_ops_t         ops;            /**< Registered callback handlers */
+    vf_ops_t         ops;            /**< Registered callback handlers */
     struct sockaddr_in  remote_addr;    /**< Pre-calculated remote peer address */
     bool                is_server;      /**< Operation mode (Server vs Client) */
     atomic_bool         running;
@@ -103,7 +108,7 @@ struct vfast_io {
  * @brief Initializes the vfast_io context and io_uring subsystem.
  * @return 0 on success, negative error code on failure.
  */
-int vf_io_init(vf_io_t *io, int udp_fd, int tun_fd, int pool_size, int io_ring_depth, vfast_ops_t ops);
+int vf_io_init(vf_io_t *io, int udp_fd, int tun_fd, int pool_size, int io_ring_depth, vf_ops_t ops);
 
 /**
  * @brief Starts the infinite event loop (blocking).
@@ -118,7 +123,7 @@ void vf_io_exit(vf_io_t *io);
 /**
  * @brief Posts an asynchronous read or receive request to the Submission Queue (SQ).
  * Prepares a task from the pool and submits a read/recvmsg operation. The actual 
- * data processing occurs in the registered callbacks within @ref vfast_ops_t.
+ * data processing occurs in the registered callbacks within @ref vf_ops_t.
  *
  * @param io    Pointer to the initialized vf_io_t context.
  * @param fd    The raw file descriptor (UDP or TUN).

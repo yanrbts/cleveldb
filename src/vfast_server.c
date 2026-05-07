@@ -311,12 +311,6 @@ static bool vfast_handle_echo(vf_io_t *io, vpn_session_t *s, uint32_t sid, uint8
                  sid, inet_ntoa(src->sin_addr));
         return false;
     }
-
-    /* 3. Prepare Response (Reflection)
-     * We keep echo_id and timestamp exactly as they were.
-     * The client will use the timestamp to calculate the RTT.
-     */
-    // vf_payload_echo_t *echo = (vf_payload_echo_t *)payload;
     
     /* 4. Package and Dispatch 
      * We reuse the same base buffer (Zero-copy).
@@ -431,19 +425,20 @@ static inline void vfast_handle_rekey_ack(vpn_session_t *s) {
  * Decapsulates the VPN header, decrypts the payload, and writes the 
  * resulting plain IP packet to the TUN device.
  */
-static int server_on_udp(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
+static vf_task_state_t server_on_udp(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
      UNUSED(arg);
      /* 1. Basic Validation: Ensure packet is large enough to contain header */
     if (unlikely(len < (int)sizeof(vf_hdr_t))) {
         atomic_fetch_add(&vfserver.stats.drops, 1);
         cmd_reass_stats_add(0, 0, 1);
-        return -1;
+        return IO_TASK_DONE;
     }
 
     uint32_t sid = 0;
     int plen = 0;
     vpn_session_t *s = NULL;
     uint8_t *payload = NULL;
+    bool isuse = false;
 
     /* Handled manually at the entrance for total control. */
     vf_remove_header_obfs(data, (size_t)len);
@@ -461,11 +456,10 @@ static int server_on_udp(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in
 
     payload = vf_unpack(s ? &s->sec_ctx : NULL, data, len, &plen);
     if (unlikely(!payload)) {
-        log_warn("Ingress: Decryption failed or invalid packet from %s", 
-                 inet_ntoa(src->sin_addr));
+        log_warn("Ingress: Decryption failed or invalid packet from %s", inet_ntoa(src->sin_addr));
         atomic_fetch_add(&vfserver.stats.drops, 1);
         cmd_reass_stats_add(0, 0, 1);
-        return -1;
+        return IO_TASK_DONE;
     }
 
     if (s) atomic_fetch_add(&s->sec_ctx.active_key.bytes_processed, (long)len);
@@ -476,13 +470,13 @@ static int server_on_udp(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in
             vfast_handle_data(io, s, payload, plen, src);
             break;
         case VPN_MSG_HELLO:
-            vfast_handle_hello(io, payload, plen, src);
+            isuse = vfast_handle_hello(io, payload, plen, src);
             break;
         case VPN_MSG_AUTH_REQ:
-            vfast_handle_auth(io, payload, plen, src);
+            isuse = vfast_handle_auth(io, payload, plen, src);
             break;
         case VPN_MSG_KEEPALIVE:
-            vfast_handle_echo(io, s, sid, payload, plen, src);
+            isuse = vfast_handle_echo(io, s, sid, payload, plen, src);
             break;
         case VPN_DPD_RESPONSE:
             log_info("Received DPD Response from %s. Session is alive.", inet_ntoa(src->sin_addr));
@@ -503,7 +497,8 @@ static int server_on_udp(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in
 
     atomic_fetch_add(&vfserver.stats.rx_pkts, 1);
     cmd_reass_stats_add(1, 0, 0);
-    return 0;
+
+    return isuse ? IO_TASK_USE : IO_TASK_DONE;
 }
 
 /**
@@ -513,7 +508,7 @@ static int server_on_udp(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in
  * memcpy, we back-calculate the buffer head and pack the VPN encapsulation 
  * directly in-place.
  */
-static int server_on_tun(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
+static vf_task_state_t server_on_tun(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in *src, void *arg) {
     UNUSED(src);
     UNUSED(arg);
 
@@ -524,7 +519,7 @@ static int server_on_tun(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in
     if (unlikely(len < (int)sizeof(struct iphdr) || len > (int)(BUF_SIZE - sizeof(vf_hdr_t)))) {
         atomic_fetch_add(&vfserver.stats.drops, 1);
         cmd_reass_stats_add(0, 0, 1);
-        return -1;
+        return IO_TASK_DONE;
     }
 
     /**
@@ -543,7 +538,7 @@ static int server_on_tun(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in
     if (!vf_ss_lookup_by_ip(dest_vip, &s)) {
         atomic_fetch_add(&vfserver.stats.drops, 1);
         cmd_reass_stats_add(0, 0, 1);
-        return -1;
+        return IO_TASK_DONE;
     }
 
     /**
@@ -575,14 +570,14 @@ static int server_on_tun(vf_io_t *io, uint8_t *data, int len, struct sockaddr_in
          * Returning 1 informs the IO loop that this specific task has been 
          * chained to an outbound write operation and should not be recycled yet.
          */
-        return 0; 
+        return IO_TASK_USE; 
     } else {
         log_error("Egress: Packing failed for VIP 0x%08x", ntohl(dest_vip));
         atomic_fetch_add(&vfserver.stats.drops, 1);
         cmd_reass_stats_add(0, 0, 1);
     }
 
-    return -1;
+    return IO_TASK_DONE;
 }
 
 /**
@@ -693,7 +688,7 @@ static int vfast_init_server(void) {
     }
     vf_set_nonblocking(vfserver.udp->fd);
     
-    vfast_ops_t ops = {
+    vf_ops_t ops = {
         .on_udp_data = server_on_udp,
         .on_tun_data = server_on_tun,
         .ctx = NULL
@@ -789,5 +784,6 @@ int main(int argc, char *argv[]) {
     vf_io_run(&vfserver.io);
 
     vfast_clean_server();
+    
     return 0;
 }

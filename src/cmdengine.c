@@ -27,6 +27,15 @@ typedef struct cmd_engine_s {
         atomic_uint_least64_t tx_pkts;   /* Reassembly attempts that timed out */
         atomic_uint_least64_t drops;     /* Reassembly errors (e.g., missing fragments) */
     } reass_stats;
+
+    struct {
+        atomic_int_fast16_t total;    /* Total number of pre-allocated task buffers */
+        atomic_int_fast16_t count;    /* Number of pre-allocated task buffers */
+        atomic_int_fast16_t r_tun;    /* Read number for tun tasks */
+        atomic_int_fast16_t r_udp;    /* Read number for UDP tasks */
+        atomic_int_fast16_t w_tun;    /* Write number for tun tasks */
+        atomic_int_fast16_t w_udp;    /* Write number for UDP tasks */
+    } task_pool;
 } cmd_engine_t;
 
 static cmd_engine_t cmdengine = {
@@ -37,6 +46,13 @@ static cmd_engine_t cmdengine = {
         .rx_pkts = ATOMIC_VAR_INIT(0),
         .tx_pkts = ATOMIC_VAR_INIT(0),
         .drops = ATOMIC_VAR_INIT(0)
+    },
+    .task_pool = {
+        .count = ATOMIC_VAR_INIT(0),
+        .r_tun = ATOMIC_VAR_INIT(0),
+        .r_udp = ATOMIC_VAR_INIT(0),
+        .w_tun = ATOMIC_VAR_INIT(0),
+        .w_udp = ATOMIC_VAR_INIT(0)
     }
 };
 
@@ -48,6 +64,7 @@ static int cmd_get_reass_stats(void *ctx, int argc, char **argv, cmd_resp_t *res
 static int cmd_get_config(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_get_sessions(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_get_session_bysid(void *ctx, int argc, char **argv, cmd_resp_t *resp);
+static int cmd_get_task_pool(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 
 static int cmd_handle_set(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_handle_get(void *ctx, int argc, char **argv, cmd_resp_t *resp);
@@ -69,6 +86,7 @@ static const cmd_entry_t cmd_table[] = {
     {"GET", "config",   "get configuration",               "",           2, cmd_get_config},
     {"GET", "session",  "get session number",              "",           2, cmd_get_sessions},
     {"GET", "show",     "show session information",        "<sid>",      3, cmd_get_session_bysid},
+    {"GET", "tasks",    "show task pool status",           "",           2, cmd_get_task_pool},
 
     {NULL, NULL, NULL, NULL, 0, NULL}
 };
@@ -645,6 +663,36 @@ static int cmd_handle_status(void *ctx, int argc, char **argv, cmd_resp_t *resp)
     return 0;
 }
 
+static int cmd_get_task_pool(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
+    (void)argv;
+
+    cmd_engine_t *engine = (cmd_engine_t *)ctx;
+    if (!engine || !resp) {
+        return -1;
+    }
+
+    if (argc != 2) {
+        cmd_resp_red(resp, "ERR: Unexpected arguments. Usage: GET tasks");
+        return -1;
+    }
+
+    int total = atomic_load(&engine->task_pool.total);
+    int count = atomic_load(&engine->task_pool.count);
+    int r_tun = atomic_load(&engine->task_pool.r_tun);
+    int r_udp = atomic_load(&engine->task_pool.r_udp);
+    int w_tun = atomic_load(&engine->task_pool.w_tun);
+    int w_udp = atomic_load(&engine->task_pool.w_udp);
+
+    cmd_resp_printf(resp, "\n  %s%-20s%s : %s%d%s\n", C_GREEN, "Total Tasks", C_RESET, C_YELLOW, total, C_RESET);
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%d%s\n", C_GREEN, "Active Tasks", C_RESET, C_YELLOW, count, C_RESET);
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%d%s\n", C_GREEN, "Read TUN", C_RESET, C_YELLOW, r_tun, C_RESET);
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%d%s\n", C_GREEN, "Read UDP", C_RESET, C_YELLOW, r_udp, C_RESET);
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%d%s\n", C_GREEN, "Write TUN", C_RESET, C_YELLOW, w_tun, C_RESET);
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%d%s\n", C_GREEN, "Write UDP", C_RESET, C_YELLOW, w_udp, C_RESET);
+
+    return 0;
+}
+
 /**
  * @brief Initializes the command table and launches the management server thread.
  * @return pthread_t The thread ID of the management server on success, 
@@ -686,4 +734,13 @@ void cmd_reass_stats_add(int rx_pkts, int tx_pkts, int drops) {
     if (rx_pkts) atomic_fetch_add(&cmdengine.reass_stats.rx_pkts, 1);
     if (tx_pkts) atomic_fetch_add(&cmdengine.reass_stats.tx_pkts, 1);
     if (drops) atomic_fetch_add(&cmdengine.reass_stats.drops, 1);
+}
+
+void cmd_task_pool_set(int total, int count, int r_tun, int r_udp, int w_tun, int w_udp) {
+    atomic_store(&cmdengine.task_pool.total, total);
+    atomic_store(&cmdengine.task_pool.count, count);
+    atomic_store(&cmdengine.task_pool.r_tun, r_tun);
+    atomic_store(&cmdengine.task_pool.r_udp, r_udp);
+    atomic_store(&cmdengine.task_pool.w_tun, w_tun);
+    atomic_store(&cmdengine.task_pool.w_udp, w_udp);
 }

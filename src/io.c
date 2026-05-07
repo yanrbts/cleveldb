@@ -25,6 +25,7 @@
 #include "log.h"
 #include "zmalloc.h"
 #include "io.h"
+#include "cmdengine.h"
 
 /**
  * @brief Thread-safe acquisition of an available task from the instance's private pool.
@@ -156,7 +157,7 @@ void vfast_check_icmp_errors(vf_io_t *io, int udp_fd) {
 /**
  * @brief Initializes the io_uring instance and registers fixed files.
  */
-int vf_io_init(vf_io_t *io, int udp_fd, int tun_fd, int pool_size, int io_ring_depth, vfast_ops_t ops) {
+int vf_io_init(vf_io_t *io, int udp_fd, int tun_fd, int pool_size, int io_ring_depth, vf_ops_t ops) {
     io->udp_fd = udp_fd;
     io->tun_fd = tun_fd;
     io->ops    = ops;
@@ -402,7 +403,7 @@ void vf_io_raw(vf_io_t *io, int fd, void *data, size_t len, struct sockaddr_in *
     io_uring_submit(&io->ring);
 }
 
-static inline void vfast_monitor_pool_status(vf_io_t *io) {
+static inline void vf_monitor_pool_status(vf_io_t *io) {
     int tun_read = 0, udp_recv = 0, tun_write = 0, udp_send = 0, unknown = 0;
     int pool_size = io->pool_size;
     vf_task_t *pool = io->task_pool;
@@ -418,10 +419,12 @@ static inline void vfast_monitor_pool_status(vf_io_t *io) {
             }
         }
     }
-    printf("\r[POOL] R_TUN:%d R_UDP:%d | W_TUN:%d W_UDP:%d | UNK:%d | TOTAL_BUSY:%d/%d",
-            tun_read, udp_recv, tun_write, udp_send, unknown, 
-            (tun_read+udp_recv+tun_write+udp_send+unknown), pool_size);
-    fflush(stdout);
+    int total_busy = tun_read + udp_recv + tun_write + udp_send + unknown;
+    cmd_task_pool_set(pool_size, total_busy, tun_read, udp_recv, tun_write, udp_send);
+    // printf("\r[POOL] R_TUN:%d R_UDP:%d | W_TUN:%d W_UDP:%d | UNK:%d | TOTAL_BUSY:%d/%d",
+    //         tun_read, udp_recv, tun_write, udp_send, unknown, 
+    //         (tun_read+udp_recv+tun_write+udp_send+unknown), pool_size);
+    // fflush(stdout);
 }
 
 /**
@@ -434,7 +437,7 @@ void vf_io_run(vf_io_t *io) {
 
     atomic_store(&io->running, true);
     uint64_t last_tick_ms = vf_now_ms();
-    // uint64_t last_stat_ms = 0;
+    uint64_t last_stat_ms = 0;
 
     /* Initial Pipeline Warm-up */
     for (int i = 0; i < 16; i++) {
@@ -489,19 +492,21 @@ void vf_io_run(vf_io_t *io) {
             if (!task) continue;
 
             int res = cqe->res;
+            vf_task_state_t st;
 
             if (res >= 0) {
                 switch (task->op) {
                     case OP_TUN_READ:
                         uint8_t *tun_data = task->buf + VPN_TNL_HLEN;
-                        io->ops.on_tun_data(io, tun_data, res, &task->addr, io->ops.ctx);
+                        st = io->ops.on_tun_data(io, tun_data, res, &task->addr, io->ops.ctx);
                         vf_io_read(io, io->tun_fd, OP_TUN_READ);
                         break;
                     case OP_UDP_RECV:
-                        io->ops.on_udp_data(io, task->buf, res, &task->addr, io->ops.ctx);
+                        st = io->ops.on_udp_data(io, task->buf, res, &task->addr, io->ops.ctx);
                         vf_io_read(io, io->udp_fd, OP_UDP_RECV);
                         break;
                     default: /* Write/Send completion */
+                        st = IO_TASK_DONE;
                         break;
                 }
             } else {
@@ -514,13 +519,14 @@ void vf_io_run(vf_io_t *io) {
                 if (task->op == OP_TUN_READ || task->op == OP_UDP_RECV) {
                     vf_io_read(io, (task->op == OP_TUN_READ) ? io->tun_fd : io->udp_fd, task->op);
                 }
+                st = IO_TASK_DONE;
             }
            /* RELEASE OWNERSHIP: 
             * We mark the task as not in use BEFORE invoking the callback.
             * This allows the business logic (ops) to immediately reuse this 
             * buffer or borrow a new one for outbound responses (Zero-Copy).
             */
-            atomic_store(&task->in_use, false);
+            if (st == IO_TASK_DONE) atomic_store(&task->in_use, false);
         }
 
         if (count > 0) {
@@ -528,10 +534,10 @@ void vf_io_run(vf_io_t *io) {
             io_uring_submit(&io->ring); /* Flush any pending SQEs from the threshold logic */
         }
 
-        // if (now - last_stat_ms >= 1000) {
-        //     vfast_monitor_pool_status(io); 
-        //     last_stat_ms = now;
-        // }
+        if (now - last_stat_ms >= 1000) {
+            vf_monitor_pool_status(io); 
+            last_stat_ms = now;
+        }
     }
 }
 
