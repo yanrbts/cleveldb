@@ -81,12 +81,7 @@ static void fsm_send_pkt(vfast_fsm_t *fsm, uint8_t type) {
             goto rollback;
     }
 
-    /* 3. Encapsulation */
-    /* Only KEEPALIVE uses the security context (sec). 
-     * HELLO and AUTH_REQ are sent before the session key is established. */
-    void *sec_ctx = (type == VPN_MSG_KEEPALIVE || type == VPN_MSG_HELLO) ? NULL : fsm->sec;
-
-    int total_len = vf_pack(sec_ctx, 
+    int total_len = vf_pack(NULL, 
                             task->buf, 
                             payload_len, 
                             BUF_SIZE, 
@@ -100,11 +95,11 @@ static void fsm_send_pkt(vfast_fsm_t *fsm, uint8_t type) {
 
     /* 4. Submission to io_uring */
     vf_io_write(fsm->io, 
-                        fsm->io->udp_fd, 
-                        OP_UDP_SEND, 
-                        task->buf, 
-                        total_len, 
-                        &fsm->dst_addr);
+                fsm->io->udp_fd, 
+                OP_UDP_SEND, 
+                task->buf, 
+                total_len, 
+                &fsm->dst_addr);
 
     /* Force the kernel to process the SQE immediately */
     io_uring_submit(&fsm->io->ring);

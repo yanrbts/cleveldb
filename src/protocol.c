@@ -63,7 +63,11 @@ int vf_pack(const vfast_sec_ctx_t *sec, uint8_t *buf, int plen,
      * 2. Encryption Branching: 
      * HELLO and KEEPALIVE bypass AEAD to maintain handshake availability.
      */
-    if (sec == NULL || type == VPN_MSG_HELLO || type == VPN_MSG_KEEPALIVE) {
+    if (sec == NULL 
+        || type == VPN_MSG_HELLO 
+        || type == VPN_MSG_KEEPALIVE
+        || type == VPN_MSG_AUTH_REQ
+        || type == VPN_MSG_AUTH_ACK) {
         out_len = (size_t)i_plen;
     } else {
         // if (unlikely(!sec)) return -1;
