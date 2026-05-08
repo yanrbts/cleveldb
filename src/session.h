@@ -16,26 +16,26 @@
 #include "key.h"
 
 typedef struct {
-    uint32_t session_id;            /* Unique ID: For UDP -> TUN lookup/validation */
-    uint32_t virtual_ip;            /* Key: Network Byte Order */
+    uint32_t sid;            /* Unique ID: For UDP -> TUN lookup/validation */
+    uint32_t vip;            /* Key: Network Byte Order */
     struct sockaddr_in remote_addr; /* Value: Client Physical Addr */
     atomic_uint_fast32_t next_seq;
     vfast_sec_ctx_t sec_ctx;        /* Security context for this session */
     time_t last_seen;
 
-    UT_hash_handle hh_ip;           /* handle for virtual_ip-based lookup */
+    UT_hash_handle hh_ip;           /* handle for vip-based lookup */
     UT_hash_handle hh_sid;          /* Handle for SessionID-based lookup */
 } __attribute__((aligned(64))) vf_session_t;
 
 typedef struct {
-    uint32_t session_id;
-    uint32_t virtual_ip;
+    uint32_t sid;
+    uint32_t vip;
     struct sockaddr_in remote_addr;
     int is_dead;                    // 1: Expired, 0: Active
 } vf_expired_node_t;
 
 typedef struct {
-    vf_session_t *ip_table;        /* Hash head for hh (virtual_ip) */
+    vf_session_t *ip_table;        /* Hash head for hh (vip) */
     vf_session_t *sid_table;       /* Hash head for hh_sid */           
     pthread_rwlock_t lock;          
 } vf_session_shard_t;

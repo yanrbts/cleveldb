@@ -28,18 +28,17 @@
 /* Internal Session Node: Volatile Active Tokens */
 typedef struct {
     uint8_t token[VF_TOKEN_LEN];        /* Key */
-    vf_identity_t identity;             /* Snapshot including assigned VIP */
+    vf_user_t user;             /* Snapshot including assigned VIP */
     time_t expire;
     UT_hash_handle hh;
-} vf_token_node_t;
+} vf_node_t;
 
 /* Global Manager Singleton */
 static struct {
     int urandom_fd;
     rc_handle *rh;                  /* RADIUS handle */
-    vf_token_node_t *token_cache;   /* Active sessions */
+    vf_node_t *user_node;   /* Active sessions */
     pthread_rwlock_t lock;
-    vf_user_fetch_cb fetch_cb;      /* Customer-defined data source */
 } g_user_mgr;
 
 /**
@@ -121,15 +120,6 @@ static int vf_radius_authenticate(const char *user, const char *pass) {
     return ret; 
 }
 
-/**
- * Register the external database hook
- */
-void vf_user_register_datasource(vf_user_fetch_cb cb) {
-    pthread_rwlock_wrlock(&g_user_mgr.lock);
-    g_user_mgr.fetch_cb = cb;
-    pthread_rwlock_unlock(&g_user_mgr.lock);
-}
-
 bool vf_user_init(void) {
     memset(&g_user_mgr, 0, sizeof(g_user_mgr));
 
@@ -167,7 +157,7 @@ bool vf_user_init(void) {
     return true;
 }
 
-int vf_user_login(uint32_t vip, const char *user, const char *pass, uint8_t tk_out[VF_TOKEN_LEN]) {
+int vf_user_login(const char *user, const char *pass, uint8_t tk_out[VF_TOKEN_LEN]) {
     if (unlikely(!user || !pass || !tk_out)) return -3;
 
     /* Step 1: RADIUS Authentication (Primary) */
@@ -179,39 +169,37 @@ int vf_user_login(uint32_t vip, const char *user, const char *pass, uint8_t tk_o
     if (read(g_user_mgr.urandom_fd, tk_out, VF_TOKEN_LEN) != VF_TOKEN_LEN)
         return -3;
 
-    vf_token_node_t *session = (vf_token_node_t *)zcalloc(sizeof(vf_token_node_t));
+    vf_node_t *session = (vf_node_t *)zcalloc(sizeof(vf_node_t));
     if (unlikely(!session)) return -3;
 
     memcpy(session->token, tk_out, VF_TOKEN_LEN);
     /* Resolve VIP Logic: Static from DB takes priority over Pool */
-    strncpy(session->identity.base.name, user, sizeof(session->identity.base.name) - 1);
-    session->identity.base.name[sizeof(session->identity.base.name) - 1] = '\0';
-    session->identity.base.role = VF_ROLE_USER; // Default role; can be extended to
-
-    session->identity.vip  = vip;
+    strncpy(session->user.name, user, sizeof(session->user.name) - 1);
+    session->user.name[sizeof(session->user.name) - 1] = '\0';
+    session->user.role = VF_ROLE_USER; // Default role; can be extended to
     session->expire = time(NULL) + VF_USER_TOKEN_INTER;
 
     pthread_rwlock_wrlock(&g_user_mgr.lock);
-    HASH_ADD(hh, g_user_mgr.token_cache, token, VF_TOKEN_LEN, session);
+    HASH_ADD(hh, g_user_mgr.user_node, token, VF_TOKEN_LEN, session);
     pthread_rwlock_unlock(&g_user_mgr.lock);
 
     return 0;
 }
 
-bool vf_user_verify_pkt(const vpn_auth_t *pkt, vf_identity_t *info) {
+bool vf_user_verify_pkt(const vpn_auth_t *pkt, vf_user_t *info) {
     if (unlikely(!pkt || pkt->magic != VFAST_MAGIC)) return false;
 
     time_t now = time(NULL);
     bool valid = false;
 
     pthread_rwlock_rdlock(&g_user_mgr.lock);
-    vf_token_node_t *session = NULL;
-    HASH_FIND(hh, g_user_mgr.token_cache, pkt->token, VF_TOKEN_LEN, session);
+    vf_node_t *session = NULL;
+    HASH_FIND(hh, g_user_mgr.user_node, pkt->token, VF_TOKEN_LEN, session);
 
     if (likely(session && now <= session->expire)) {
         if (info) {
             /* Zero-redundancy structural copy to data-plane buffer */
-            *info = session->identity;
+            *info = session->user;
         }
         valid = true;
 
@@ -229,10 +217,10 @@ int vf_user_logout(const uint8_t token[VF_TOKEN_LEN]) {
     if (unlikely(!token)) return -1;
 
     pthread_rwlock_wrlock(&g_user_mgr.lock);
-    vf_token_node_t *session = NULL;
-    HASH_FIND(hh, g_user_mgr.token_cache, token, VF_TOKEN_LEN, session);
+    vf_node_t *session = NULL;
+    HASH_FIND(hh, g_user_mgr.user_node, token, VF_TOKEN_LEN, session);
     if (session) {
-        HASH_DEL(g_user_mgr.token_cache, session);
+        HASH_DEL(g_user_mgr.user_node, session);
         zfree(session);
         pthread_rwlock_unlock(&g_user_mgr.lock);
         return 0;
@@ -242,13 +230,13 @@ int vf_user_logout(const uint8_t token[VF_TOKEN_LEN]) {
 }
 
 void vf_user_clean_expired(void) {
-    vf_token_node_t *curr, *tmp;
+    vf_node_t *curr, *tmp;
     time_t now = time(NULL);
 
     pthread_rwlock_wrlock(&g_user_mgr.lock);
-    HASH_ITER(hh, g_user_mgr.token_cache, curr, tmp) {
+    HASH_ITER(hh, g_user_mgr.user_node, curr, tmp) {
         if (now > curr->expire) {
-            HASH_DEL(g_user_mgr.token_cache, curr);
+            HASH_DEL(g_user_mgr.user_node, curr);
             free(curr);
         }
     }
@@ -267,9 +255,9 @@ void vf_user_uninit(void) {
     }
 
     /* Flush Active Sessions */
-    vf_token_node_t *tk, *tk_tmp;
-    HASH_ITER(hh, g_user_mgr.token_cache, tk, tk_tmp) {
-        HASH_DEL(g_user_mgr.token_cache, tk);
+    vf_node_t *tk, *tk_tmp;
+    HASH_ITER(hh, g_user_mgr.user_node, tk, tk_tmp) {
+        HASH_DEL(g_user_mgr.user_node, tk);
         free(tk);
     }
 

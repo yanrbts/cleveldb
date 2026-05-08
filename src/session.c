@@ -101,19 +101,19 @@ void vf_ss_update(uint32_t v_ip, uint32_t s_id, const struct sockaddr_in *addr) 
     if (!s) {
         s = (vf_session_t *)zmalloc(sizeof(vf_session_t));
         if (s) {
-            s->virtual_ip = v_ip;
-            s->session_id = s_id;
+            s->vip = v_ip;
+            s->sid = s_id;
 
             vf_rekey_init(&s->sec_ctx, s_id); // Initialize security context for this session
 
-            HASH_ADD(hh_ip, g_shards[idx].ip_table, virtual_ip, sizeof(uint32_t), s);
-            HASH_ADD(hh_sid, g_shards[idx].sid_table, session_id, sizeof(uint32_t), s);
+            HASH_ADD(hh_ip, g_shards[idx].ip_table, vip, sizeof(uint32_t), s);
+            HASH_ADD(hh_sid, g_shards[idx].sid_table, sid, sizeof(uint32_t), s);
         }
     } else {
-        if (s->session_id != s_id) {
+        if (s->sid != s_id) {
             HASH_DELETE(hh_sid, g_shards[idx].sid_table, s);
-            s->session_id = s_id;
-            HASH_ADD(hh_sid, g_shards[idx].sid_table, session_id, sizeof(uint32_t), s);
+            s->sid = s_id;
+            HASH_ADD(hh_sid, g_shards[idx].sid_table, sid, sizeof(uint32_t), s);
         }
     }
 
@@ -215,7 +215,7 @@ void vf_ss_delete(uint32_t v_ip) {
         log_debug("Session destroyed for IP: %u.%u.%u.%u | SID: 0x%08x", 
                   (v_ip & 0xFF), (v_ip >> 8) & 0xFF, 
                   (v_ip >> 16) & 0xFF, (v_ip >> 24) & 0xFF,
-                  s->session_id);
+                  s->sid);
         memset(&s->sec_ctx, 0, sizeof(vfast_sec_ctx_t));
         /* 2. Safe to release memory only after all references are removed */
         zfree(s);
@@ -274,7 +274,7 @@ void vf_ss_clean_timeout(vpn_ip_pool_t *ipp, int timeout_sec) {
                 
                 /* Return the virtual IP to the pool for reuse by other clients */
                 if (ipp) {
-                    vf_ip_pool_free(ipp, s->virtual_ip);
+                    vf_ip_pool_free(ipp, s->vip);
                 }
 
                 /* Detach from both hash indexes simultaneously */
@@ -317,8 +317,8 @@ int vf_ss_get_expired(vf_expired_node_t *list, int max_count,
         HASH_ITER(hh_ip, g_shards[i].ip_table, s, tmp) {
             long idle = now - s->last_seen;
             if (idle >= probe_sec) {
-                list[count].session_id = s->session_id;
-                list[count].virtual_ip = s->virtual_ip;
+                list[count].sid = s->sid;
+                list[count].vip = s->vip;
                 list[count].remote_addr = s->remote_addr;
                 list[count].is_dead = (idle >= dead_sec);
                 

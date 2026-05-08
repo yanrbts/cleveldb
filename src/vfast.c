@@ -171,12 +171,12 @@ void vfast_server_maintenance(vf_io_t *io, void *data) {
         if (node->is_dead) {
             /* Strategy A: Final Reclamation */
             log_info("DPD: Session 0x%08x confirmed dead. Reclaiming VIP %u", 
-                     node->session_id, node->virtual_ip);
+                     node->sid, node->vip);
             
             /* Physical deletion from session internal sharded tables */
-            vf_ss_delete(node->virtual_ip);
+            vf_ss_delete(node->vip);
             /* Release the virtual IP back to the pool for reuse */
-            vf_ip_pool_free(ipp, node->virtual_ip);
+            vf_ip_pool_free(ipp, node->vip);
         } else {
             /* Strategy B: Active Probing (Keep-alive) */
             vf_task_t *task = vf_io_task(io);
@@ -192,7 +192,7 @@ void vfast_server_maintenance(vf_io_t *io, void *data) {
              */
             vf_session_t *s = NULL;
             /* We need the session context to get the security keys for packing */
-            if (unlikely(!vf_ss_lookup_by_sid(node->session_id, &s))) {
+            if (unlikely(!vf_ss_lookup_by_sid(node->sid, &s))) {
                 continue;
             }
 
@@ -202,14 +202,14 @@ void vfast_server_maintenance(vf_io_t *io, void *data) {
              * randomized, masked packet.
              */
             int tlen = vf_pack(&s->sec_ctx, task->buf, 0, 
-                                BUF_SIZE, VPN_DPD_REQUEST, node->session_id);
+                                BUF_SIZE, VPN_DPD_REQUEST, node->sid);
 
             if (likely(tlen > 0)) {
                 /* 4. Asynchronous Dispatch via io_uring */
                 vf_io_write(io, io->udp_fd, OP_UDP_SEND, task->buf, 
                                    tlen, &node->remote_addr);
                 
-                log_debug("DPD: Sent masked probe to SID[0x%08x]", node->session_id);
+                log_debug("DPD: Sent masked probe to SID[0x%08x]", node->sid);
             }
         }
     }

@@ -210,7 +210,7 @@ static bool vfast_handle_auth(vf_io_t *io, uint8_t *payload, int plen, struct so
 
     /* 4. Credentials Validation */
     uint8_t token[VF_TOKEN_LEN] = {0};
-    if (unlikely(vf_user_login(vip, req->username, req->password, token) != 0)) {
+    if (unlikely(vf_user_login(req->username, req->password, token) != 0)) {
         log_warn("Auth Failed: User '%.32s' from %s", req->username, inet_ntoa(src->sin_addr));
         /* TODO: Optional send AUTH_ERR to client */
         return false;
@@ -301,11 +301,11 @@ static bool vfast_handle_echo(vf_io_t *io, vf_session_t *s, uint32_t sid, uint8_
             inet_ntop(AF_INET, &src->sin_addr, new_ip, sizeof(new_ip));
 
             log_info("ROAM: SID[0x%08x] migrated from %s:%d to %s:%d", 
-                    s->session_id, old_ip, ntohs(s->remote_addr.sin_port),
+                    s->sid, old_ip, ntohs(s->remote_addr.sin_port),
                     new_ip, ntohs(src->sin_port));
         }
         /* 3. Session Refresh: Update VIP-SID mapping and 'last_seen' timestamp */
-        vf_ss_update(s->virtual_ip, s->session_id, src);
+        vf_ss_update(s->vip, s->sid, src);
     } else {
         log_warn("FSM: Unknown SID 0x%08x from %s. Sending Force-Reconnect.", 
                  sid, inet_ntoa(src->sin_addr));
@@ -367,7 +367,7 @@ static inline void vfast_handle_rekey_req(vf_io_t *io, vf_session_t *s,
     /* 3. Security Validation: Ensure monotonic increase of Key ID */
     if (unlikely(r_kid <= s->sec_ctx.active_key.id)) {
         log_warn("REKEY: Stale KeyID %u (Current: %u) from SID[0x%08x]", 
-                 r_kid, s->sec_ctx.active_key.id, s->session_id);
+                 r_kid, s->sec_ctx.active_key.id, s->sid);
         return;
     }
 
@@ -388,7 +388,7 @@ static inline void vfast_handle_rekey_req(vf_io_t *io, vf_session_t *s,
     *(uint32_t *)payload = htonl(r_kid);
 
     /* Security Pipeline: Padding + Obfuscation for the ACK */
-    int flen = vf_pack(&s->sec_ctx, base_buf, 4, BUF_SIZE, VPN_MSG_REKEY_ACK, s->session_id);
+    int flen = vf_pack(&s->sec_ctx, base_buf, 4, BUF_SIZE, VPN_MSG_REKEY_ACK, s->sid);
 
     if (likely(flen > 0)) {
         vf_io_write(io, io->udp_fd, OP_UDP_SEND, base_buf, flen, src);
@@ -401,7 +401,7 @@ static inline void vfast_handle_rekey_req(vf_io_t *io, vf_session_t *s,
      */
     vf_rekey_commit(&s->sec_ctx);
     
-    log_info("REKEY: Switched to KeyID %u for SID 0x%08x", r_kid, s->session_id);
+    log_info("REKEY: Switched to KeyID %u for SID 0x%08x", r_kid, s->sid);
 }
 
 /**
@@ -410,14 +410,14 @@ static inline void vfast_handle_rekey_req(vf_io_t *io, vf_session_t *s,
  */
 static inline void vfast_handle_rekey_ack(vf_session_t *s) {
     if (unlikely(!s->sec_ctx.rekey_pending)) {
-        log_warn("REKEY: Received unexpected ACK for SID[0x%08x]", s->session_id);
+        log_warn("REKEY: Received unexpected ACK for SID[0x%08x]", s->sid);
         return;
     }
 
     /* Client is ready, we can now safely rotate keys */
     vf_rekey_commit(&s->sec_ctx);
     
-    log_info("REKEY: Committed for SID[0x%08x] (Server-initiated)", s->session_id);
+    log_info("REKEY: Committed for SID[0x%08x] (Server-initiated)", s->sid);
 }
 
 /**
@@ -551,7 +551,7 @@ static vf_task_state_t server_on_tun(vf_io_t *io, uint8_t *data, int len, struct
                              len, 
                              BUF_SIZE, 
                              VPN_MSG_DATA, 
-                             s->session_id);
+                             s->sid);
 
     if (likely(total_len > 0)) {
         /**

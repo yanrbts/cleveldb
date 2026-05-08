@@ -610,11 +610,11 @@ static int cmd_get_session_bysid(void *ctx, int argc, char **argv, cmd_resp_t *r
     // Session ID
     cmd_resp_printf(resp, "  %s%-20s%s : %s0x%08x%s\n", 
                     C_GREEN, "Sid", C_RESET, 
-                    C_YELLOW, s->session_id, C_RESET);
+                    C_YELLOW, s->sid, C_RESET);
 
     // Virtual IP
     char vip_str[INET_ADDRSTRLEN];
-    ip_ntop(s->virtual_ip, vip_str, sizeof(vip_str));
+    ip_ntop(s->vip, vip_str, sizeof(vip_str));
     cmd_resp_printf(resp, "  %s%-20s%s : %s%s%s\n", 
                     C_GREEN, "Vip", C_RESET, 
                     C_YELLOW, vip_str, C_RESET);
