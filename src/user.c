@@ -25,16 +25,10 @@
 #define VF_USER_TOKEN_MIN       900
 #define VF_USER_RADCLI_CONF     "./radcli.conf"
 
-/* Internal Cache Node: Persistent Account Data */
-typedef struct {
-    vf_user_auth_t auth;    /* Contains base info + password + static_vip */
-    UT_hash_handle hh;
-} vf_db_node_t;
-
 /* Internal Session Node: Volatile Active Tokens */
 typedef struct {
-    uint8_t token[VF_TOKEN_LEN];      /* Key */
-    vf_identity_t identity; /* Snapshot including assigned VIP */
+    uint8_t token[VF_TOKEN_LEN];        /* Key */
+    vf_identity_t identity;             /* Snapshot including assigned VIP */
     time_t expire;
     UT_hash_handle hh;
 } vf_token_node_t;
@@ -42,32 +36,15 @@ typedef struct {
 /* Global Manager Singleton */
 static struct {
     int urandom_fd;
-    vf_token_node_t *token_cache;  /* Active sessions */
+    rc_handle *rh;                  /* RADIUS handle */
+    vf_token_node_t *token_cache;   /* Active sessions */
     pthread_rwlock_t lock;
-    vf_user_fetch_cb fetch_cb;     /* Customer-defined data source */
+    vf_user_fetch_cb fetch_cb;      /* Customer-defined data source */
 } g_user_mgr;
-
-static rc_handle *g_rh = NULL;
-
-// static vf_db_node_t* vf_sync_user(const char *username) {
-//     if (!g_user_mgr.fetch_cb) return NULL;
-
-//     vf_user_auth_t ext_auth;
-//     if (g_user_mgr.fetch_cb(username, &ext_auth)) {
-//         vf_db_node_t *node = (vf_db_node_t *)zcalloc(sizeof(vf_db_node_t));
-//         if (node) {
-//             node->auth = ext_auth; // Structural copy
-//             HASH_ADD(hh, g_user_mgr.db_cache, auth.base.name, 
-//                      strlen(node->auth.base.name), node);
-//             return node;
-//         }
-//     }
-//     return NULL;
-// }
 
 /**
  * @brief Authenticates a user against the RADIUS server.
- * * This function constructs a RADIUS Access-Request packet. 
+ * This function constructs a RADIUS Access-Request packet. 
  * Includes Message-Authenticator (Attribute 80) to support modern 
  * FreeRADIUS security requirements (mitigating BLAST RADIUS).
  *
@@ -77,7 +54,7 @@ static rc_handle *g_rh = NULL;
  */
 static int vf_radius_authenticate(const char *user, const char *pass) {
     /* 1. Basic sanity check for the RADIUS handle */
-    if (unlikely(!g_rh)) {
+    if (unlikely(!g_user_mgr.rh)) {
         return VF_ERR_CONFIG;
     }
 
@@ -89,18 +66,18 @@ static int vf_radius_authenticate(const char *user, const char *pass) {
     /* 2. Build the Attribute-Value Pair (AVP) list */
 
     /* Add User-Name (Attribute 1) */
-    if (rc_avpair_add(g_rh, &send, PW_USER_NAME, (void*)user, -1, 0) == NULL) {
+    if (rc_avpair_add(g_user_mgr.rh, &send, PW_USER_NAME, (void*)user, -1, 0) == NULL) {
         return VF_ERR_SYSTEM;
     }
 
     /* Add User-Password (Attribute 2) */
-    if (rc_avpair_add(g_rh, &send, PW_USER_PASSWORD, (void*)pass, -1, 0) == NULL) {
+    if (rc_avpair_add(g_user_mgr.rh, &send, PW_USER_PASSWORD, (void*)pass, -1, 0) == NULL) {
         rc_avpair_free(send);
         return VF_ERR_SYSTEM;
     }
 
     /* Add Service-Type (Attribute 6) - Pass address of the integer */
-    if (rc_avpair_add(g_rh, &send, PW_SERVICE_TYPE, &service, -1, 0) == NULL) {
+    if (rc_avpair_add(g_user_mgr.rh, &send, PW_SERVICE_TYPE, &service, -1, 0) == NULL) {
         rc_avpair_free(send);
         return VF_ERR_SYSTEM;
     }
@@ -110,7 +87,7 @@ static int vf_radius_authenticate(const char *user, const char *pass) {
      * 'msg' will capture any Reply-Message from the server.
      */
     char msg[PW_MAX_MSG_SIZE] = {0};
-    int result = rc_auth(g_rh, 0, send, &received, msg);
+    int result = rc_auth(g_user_mgr.rh, 0, send, &received, msg);
     
     /* Clean up the allocated AVP list */
     if (send) rc_avpair_free(send);
@@ -159,21 +136,22 @@ bool vf_user_init(void) {
     if (pthread_rwlock_init(&g_user_mgr.lock, NULL) != 0) {
         return false;
     }
-    rc_openlog("my-prog-name");
-    /* Initialize RADIUS (libradcli) */
-    /* Using db_conn as the path to radiusclient.conf if provided */
+
+    rc_openlog("vfast-server");
+    /* Initialize RADIUS (libradcli)
+     * Using db_conn as the path to radiusclient.conf if provided */
     const char *apath = vf_get_absolute_path(VF_USER_RADCLI_CONF);
-    g_rh = rc_read_config(apath);
-    if (!g_rh) {
+    g_user_mgr.rh = rc_read_config(apath);
+    if (!g_user_mgr.rh) {
         log_error("Failed to read radcli config [%s]: %s (errno: %d)", 
               apath, strerror(errno), errno);
         pthread_rwlock_destroy(&g_user_mgr.lock);
         return false;
     }
 
-    if (rc_read_dictionary(g_rh, rc_conf_str(g_rh, "dictionary")) != 0) {
+    if (rc_read_dictionary(g_user_mgr.rh, rc_conf_str(g_user_mgr.rh, "dictionary")) != 0) {
         log_error("Failed to read RADIUS dictionary.");
-        rc_destroy(g_rh);
+        rc_destroy(g_user_mgr.rh);
         pthread_rwlock_destroy(&g_user_mgr.lock);
         return false;
     }
@@ -263,7 +241,7 @@ int vf_user_logout(const uint8_t token[VF_TOKEN_LEN]) {
     return -1;
 }
 
-void vf_user_cron_clean(void) {
+void vf_user_clean_expired(void) {
     vf_token_node_t *curr, *tmp;
     time_t now = time(NULL);
 
@@ -283,9 +261,9 @@ void vf_user_uninit(void) {
     if (g_user_mgr.urandom_fd >= 0) close(g_user_mgr.urandom_fd);
 
     /* Clean RADIUS handle */
-    if (g_rh) {
-        rc_destroy(g_rh);
-        g_rh = NULL;
+    if (g_user_mgr.rh) {
+        rc_destroy(g_user_mgr.rh);
+        g_user_mgr.rh = NULL;
     }
 
     /* Flush Active Sessions */
@@ -294,13 +272,6 @@ void vf_user_uninit(void) {
         HASH_DEL(g_user_mgr.token_cache, tk);
         free(tk);
     }
-
-    /* Flush DB Cache */
-    // vf_db_node_t *u, *u_tmp;
-    // HASH_ITER(hh, g_user_mgr.db_cache, u, u_tmp) {
-    //     HASH_DEL(g_user_mgr.db_cache, u);
-    //     free(u);
-    // }
 
     pthread_rwlock_unlock(&g_user_mgr.lock);
     pthread_rwlock_destroy(&g_user_mgr.lock);

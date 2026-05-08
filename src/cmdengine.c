@@ -594,7 +594,7 @@ static int cmd_get_session_bysid(void *ctx, int argc, char **argv, cmd_resp_t *r
     }
 
     /* 3. Lookup session context */
-    vpn_session_t *s = NULL;
+    vf_session_t *s = NULL;
     if (!vf_ss_lookup_by_sid(sid, &s) || s == NULL) {
         cmd_resp_printf(resp, C_RED "SID [" C_RESET C_YELLOW "0x%08x" C_RESET "] " C_RED "not found" C_RESET, sid);
         return 0;

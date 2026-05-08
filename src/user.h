@@ -15,16 +15,14 @@ typedef enum {
     VF_ROLE_ADMIN
 } vf_role_t;
 
-/* Base attributes common to all user representations */
 typedef struct {
     char name[32];
     vf_role_t role;
 } vf_user_base_t;
 
-/* Identity snapshot for data-plane packet verification */
 typedef struct {
     vf_user_base_t base;
-    uint32_t vip;          /* The final assigned Virtual IP */
+    uint32_t vip;
 } vf_identity_t;
 
 /* Authentication data retrieved from external sources (DB/LDAP/API) */
@@ -48,6 +46,6 @@ void vf_user_register_datasource(vf_user_fetch_cb cb);
 int vf_user_login(uint32_t vip, const char *user, const char *pass, uint8_t tk_out[VF_TOKEN_LEN]);
 bool vf_user_verify_pkt(const vpn_auth_t *pkt, vf_identity_t *info);
 int vf_user_logout(const uint8_t token[VF_TOKEN_LEN]);
-void vf_user_cron_clean(void);
+void vf_user_clean_expired(void);
 
 #endif /* __USER_H__ */

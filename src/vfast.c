@@ -149,7 +149,7 @@ void vfast_server_maintenance(vf_io_t *io, void *data) {
     if (unlikely(!io || !data)) return;
 
     vpn_ip_pool_t *ipp = (vpn_ip_pool_t *)data;
-    vpn_expired_node_t expired_list[64];
+    vf_expired_node_t expired_list[64];
     const int PROBE_SEC = 15;
     const int DEAD_SEC  = 30;
 
@@ -166,7 +166,7 @@ void vfast_server_maintenance(vf_io_t *io, void *data) {
      * Iterate through the collected candidates and execute the appropriate strategy.
      */
     for (int i = 0; i < count; i++) {
-        vpn_expired_node_t *node = &expired_list[i];
+        vf_expired_node_t *node = &expired_list[i];
 
         if (node->is_dead) {
             /* Strategy A: Final Reclamation */
@@ -190,7 +190,7 @@ void vfast_server_maintenance(vf_io_t *io, void *data) {
              * Even DPD probes must be masked.
              * Since DPD usually has no payload, we pass plen = 0.
              */
-            vpn_session_t *s = NULL;
+            vf_session_t *s = NULL;
             /* We need the session context to get the security keys for packing */
             if (unlikely(!vf_ss_lookup_by_sid(node->session_id, &s))) {
                 continue;

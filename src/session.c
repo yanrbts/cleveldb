@@ -15,7 +15,7 @@
 
 #define VPN_SESSION_SHARD_COUNT 16
 
-static vpn_session_shard_t g_shards[VPN_SESSION_SHARD_COUNT];
+static vf_session_shard_t g_shards[VPN_SESSION_SHARD_COUNT];
 
 static inline uint32_t vpn_get_shard_idx(uint32_t ip) {
     return (ip ^ (ip >> 16)) & (VPN_SESSION_SHARD_COUNT - 1);
@@ -93,13 +93,13 @@ void vf_ss_update(uint32_t v_ip, uint32_t s_id, const struct sockaddr_in *addr) 
     if (!addr) return;
 
     uint32_t idx = vpn_get_shard_idx(v_ip);
-    vpn_session_t *s = NULL;
+    vf_session_t *s = NULL;
 
     pthread_rwlock_wrlock(&g_shards[idx].lock);
     
     HASH_FIND(hh_ip, g_shards[idx].ip_table, &v_ip, sizeof(uint32_t), s);
     if (!s) {
-        s = (vpn_session_t *)zmalloc(sizeof(vpn_session_t));
+        s = (vf_session_t *)zmalloc(sizeof(vf_session_t));
         if (s) {
             s->virtual_ip = v_ip;
             s->session_id = s_id;
@@ -144,7 +144,7 @@ void vf_ss_update_by_sid(uint32_t s_id, const struct sockaddr_in *addr) {
 
     /* 2. Locate the shard using the aligned SessionID */
     uint32_t idx = vpn_get_shard_idx(s_id);
-    vpn_session_t *s = NULL;
+    vf_session_t *s = NULL;
 
     /* 3. Acquire write lock: Needed for updating timestamps and roaming info */
     pthread_rwlock_wrlock(&g_shards[idx].lock);
@@ -190,7 +190,7 @@ void vf_ss_update_by_sid(uint32_t s_id, const struct sockaddr_in *addr) {
 void vf_ss_delete(uint32_t v_ip) {
     /* Determine which shard contains this IP */
     uint32_t idx = vpn_get_shard_idx(v_ip);
-    vpn_session_t *s = NULL;
+    vf_session_t *s = NULL;
 
     /* Acquire write lock for the specific shard to ensure atomicity */
     pthread_rwlock_wrlock(&g_shards[idx].lock);
@@ -224,9 +224,9 @@ void vf_ss_delete(uint32_t v_ip) {
     pthread_rwlock_unlock(&g_shards[idx].lock);
 }
 
-bool vf_ss_lookup_by_sid(uint32_t sid, vpn_session_t **outs) {
+bool vf_ss_lookup_by_sid(uint32_t sid, vf_session_t **outs) {
     uint32_t idx = vpn_get_shard_idx(sid); 
-    vpn_session_t *s = NULL;
+    vf_session_t *s = NULL;
 
     pthread_rwlock_rdlock(&g_shards[idx].lock);
     HASH_FIND(hh_sid, g_shards[idx].sid_table, &sid, sizeof(uint32_t), s);
@@ -236,9 +236,9 @@ bool vf_ss_lookup_by_sid(uint32_t sid, vpn_session_t **outs) {
     return s != NULL;
 }
 
-bool vf_ss_lookup_by_ip(uint32_t vip, vpn_session_t **outs) {
+bool vf_ss_lookup_by_ip(uint32_t vip, vf_session_t **outs) {
     uint32_t idx = vpn_get_shard_idx(vip); 
-    vpn_session_t *s = NULL;
+    vf_session_t *s = NULL;
 
     pthread_rwlock_rdlock(&g_shards[idx].lock);
     HASH_FIND(hh_ip, g_shards[idx].ip_table, &vip, sizeof(uint32_t), s);
@@ -263,7 +263,7 @@ void vf_ss_clean_timeout(vpn_ip_pool_t *ipp, int timeout_sec) {
     for (int i = 0; i < VPN_SESSION_SHARD_COUNT; i++) {
         pthread_rwlock_wrlock(&g_shards[i].lock);
         
-        vpn_session_t *s, *tmp;
+        vf_session_t *s, *tmp;
         
         /**
          * Use HASH_ITER to safely delete elements while traversing.
@@ -292,7 +292,7 @@ void vf_ss_clean_timeout(vpn_ip_pool_t *ipp, int timeout_sec) {
 
 void vf_ss_destroy(void) {
     for (int i = 0; i < VPN_SESSION_SHARD_COUNT; i++) {
-        vpn_session_t *s, *tmp;
+        vf_session_t *s, *tmp;
         pthread_rwlock_wrlock(&g_shards[i].lock);
         HASH_ITER(hh_ip, g_shards[i].ip_table, s, tmp) {
             HASH_DELETE(hh_ip, g_shards[i].ip_table, s);
@@ -305,7 +305,7 @@ void vf_ss_destroy(void) {
     log_info("VPN_SESSION: Manager destroyed.");
 }
 
-int vf_ss_get_expired(vpn_expired_node_t *list, int max_count, 
+int vf_ss_get_expired(vf_expired_node_t *list, int max_count, 
                              int probe_sec, int dead_sec) {
     int count = 0;
     time_t now = time(NULL);
@@ -313,7 +313,7 @@ int vf_ss_get_expired(vpn_expired_node_t *list, int max_count,
     for (int i = 0; i < VPN_SESSION_SHARD_COUNT; i++) {
         pthread_rwlock_rdlock(&g_shards[i].lock);
         
-        vpn_session_t *s, *tmp;
+        vf_session_t *s, *tmp;
         HASH_ITER(hh_ip, g_shards[i].ip_table, s, tmp) {
             long idle = now - s->last_seen;
             if (idle >= probe_sec) {

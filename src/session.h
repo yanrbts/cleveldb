@@ -25,20 +25,20 @@ typedef struct {
 
     UT_hash_handle hh_ip;           /* handle for virtual_ip-based lookup */
     UT_hash_handle hh_sid;          /* Handle for SessionID-based lookup */
-} __attribute__((aligned(64))) vpn_session_t;
+} __attribute__((aligned(64))) vf_session_t;
 
 typedef struct {
     uint32_t session_id;
     uint32_t virtual_ip;
     struct sockaddr_in remote_addr;
     int is_dead;                    // 1: Expired, 0: Active
-} vpn_expired_node_t;
+} vf_expired_node_t;
 
 typedef struct {
-    vpn_session_t *ip_table;        /* Hash head for hh (virtual_ip) */
-    vpn_session_t *sid_table;       /* Hash head for hh_sid */           
+    vf_session_t *ip_table;        /* Hash head for hh (virtual_ip) */
+    vf_session_t *sid_table;       /* Hash head for hh_sid */           
     pthread_rwlock_t lock;          
-} vpn_session_shard_t;
+} vf_session_shard_t;
 
 /**
  * @brief Generates a unique Session ID (SID) for a given Virtual IP.
@@ -95,7 +95,7 @@ void vf_ss_clean_timeout(vpn_ip_pool_t *ipp, int timeout_sec);
  * @param[out] outs  Pointer to store the retrieved session object address.
  * @return true if found, false otherwise.
  */
-bool vf_ss_lookup_by_sid(uint32_t sid, vpn_session_t **outs);
+bool vf_ss_lookup_by_sid(uint32_t sid, vf_session_t **outs);
 
 /**
  * @brief Locates a session object by its Virtual IP.
@@ -104,13 +104,13 @@ bool vf_ss_lookup_by_sid(uint32_t sid, vpn_session_t **outs);
  * @param[out] outs  Pointer to store the retrieved session object address.
  * @return true if found, false otherwise.
  */
-bool vf_ss_lookup_by_ip(uint32_t vip, vpn_session_t **outs);
+bool vf_ss_lookup_by_ip(uint32_t vip, vf_session_t **outs);
 
 /**
  * @brief Scans all shards and collects sessions that exceed the given thresholds.
  * @return Number of nodes collected.
  */
-int vf_ss_get_expired(vpn_expired_node_t *list, int max_count, 
+int vf_ss_get_expired(vf_expired_node_t *list, int max_count, 
                              int probe_sec, int dead_sec);
 /**
  * @brief Retrieves the total number of active sessions across all shards.

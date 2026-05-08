@@ -220,7 +220,7 @@ static bool vfast_handle_auth(vf_io_t *io, uint8_t *payload, int plen, struct so
     vf_ss_update(vip, sid, src);
 
     /* 5. Retrieve the newly created session context for Key Management */
-    vpn_session_t *s = NULL;
+    vf_session_t *s = NULL;
     if (!vf_ss_lookup_by_sid(sid, &s)) {
         log_error("FSM: Session lookup failed for SID 0x%08x", sid);
         goto err;
@@ -281,7 +281,7 @@ err:
  * @brief Responds to client's Keepalive/DPD request (Echo Service).
  * This function performs an in-place modification of the payload to save memory cycles.
  */
-static bool vfast_handle_echo(vf_io_t *io, vpn_session_t *s, uint32_t sid, uint8_t *payload, int plen, struct sockaddr_in *src) {
+static bool vfast_handle_echo(vf_io_t *io, vf_session_t *s, uint32_t sid, uint8_t *payload, int plen, struct sockaddr_in *src) {
     /* 1. Validation */
     if (unlikely(!payload || plen < (int)sizeof(vf_payload_echo_t))) {
         return false;
@@ -342,7 +342,7 @@ static bool vfast_handle_echo(vf_io_t *io, vpn_session_t *s, uint32_t sid, uint8
  * * This internal helper handles the decryption, validation, and submission 
  * to the virtual network device.
  */
-static inline void vfast_handle_data(vf_io_t *io, vpn_session_t *s, uint8_t *payload, int plen, struct sockaddr_in *src) {
+static inline void vfast_handle_data(vf_io_t *io, vf_session_t *s, uint8_t *payload, int plen, struct sockaddr_in *src) {
     UNUSED(s);
     UNUSED(src);
 
@@ -354,7 +354,7 @@ static inline void vfast_handle_data(vf_io_t *io, vpn_session_t *s, uint8_t *pay
  * @param payload Decrypted/Unpadded payload from vf_unpack.
  * @param plen    Length of the decrypted payload.
  */
-static inline void vfast_handle_rekey_req(vf_io_t *io, vpn_session_t *s, 
+static inline void vfast_handle_rekey_req(vf_io_t *io, vf_session_t *s, 
                                           uint8_t *payload, int plen, struct sockaddr_in *src) {
     /* 1. Validation: Payload should contain [KeyID (4B)][Raw Key (32B)] */
     const int req_size = 4 + REKEY_KEY_SIZE;
@@ -408,7 +408,7 @@ static inline void vfast_handle_rekey_req(vf_io_t *io, vpn_session_t *s,
  * @brief Handles a Rekey Acknowledgment from the client (Active Rekey Response).
  * The server previously sent a REQ, and the client has confirmed receipt.
  */
-static inline void vfast_handle_rekey_ack(vpn_session_t *s) {
+static inline void vfast_handle_rekey_ack(vf_session_t *s) {
     if (unlikely(!s->sec_ctx.rekey_pending)) {
         log_warn("REKEY: Received unexpected ACK for SID[0x%08x]", s->session_id);
         return;
@@ -436,7 +436,7 @@ static vf_task_state_t server_on_udp(vf_io_t *io, uint8_t *data, int len, struct
 
     uint32_t sid = 0;
     int plen = 0;
-    vpn_session_t *s = NULL;
+    vf_session_t *s = NULL;
     uint8_t *payload = NULL;
     bool isuse = false;
 
@@ -534,7 +534,7 @@ static vf_task_state_t server_on_tun(vf_io_t *io, uint8_t *data, int len, struct
     const uint32_t dest_vip = iph->daddr;
 
     /* 4. Session Lookup: Map VIP to client endpoint and session security context */
-    vpn_session_t *s = NULL;
+    vf_session_t *s = NULL;
     if (!vf_ss_lookup_by_ip(dest_vip, &s)) {
         atomic_fetch_add(&vfserver.stats.drops, 1);
         cmd_reass_stats_add(0, 0, 1);
