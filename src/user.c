@@ -19,6 +19,7 @@
 #include "error.h"
 #include "zmalloc.h"
 #include "ippool.h"
+#include "session.h"
 #include "user.h"
 
 #define VF_USER_TOKEN_INTER     3600
@@ -169,18 +170,18 @@ int vf_user_login(const char *user, const char *pass, uint8_t tk_out[VF_TOKEN_LE
     if (read(g_user_mgr.urandom_fd, tk_out, VF_TOKEN_LEN) != VF_TOKEN_LEN)
         return -3;
 
-    vf_node_t *session = (vf_node_t *)zcalloc(sizeof(vf_node_t));
-    if (unlikely(!session)) return -3;
+    vf_node_t *n = (vf_node_t *)zcalloc(sizeof(vf_node_t));
+    if (unlikely(!n)) return -3;
 
-    memcpy(session->token, tk_out, VF_TOKEN_LEN);
+    memcpy(n->token, tk_out, VF_TOKEN_LEN);
     /* Resolve VIP Logic: Static from DB takes priority over Pool */
-    strncpy(session->user.name, user, sizeof(session->user.name) - 1);
-    session->user.name[sizeof(session->user.name) - 1] = '\0';
-    session->user.role = VF_ROLE_USER; // Default role; can be extended to
-    session->expire = time(NULL) + VF_USER_TOKEN_INTER;
+    strncpy(n->user.name, user, sizeof(n->user.name) - 1);
+    n->user.name[sizeof(n->user.name) - 1] = '\0';
+    n->user.role = VF_ROLE_USER; // Default role; can be extended to
+    n->expire = time(NULL) + VF_USER_TOKEN_INTER;
 
     pthread_rwlock_wrlock(&g_user_mgr.lock);
-    HASH_ADD(hh, g_user_mgr.user_node, token, VF_TOKEN_LEN, session);
+    HASH_ADD(hh, g_user_mgr.user_node, token, VF_TOKEN_LEN, n);
     pthread_rwlock_unlock(&g_user_mgr.lock);
 
     return 0;
